@@ -1,0 +1,11 @@
+# Sensitive credentials and local config
+config.json
+.env
+*.db
+kufar_hunter.db
+
+# Logs and system files
+bot.log
+__pycache__/
+*.pyc
+.DS_Store
