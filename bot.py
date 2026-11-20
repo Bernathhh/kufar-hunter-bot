@@ -224,10 +224,11 @@ def resolve_phone_string(ad: Dict[str, Any], description: str) -> str:
             return f"<code>{html.escape(direct_phone)}</code>"
 
     # 3. Fallback based on Kufar's phone_hidden flag
+    link = ad.get("ad_link", "")
     if ad.get("phone_hidden") is False:
-        return "Указан продавцом (нажмите «Позвонить» на Куфаре)"
+        return f"<a href=\"{link}\">Есть в объявлении (кнопка «Позвонить»)</a>"
     else:
-        return "Скрыт (только сообщения на Куфаре)"
+        return "<i>Скрыт продавцом (только сообщения)</i>"
 
 
 def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = "") -> str:
@@ -302,8 +303,6 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
             media.append({"type": "photo", "media": u})
         ok = tg.send_media_group(chat_id, media)
         if ok:
-            # Send quick action button message below album
-            tg.send_message(chat_id, f"🔗 <b>Перейти к объявлению «{html.escape(ad['subject'][:40])}»:</b>", reply_markup=markup)
             return True
 
     # Case 2: Single photo -> sendPhoto with button
