@@ -149,10 +149,11 @@ def format_params_human(p: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_kufar_time(iso_str: str) -> str:
-    """Converts Kufar UTC ISO timestamp to local Minsk time (UTC+3) with relative age."""
+def parse_ad_timing(iso_str: str) -> Dict[str, Any]:
+    """Parses ad list_time and determines whether it is freshly published or reactivated."""
     if not iso_str:
-        return "Только что"
+        return {"header": "🔥 <b>Новое объявление на Куфаре!</b>", "time_str": "Только что", "is_repost": False, "note": ""}
+
     try:
         clean_iso = iso_str[:-1] + "+00:00" if iso_str.endswith("Z") else iso_str
         dt_utc = datetime.fromisoformat(clean_iso)
@@ -161,6 +162,10 @@ def format_kufar_time(iso_str: str) -> str:
         now_minsk = datetime.now(minsk_tz)
 
         diff_sec = int((now_minsk - dt_minsk).total_seconds())
+
+        # If creation date was more than 24 hours ago, it's an update / reactivation / price change
+        is_repost = diff_sec > 86400
+
         if diff_sec < 60:
             ago = f"{max(0, diff_sec)} сек. назад"
         elif diff_sec < 3600:
@@ -168,19 +173,34 @@ def format_kufar_time(iso_str: str) -> str:
         elif diff_sec < 86400:
             ago = f"{diff_sec // 3600} ч. назад"
         else:
-            ago = ""
+            days = diff_sec // 86400
+            ago = f"{days} дн. назад"
 
         time_part = dt_minsk.strftime("%H:%M:%S")
         if dt_minsk.date() == now_minsk.date():
             res = f"Сегодня в {time_part}"
+        elif (now_minsk.date() - dt_minsk.date()).days == 1:
+            res = f"Вчера в {time_part}"
         else:
             res = dt_minsk.strftime("%d.%m в %H:%M:%S")
 
-        if ago:
-            return f"{res} ({ago})"
-        return res
+        full_time = f"{res} ({ago})" if ago else res
+
+        if is_repost:
+            header = "🔄 <b>Обновление / Поднято из архива!</b>"
+            note = "\nℹ️ <i>Продавец поднял объявление, изменил цену или активировал из архива.</i>"
+        else:
+            header = "🔥 <b>Свежее объявление на Куфаре!</b>"
+            note = ""
+
+        return {
+            "header": header,
+            "time_str": full_time,
+            "is_repost": is_repost,
+            "note": note
+        }
     except Exception:
-        return iso_str
+        return {"header": "🔥 <b>Новое объявление на Куфаре!</b>", "time_str": iso_str, "is_repost": False, "note": ""}
 
 
 def format_ad_caption(ad: Dict[str, Any], query_name: str) -> str:
@@ -189,7 +209,7 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str) -> str:
     link = ad.get("ad_link", "")
     price_byn = ad.get("price_byn")
     price_usd = ad.get("price_usd")
-    time_str = format_kufar_time(ad.get("list_time", ""))
+    timing = parse_ad_timing(ad.get("list_time", ""))
 
     if price_byn is not None:
         price_str = f"<b>{price_byn:,.2f} BYN</b>".replace(",", " ")
@@ -207,16 +227,23 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str) -> str:
 
     seller = html.escape(ad.get("seller", "").strip()) or "Частное лицо"
 
-    return (
-        f"🔥 <b>Новое объявление на Куфаре!</b>\n\n"
-        f"📌 <b>{subject}</b>\n"
-        f"💰 <b>Цена:</b> {price_str}\n"
-        f"🕒 <b>Опубликовано:</b> {time_str}\n"
-        f"📍 <b>Локация:</b> {location}\n"
-        f"👤 <b>Продавец:</b> {seller}\n"
-        f"🎯 <i>Поиск: {html.escape(query_name)}</i>\n\n"
-        f"👉 <a href=\"{link}\">Открыть объявление на Kufar</a>"
-    )
+    time_label = "Первично создано:" if timing["is_repost"] else "Опубликовано:"
+
+    lines = [
+        f"{timing['header']}\n",
+        f"📌 <b>{subject}</b>",
+        f"💰 <b>Цена:</b> {price_str}",
+        f"🕒 <b>{time_label}</b> {timing['time_str']}",
+        f"📍 <b>Локация:</b> {location}",
+        f"👤 <b>Продавец:</b> {seller}",
+        f"🎯 <i>Поиск: {html.escape(query_name)}</i>"
+    ]
+    if timing.get("note"):
+        lines.append(timing["note"])
+
+    lines.append(f"\n👉 <a href=\"{link}\">Открыть объявление на Kufar</a>")
+
+    return "\n".join(lines)
 
 
 def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], query_name: str) -> bool:
