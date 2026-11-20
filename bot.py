@@ -848,7 +848,7 @@ def main():
 
     token = config.get("bot_token", "").strip()
     if not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("❗ ОШИБКА: Не указан токен бота в config.json!")
+        print("❗ ОШИБКА: Не указан токен бота! Укажите переменную окружения BOT_TOKEN (в настройках Environment на Render) или в config.json.")
         sys.exit(1)
 
     init_db()
