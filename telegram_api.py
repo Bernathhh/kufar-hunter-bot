@@ -114,6 +114,15 @@ class TelegramClient:
         res = self._api_call("deleteMessage", payload=payload)
         return res is not None
 
+    def send_media_group(self, chat_id: int, media: List[Dict[str, Any]]) -> bool:
+        """Sends an album of photos/videos (up to 10 items)."""
+        payload = {
+            "chat_id": chat_id,
+            "media": media
+        }
+        res = self._api_call("sendMediaGroup", payload=payload)
+        return res is not None
+
     def send_photo(
         self,
         chat_id: int,

@@ -31,7 +31,13 @@ from database import (
     mark_ads_seen,
     get_query_seen_count
 )
-from kufar_api import parse_kufar_url_or_query, fetch_ads
+from kufar_api import (
+    parse_kufar_url_or_query,
+    fetch_ads,
+    fetch_ad_description,
+    extract_phone_from_text,
+    fetch_ad_phone_with_token
+)
 from telegram_api import TelegramClient
 
 logging.basicConfig(
@@ -203,13 +209,35 @@ def parse_ad_timing(iso_str: str) -> Dict[str, Any]:
         return {"header": "🔥 <b>Новое объявление на Куфаре!</b>", "time_str": iso_str, "is_repost": False, "note": ""}
 
 
-def format_ad_caption(ad: Dict[str, Any], query_name: str) -> str:
+def resolve_phone_string(ad: Dict[str, Any], description: str) -> str:
+    """Detects phone number from description or checks authorization/visibility."""
+    # 1. Search in description text
+    phone_in_text = extract_phone_from_text(description)
+    if phone_in_text:
+        return f"<code>{html.escape(phone_in_text)}</code> (из описания)"
+
+    # 2. Check if optional Kufar Bearer token is provided
+    kufar_token = os.getenv("KUFAR_BEARER_TOKEN")
+    if kufar_token:
+        direct_phone = fetch_ad_phone_with_token(ad["ad_id"], kufar_token)
+        if direct_phone:
+            return f"<code>{html.escape(direct_phone)}</code>"
+
+    # 3. Fallback based on Kufar's phone_hidden flag
+    if ad.get("phone_hidden") is False:
+        return "Указан продавцом (нажмите «Позвонить» на Куфаре)"
+    else:
+        return "Скрыт (только сообщения на Куфаре)"
+
+
+def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = "") -> str:
     """Creates a clean, attractive HTML caption for the ad."""
     subject = html.escape(ad.get("subject", "Объявление"))
     link = ad.get("ad_link", "")
     price_byn = ad.get("price_byn")
     price_usd = ad.get("price_usd")
     timing = parse_ad_timing(ad.get("list_time", ""))
+    phone_str = resolve_phone_string(ad, description)
 
     if price_byn is not None:
         price_str = f"<b>{price_byn:,.2f} BYN</b>".replace(",", " ")
@@ -236,10 +264,17 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str) -> str:
         f"🕒 <b>{time_label}</b> {timing['time_str']}",
         f"📍 <b>Локация:</b> {location}",
         f"👤 <b>Продавец:</b> {seller}",
+        f"📞 <b>Телефон:</b> {phone_str}",
         f"🎯 <i>Поиск: {html.escape(query_name)}</i>"
     ]
     if timing.get("note"):
         lines.append(timing["note"])
+
+    if description:
+        clean_desc = html.escape(description.strip())
+        if len(clean_desc) > 360:
+            clean_desc = clean_desc[:360] + "..."
+        lines.append(f"\n📝 <b>Описание:</b>\n<i>{clean_desc}</i>")
 
     lines.append(f"\n👉 <a href=\"{link}\">Открыть объявление на Kufar</a>")
 
@@ -247,9 +282,12 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str) -> str:
 
 
 def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], query_name: str) -> bool:
-    """Sends notification with photo if available, or text with link."""
-    caption = format_ad_caption(ad, query_name)
-    image_url = ad.get("image_url")
+    """Sends notification with all photos (album) if multiple, plus description and phone."""
+    # Fetch description from Kufar item page
+    description = fetch_ad_description(ad["ad_id"])
+    caption = format_ad_caption(ad, query_name, description=description)
+
+    image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
 
     markup = {
         "inline_keyboard": [
@@ -257,11 +295,24 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
         ]
     }
 
-    if image_url:
-        ok = tg.send_photo(chat_id, image_url, caption=caption, reply_markup=markup)
+    # Case 1: Multiple photos -> Send as Telegram Media Group Album (up to 10 photos)
+    if len(image_urls) >= 2:
+        media = [{"type": "photo", "media": image_urls[0], "caption": caption, "parse_mode": "HTML"}]
+        for u in image_urls[1:10]:
+            media.append({"type": "photo", "media": u})
+        ok = tg.send_media_group(chat_id, media)
+        if ok:
+            # Send quick action button message below album
+            tg.send_message(chat_id, f"🔗 <b>Перейти к объявлению «{html.escape(ad['subject'][:40])}»:</b>", reply_markup=markup)
+            return True
+
+    # Case 2: Single photo -> sendPhoto with button
+    if len(image_urls) == 1:
+        ok = tg.send_photo(chat_id, image_urls[0], caption=caption, reply_markup=markup)
         if ok:
             return True
 
+    # Case 3: Text only
     return tg.send_message(chat_id, caption, disable_web_page_preview=False, reply_markup=markup) is not None
 
 

@@ -194,13 +194,17 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
             if p.get("p") == "name":
                 seller_name = p.get("v", "").strip()
 
-        # Image URL (first image)
-        image_url = None
+        # Image URLs (up to 10 images)
         images = ad.get("images", [])
+        image_urls = []
         if images and isinstance(images, list):
-            path = images[0].get("path")
-            if path:
-                image_url = f"{IMAGE_BASE_URL}/{path}"
+            for img in images[:10]:
+                path = img.get("path")
+                if path:
+                    image_urls.append(f"{IMAGE_BASE_URL}/{path}")
+
+        image_url = image_urls[0] if image_urls else None
+        phone_hidden = ad.get("phone_hidden", True)
 
         results.append({
             "ad_id": ad_id,
@@ -212,7 +216,68 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
             "region": region_name,
             "area": area_name,
             "seller": seller_name,
-            "image_url": image_url
+            "image_url": image_url,
+            "image_urls": image_urls,
+            "phone_hidden": phone_hidden
         })
 
     return results
+
+
+def fetch_ad_description(ad_id: int, timeout: int = 5) -> str:
+    """Fetches the full item description from Kufar item page."""
+    url = f"https://www.kufar.by/item/{ad_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Referer": "https://www.kufar.by/"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            html_text = r.read().decode("utf-8", errors="ignore")
+
+        # Extract description from Next.js payload
+        m = re.search(r'\"id\":\"?' + str(ad_id) + r'\"?.*?\"description\":(\"[^\"]*\")', html_text)
+        if not m:
+            m = re.search(r'\"description\":(\"[^\"]*\")', html_text)
+        if m:
+            return json.loads(m.group(1)).strip()
+    except Exception as e:
+        logger.debug(f"Could not fetch description for {ad_id}: {e}")
+    return ""
+
+
+def extract_phone_from_text(text: str) -> Optional[str]:
+    """Finds Belarusian phone numbers in text."""
+    if not text:
+        return None
+    # Matches: +375 29 123-45-67, 80291234567, 375 (33) 123 45 67
+    pattern = r'(?:\+?375|80)\s*\(?(?:25|29|33|44|17)\)?\s*\d{3}[-\s]?\d{2}[-\s]?\d{2}'
+    m = re.search(pattern, text)
+    if m:
+        return m.group(0).strip()
+    return None
+
+
+def fetch_ad_phone_with_token(ad_id: int, bearer_token: str, timeout: int = 5) -> Optional[str]:
+    """Fetches phone from Kufar API if authorized user token is provided."""
+    if not bearer_token:
+        return None
+    url = f"https://cre-api.kufar.by/ads-search/v1/engine/v1/item/{ad_id}/phone"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {bearer_token}",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            return data.get("phone")
+    except Exception:
+        return None
