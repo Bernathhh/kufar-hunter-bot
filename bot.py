@@ -354,18 +354,21 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
         for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
             AD_MESSAGES_MAP.pop(old_k, None)
 
-    # Case 1: Multiple photos -> Send ALL photos as album, then ad card with buttons attached directly!
+    # Case 1: Multiple photos -> Send ALL photos as album WITH description together in one single message!
     if len(image_urls) >= 2:
-        media = [{"type": "photo", "media": u} for u in image_urls[:10]]
+        album_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
+        media = [{"type": "photo", "media": image_urls[0], "caption": album_caption, "parse_mode": "HTML"}]
+        for u in image_urls[1:10]:
+            media.append({"type": "photo", "media": u})
         res_album = tg.send_media_group(chat_id, media)
         if res_album and isinstance(res_album, list):
             for m in res_album:
                 if isinstance(m, dict) and "message_id" in m:
                     sent_mids.append(m["message_id"])
 
-        res_card = tg.send_message(chat_id, caption, reply_markup=markup)
-        if res_card and isinstance(res_card, dict) and "message_id" in res_card:
-            sent_mids.append(res_card["message_id"])
+        res_btn = tg.send_message(chat_id, "⚡ <b>Действия с объявлением:</b>", reply_markup=markup)
+        if res_btn and isinstance(res_btn, dict) and "message_id" in res_btn:
+            sent_mids.append(res_btn["message_id"])
             AD_MESSAGES_MAP[(chat_id, ad_id)] = sent_mids
             return True
 
