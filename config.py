@@ -40,6 +40,13 @@ def load_config() -> dict:
     if env_interval and env_interval.isdigit():
         config["check_interval_seconds"] = int(env_interval)
 
+    env_queries = os.getenv("INITIAL_QUERIES")
+    if env_queries:
+        try:
+            config["initial_queries"] = json.loads(env_queries)
+        except Exception:
+            pass
+
     return config
 
 def save_default_config_if_missing():

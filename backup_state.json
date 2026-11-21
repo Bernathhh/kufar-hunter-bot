@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "exported_at": "2026-11-21T23:32:08.545193",
+  "queries": [
+    {
+      "chat_id": 747868993,
+      "name": "PlayStation 5 Slim",
+      "params": {
+        "query": "slim",
+        "cat": "5040",
+        "sort": "lst.d"
+      },
+      "is_active": 1
+    },
+    {
+      "chat_id": 747868993,
+      "name": "slim",
+      "params": {
+        "query": "slim",
+        "prc": "r:100000,210000",
+        "ar": "v.or:22,23,24,25,26,27,28,29,30",
+        "rgn": "7",
+        "cat": "5040",
+        "sort": "lst.d",
+        "size": "30"
+      },
+      "is_active": 1
+    }
+  ],
+  "users": [
+    {
+      "chat_id": 747868993,
+      "username": "bernathh",
+      "first_name": "Pavel",
+      "last_name": "Bernat"
+    }
+  ],
+  "blacklisted_ads": [
+    {
+      "chat_id": 747868993,
+      "ad_id": 1041713901
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1084356351
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1088843778
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1090918334
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1092624813
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1094308193
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1094761587
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1095820675
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1095901774
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1095965941
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1096154934
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1096170609
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1096262677
+    },
+    {
+      "chat_id": 747868993,
+      "ad_id": 1096282881
+    }
+  ]
+}

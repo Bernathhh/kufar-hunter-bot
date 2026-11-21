@@ -195,6 +195,11 @@ class TelegramClient:
         res = self._api_call("unpinChatMessage", payload=payload)
         return res is not None
 
+    def unpin_all_chat_messages(self, chat_id: int) -> bool:
+        """Unpins all messages in the specified chat."""
+        res = self._api_call("unpinAllChatMessages", payload={"chat_id": chat_id})
+        return res is not None
+
     def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves file info including file_path for downloading."""
         return self._api_call("getFile", payload={"file_id": file_id})
