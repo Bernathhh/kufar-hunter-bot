@@ -61,14 +61,16 @@ class TelegramClient:
         text: str,
         parse_mode: str = "HTML",
         disable_web_page_preview: bool = False,
-        reply_markup: Optional[Dict[str, Any]] = None
+        reply_markup: Optional[Dict[str, Any]] = None,
+        disable_notification: bool = False
     ) -> Optional[Dict[str, Any]]:
         """Sends a text message with optional reply_markup."""
         payload = {
             "chat_id": chat_id,
             "text": text,
             "parse_mode": parse_mode,
-            "disable_web_page_preview": disable_web_page_preview
+            "disable_web_page_preview": disable_web_page_preview,
+            "disable_notification": disable_notification
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
@@ -170,3 +172,76 @@ class TelegramClient:
             logger.info("Photo sending failed, falling back to sendMessage")
             return self.send_message(chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup) is not None
         return False
+
+    def get_chat(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieves chat information, including pinned_message."""
+        return self._api_call("getChat", payload={"chat_id": chat_id})
+
+    def pin_chat_message(self, chat_id: int, message_id: int, disable_notification: bool = True) -> bool:
+        """Pins a message in the specified chat."""
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "disable_notification": disable_notification
+        }
+        res = self._api_call("pinChatMessage", payload=payload)
+        return res is not None
+
+    def unpin_chat_message(self, chat_id: int, message_id: Optional[int] = None) -> bool:
+        """Unpins a message in the specified chat."""
+        payload: Dict[str, Any] = {"chat_id": chat_id}
+        if message_id is not None:
+            payload["message_id"] = message_id
+        res = self._api_call("unpinChatMessage", payload=payload)
+        return res is not None
+
+    def get_file(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves file info including file_path for downloading."""
+        return self._api_call("getFile", payload={"file_id": file_id})
+
+    def download_file(self, file_path: str) -> Optional[bytes]:
+        """Downloads file bytes from Telegram server."""
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except Exception as e:
+            logger.error(f"Error downloading file {file_path}: {e}")
+            return None
+
+    def send_document(
+        self,
+        chat_id: int,
+        filename: str,
+        content_bytes: bytes,
+        caption: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Uploads a document (e.g. backup file) using multipart/form-data."""
+        import time
+        boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
+        parts = []
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode("utf-8"))
+        if caption:
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode("utf-8"))
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n".encode("utf-8"))
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8")
+        )
+        parts.append(content_bytes)
+        parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        
+        full_body = b"".join(parts)
+        url = f"{self.base_url}/sendDocument"
+        req = urllib.request.Request(
+            url,
+            data=full_body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=35) as response:
+                res = json.loads(response.read().decode("utf-8"))
+                return res.get("result") if res.get("ok") else None
+        except Exception as e:
+            logger.error(f"Error uploading document: {e}")
+            return None

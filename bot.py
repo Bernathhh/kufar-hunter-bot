@@ -37,7 +37,9 @@ from database import (
     remove_from_blacklist,
     is_ad_blacklisted,
     get_user_blacklist,
-    get_blacklist_count
+    get_blacklist_count,
+    export_database_state,
+    import_database_state
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -413,6 +415,11 @@ def hunter_loop(tg: TelegramClient, config: dict):
                         logger.error(f"Error checking query '{q['name']}': {e}")
                     time.sleep(2.0)
                 TOTAL_CHECKS += 1
+                if TOTAL_CHECKS % 20 == 0:
+                    try:
+                        sync_backup_to_telegram(tg, config)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error(f"Unexpected error in hunter loop: {e}")
 
@@ -421,6 +428,137 @@ def hunter_loop(tg: TelegramClient, config: dict):
 
 
 # ==================== UI & COMMAND HANDLERS ====================
+
+def sync_backup_to_telegram(tg: TelegramClient, config: dict, force_notify: bool = False):
+    """
+    Saves current queries, users, and blacklist into a pinned message in the admin chat.
+    This guarantees that whenever Render rebuilds or redeploys, no searches are lost.
+    """
+    admin_chat_id = config.get("admin_chat_id", 0)
+    if not admin_chat_id:
+        return
+
+    state = export_database_state()
+    queries = state.get("queries", [])
+    # Never overwrite a backup if local DB is completely empty (e.g. during fresh deploy before restore)
+    if not queries and not state.get("blacklisted_ads") and not force_notify:
+        return
+
+    raw_json = json.dumps(state, ensure_ascii=False)
+    updated_time = datetime.now().strftime("%d.%m.%Y в %H:%M:%S")
+    q_count = len(queries)
+    bl_count = len(state.get("blacklisted_ads", []))
+    u_count = len(state.get("users", []))
+
+    header = (
+        f"💾 <b>Kufar Hunter — Облачный бэкап данных</b>\n"
+        f"<i>Автоматическое сохранение фильтров при деплоях на Render.</i>\n\n"
+        f"📊 <b>Сохранено:</b>\n"
+        f"• Поисков: <b>{q_count}</b>\n"
+        f"• В ЧС: <b>{bl_count}</b>\n"
+        f"• Пользователей: <b>{u_count}</b>\n"
+        f"🕒 <b>Обновлено:</b> {updated_time}\n\n"
+    )
+
+    if len(raw_json) < 3200:
+        text = f"{header}#KUFAR_BACKUP_START\n<pre><code class=\"language-json\">{raw_json}</code></pre>\n#KUFAR_BACKUP_END"
+        try:
+            chat_info = tg.get_chat(admin_chat_id)
+            pinned = chat_info.get("pinned_message") if chat_info else None
+            # If the pinned message is already our backup, update it in-place to avoid chat spam
+            if pinned and pinned.get("message_id") and "#KUFAR_BACKUP_START" in pinned.get("text", ""):
+                tg.edit_message_text(admin_chat_id, pinned["message_id"], text=text)
+            else:
+                msg = tg.send_message(admin_chat_id, text, disable_notification=True)
+                if msg and msg.get("message_id"):
+                    tg.pin_chat_message(admin_chat_id, msg["message_id"], disable_notification=True)
+            if force_notify:
+                tg.send_message(admin_chat_id, f"✅ <b>Бэкап успешно сохранён в Telegram!</b>\nПоисков: {q_count}, ЧС: {bl_count}.")
+        except Exception as e:
+            logger.error(f"Error syncing backup text to Telegram: {e}")
+    else:
+        # Document mode for large state
+        try:
+            doc_msg = tg.send_document(
+                admin_chat_id,
+                "kufar_backup.json",
+                raw_json.encode("utf-8"),
+                caption=f"{header}#KUFAR_BACKUP_DOC"
+            )
+            if doc_msg and doc_msg.get("message_id"):
+                tg.pin_chat_message(admin_chat_id, doc_msg["message_id"], disable_notification=True)
+            if force_notify:
+                tg.send_message(admin_chat_id, f"✅ <b>Файл бэкапа успешно отправлен!</b>\nПоисков: {q_count}, ЧС: {bl_count}.")
+        except Exception as e:
+            logger.error(f"Error uploading backup document: {e}")
+
+
+def restore_state_from_telegram(tg: TelegramClient, config: dict) -> bool:
+    """
+    Checks the pinned backup message in admin chat and restores all queries and blacklist.
+    Called automatically on bot startup if queries are missing.
+    """
+    admin_chat_id = config.get("admin_chat_id", 0)
+    if not admin_chat_id:
+        return False
+
+    try:
+        chat_info = tg.get_chat(admin_chat_id)
+        if not chat_info:
+            return False
+
+        pinned = chat_info.get("pinned_message")
+        if not pinned:
+            logger.info("No pinned message found in admin chat for restore.")
+            return False
+
+        state = None
+        pinned_text = pinned.get("text", "")
+
+        # Mode A: Text message
+        if "#KUFAR_BACKUP_START" in pinned_text and "#KUFAR_BACKUP_END" in pinned_text:
+            part = pinned_text.split("#KUFAR_BACKUP_START")[1].split("#KUFAR_BACKUP_END")[0].strip()
+            # Clean HTML tags if any
+            part = part.replace("<pre><code class=\"language-json\">", "").replace("</code></pre>", "")
+            part = part.replace("<pre>", "").replace("</pre>", "").replace("<code>", "").replace("</code>", "").strip()
+            try:
+                state = json.loads(part)
+            except Exception as e:
+                logger.error(f"Error decoding JSON from pinned text: {e}")
+
+        # Mode B: Document message
+        elif pinned.get("document"):
+            doc = pinned["document"]
+            file_id = doc.get("file_id")
+            if file_id:
+                file_info = tg.get_file(file_id)
+                if file_info and file_info.get("file_path"):
+                    content = tg.download_file(file_info["file_path"])
+                    if content:
+                        try:
+                            state = json.loads(content.decode("utf-8"))
+                        except Exception as e:
+                            logger.error(f"Error decoding JSON from document: {e}")
+
+        if state and (state.get("queries") or state.get("blacklisted_ads")):
+            stats = import_database_state(state)
+            logger.info(f"Successfully restored state from Telegram: {stats}")
+            if stats["queries"] > 0 or stats["blacklisted"] > 0:
+                tg.send_message(
+                    admin_chat_id,
+                    f"🔄 <b>Бот перезапущен/обновлен на Render!</b>\n\n"
+                    f"✅ <b>Все ваши данные успешно восстановлены:</b>\n"
+                    f"• Поисков восстановлено: <b>{stats['queries']}</b>\n"
+                    f"• В чёрном списке: <b>{stats['blacklisted']}</b>\n"
+                    f"• Пользователей: <b>{stats['users']}</b>\n\n"
+                    f"🔔 Фоновый мониторинг Kufar продолжает работу!"
+                )
+            return True
+    except Exception as e:
+        logger.error(f"Error restoring state from Telegram: {e}")
+
+    return False
+
 
 def check_and_notify_new_user(tg: TelegramClient, user: Dict[str, Any], config: dict):
     """Registers user in database and notifies admin if this user is new."""
@@ -902,6 +1040,9 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         # Notify admin of new filter
         notify_admin_new_filter(tg, chat_id, from_user, qid, item["name"], item["params"], config)
 
+        # Sync cloud backup to Telegram so search is never lost on Render deploy
+        sync_backup_to_telegram(tg, config)
+
         tg.send_message(
             chat_id,
             f"🎉 <b>Поиск «{html.escape(item['name'])}» успешно активирован!</b> [ID: {qid}]\n\n"
@@ -919,6 +1060,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data.startswith("cb:del:"):
         qid = int(data.split(":")[-1])
         delete_query(qid, chat_id=chat_id)
+        sync_backup_to_telegram(tg, config)
         tg.send_message(chat_id, f"🗑 Поиск <b>[ID: {qid}]</b> удален.", reply_markup=MAIN_KEYBOARD)
         admin_chat_id = config.get("admin_chat_id", 0)
         if admin_chat_id and chat_id != admin_chat_id:
@@ -934,6 +1076,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data.startswith("cb:bl:"):
         ad_id = int(data.split(":")[-1])
         add_to_blacklist(chat_id, ad_id)
+        sync_backup_to_telegram(tg, config)
         tg.answer_callback_query(cb_id, text="🚫 Объявление скрыто и добавлено в ЧС!", show_alert=False)
         ad_link = f"https://www.kufar.by/item/{ad_id}"
         new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=True)
@@ -950,6 +1093,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data.startswith("cb:unbl:"):
         ad_id = int(data.split(":")[-1])
         remove_from_blacklist(chat_id, ad_id)
+        sync_backup_to_telegram(tg, config)
         tg.answer_callback_query(cb_id, text="✅ Объявление убрано из ЧС", show_alert=False)
         ad_link = f"https://www.kufar.by/item/{ad_id}"
         new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=False)
@@ -1017,6 +1161,16 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
 
     if text in ["📦 Вывести все объявления", "⚡ Проверить сейчас", "/check", "/all", "/ads"]:
         output_all_user_ads(tg, chat_id)
+        return
+
+    if text in ["/backup", "💾 Бэкап"]:
+        sync_backup_to_telegram(tg, config, force_notify=True)
+        return
+
+    if text in ["/restore", "🔄 Восстановить"]:
+        ok = restore_state_from_telegram(tg, config)
+        if not ok:
+            tg.send_message(chat_id, "ℹ️ Нет доступного бэкапа для восстановления или данные уже актуальны.")
         return
 
     if text in ["📊 Статистика", "/status"]:
@@ -1119,6 +1273,33 @@ def telegram_listener(tg: TelegramClient, config: dict):
                 chat_id = msg.get("chat", {}).get("id")
                 text = msg.get("text")
                 from_user = msg.get("from", {})
+
+                # Handle document backup file uploads (.json)
+                doc = msg.get("document")
+                if doc and chat_id:
+                    fname = doc.get("file_name", "")
+                    admin_chat_id = config.get("admin_chat_id", 0)
+                    if fname.endswith(".json") and chat_id == admin_chat_id:
+                        file_info = tg.get_file(doc.get("file_id", ""))
+                        if file_info and file_info.get("file_path"):
+                            bytes_data = tg.download_file(file_info["file_path"])
+                            if bytes_data:
+                                try:
+                                    state = json.loads(bytes_data.decode("utf-8"))
+                                    stats = import_database_state(state)
+                                    tg.send_message(
+                                        chat_id,
+                                        f"✅ <b>Файл бэкапа успешно импортирован!</b>\n"
+                                        f"• Поисков добавлено: <b>{stats['queries']}</b>\n"
+                                        f"• В чёрный список: <b>{stats['blacklisted']}</b>\n"
+                                        f"• Пользователей: <b>{stats['users']}</b>",
+                                        reply_markup=MAIN_KEYBOARD
+                                    )
+                                    sync_backup_to_telegram(tg, config)
+                                except Exception as e:
+                                    tg.send_message(chat_id, f"⚠️ Ошибка при чтении бэкапа: {e}")
+                        continue
+
                 if chat_id and text:
                     process_text_message(tg, chat_id, text, config, user_info=from_user)
         except Exception as e:
@@ -1151,6 +1332,18 @@ def main():
     if admin_id:
         print(f"👑 Администратор для оповещений: chat_id={admin_id}")
     print("🌐 Режим работы: мультипользовательский (уведомления админу о новых пользователях и фильтрах).")
+
+    # Restore state from Telegram Cloud Backup if local queries are missing (e.g. after Render redeploy)
+    active = get_active_queries()
+    if len(active) == 0:
+        print("📦 База данных пуста. Восстанавливаем сохраненные фильтры из облачного бэкапа Telegram...")
+        restored = restore_state_from_telegram(tg, config)
+        if restored:
+            print("✅ Все сохраненные поиски успешно восстановлены!")
+    else:
+        print(f"📦 Загружено активных поисков: {len(active)}")
+        # Sync current state to backup if not already synced
+        sync_backup_to_telegram(tg, config)
 
     # Start health server for Render
     port_env = os.getenv("PORT")

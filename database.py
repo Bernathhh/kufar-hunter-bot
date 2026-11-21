@@ -5,6 +5,7 @@ Stores tracking queries and seen advertisements to avoid duplicates.
 import sqlite3
 import json
 import os
+from datetime import datetime
 from typing import List, Dict, Optional, Any, Set
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "kufar_hunter.db")
@@ -270,4 +271,103 @@ def get_blacklist_count(chat_id: int, db_path: str = DB_FILE) -> int:
         cursor.execute("SELECT COUNT(*) as cnt FROM blacklisted_ads WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
         return row["cnt"] if row else 0
+
+
+# ==================== CLOUD STATE BACKUP & RESTORE ====================
+
+def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
+    """Exports all queries, users, and blacklisted ads to a dictionary."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        
+        # Queries
+        cursor.execute("SELECT chat_id, name, params_json, is_active FROM queries")
+        queries = []
+        for r in cursor.fetchall():
+            try:
+                params = json.loads(r["params_json"])
+            except Exception:
+                params = {}
+            queries.append({
+                "chat_id": r["chat_id"],
+                "name": r["name"],
+                "params": params,
+                "is_active": r["is_active"]
+            })
+            
+        # Users
+        cursor.execute("SELECT chat_id, username, first_name, last_name FROM users")
+        users = [dict(r) for r in cursor.fetchall()]
+        
+        # Blacklist
+        cursor.execute("SELECT chat_id, ad_id FROM blacklisted_ads")
+        blacklisted = [dict(r) for r in cursor.fetchall()]
+        
+        return {
+            "version": 1,
+            "exported_at": datetime.now().isoformat(),
+            "queries": queries,
+            "users": users,
+            "blacklisted_ads": blacklisted
+        }
+
+
+def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict[str, int]:
+    """Imports queries, users, and blacklisted ads from a state dictionary."""
+    init_db(db_path)
+    imported_queries = 0
+    imported_users = 0
+    imported_bl = 0
+    
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        
+        # Import Users
+        for u in state.get("users", []):
+            cid = u.get("chat_id")
+            if cid:
+                cursor.execute("SELECT 1 FROM users WHERE chat_id = ?", (cid,))
+                if not cursor.fetchone():
+                    cursor.execute(
+                        "INSERT INTO users (chat_id, username, first_name, last_name, first_seen, last_seen) "
+                        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                        (cid, u.get("username"), u.get("first_name"), u.get("last_name"))
+                    )
+                    imported_users += 1
+
+        # Import Queries
+        for q in state.get("queries", []):
+            cid = q.get("chat_id")
+            name = q.get("name")
+            params = q.get("params", {})
+            if cid and name and params:
+                cursor.execute(
+                    "SELECT 1 FROM queries WHERE chat_id = ? AND name = ?",
+                    (cid, name)
+                )
+                if not cursor.fetchone():
+                    cursor.execute(
+                        "INSERT INTO queries (chat_id, name, params_json, is_active) VALUES (?, ?, ?, ?)",
+                        (cid, name, json.dumps(params), q.get("is_active", 1))
+                    )
+                    imported_queries += 1
+
+        # Import Blacklist
+        for b in state.get("blacklisted_ads", []):
+            cid = b.get("chat_id")
+            ad_id = b.get("ad_id")
+            if cid and ad_id:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO blacklisted_ads (chat_id, ad_id) VALUES (?, ?)",
+                    (cid, int(ad_id))
+                )
+                imported_bl += 1
+                
+        conn.commit()
+        
+    return {
+        "queries": imported_queries,
+        "users": imported_users,
+        "blacklisted": imported_bl
+    }
 
