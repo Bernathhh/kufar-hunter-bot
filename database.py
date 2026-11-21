@@ -46,6 +46,30 @@ def init_db(db_path: str = DB_FILE):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_seen_query ON seen_ads(query_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_queries_chat ON queries(chat_id)")
         
+        # Registered bot users
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Blacklisted / hidden ads table (per user)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blacklisted_ads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                ad_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, ad_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_user ON blacklisted_ads(chat_id, ad_id)")
+        
         conn.commit()
 
 
@@ -139,3 +163,111 @@ def get_query_seen_count(query_id: int, db_path: str = DB_FILE) -> int:
         cursor.execute("SELECT COUNT(*) as cnt FROM seen_ads WHERE query_id = ?", (query_id,))
         row = cursor.fetchone()
         return row["cnt"] if row else 0
+
+
+# ==================== USER REGISTRATION ====================
+
+def register_or_update_user(
+    chat_id: int,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    db_path: str = DB_FILE
+) -> bool:
+    """
+    Registers a new bot user or updates existing user's last_seen timestamp.
+    Returns True if this is a brand new user, False otherwise.
+    """
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id FROM users WHERE chat_id = ?", (chat_id,))
+        exists = cursor.fetchone() is not None
+        if not exists:
+            cursor.execute(
+                "INSERT INTO users (chat_id, username, first_name, last_name, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                (chat_id, username, first_name, last_name)
+            )
+            conn.commit()
+            return True
+        else:
+            cursor.execute(
+                "UPDATE users SET username = ?, first_name = ?, last_name = ?, last_seen = CURRENT_TIMESTAMP "
+                "WHERE chat_id = ?",
+                (username, first_name, last_name, chat_id)
+            )
+            conn.commit()
+            return False
+
+
+def get_all_users(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
+    """Returns all registered users."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id, username, first_name, last_name, first_seen, last_seen FROM users ORDER BY last_seen DESC")
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_user_count(db_path: str = DB_FILE) -> int:
+    """Returns total number of registered users."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM users")
+        row = cursor.fetchone()
+        return row["cnt"] if row else 0
+
+
+# ==================== BLACKLIST (ЧС / НЕ ИНТЕРЕСНО) ====================
+
+def add_to_blacklist(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+    """Adds an ad_id to user's blacklist so it is hidden and never shown again."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO blacklisted_ads (chat_id, ad_id) VALUES (?, ?)",
+            (chat_id, int(ad_id))
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def remove_from_blacklist(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+    """Removes an ad_id from user's blacklist."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM blacklisted_ads WHERE chat_id = ? AND ad_id = ?",
+            (chat_id, int(ad_id))
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def is_ad_blacklisted(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+    """Checks if an ad_id is in user's blacklist."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM blacklisted_ads WHERE chat_id = ? AND ad_id = ?",
+            (chat_id, int(ad_id))
+        )
+        return cursor.fetchone() is not None
+
+
+def get_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> Set[int]:
+    """Returns a set of ad_ids currently blacklisted by user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT ad_id FROM blacklisted_ads WHERE chat_id = ?", (chat_id,))
+        return {r["ad_id"] for r in cursor.fetchall()}
+
+
+def get_blacklist_count(chat_id: int, db_path: str = DB_FILE) -> int:
+    """Returns total blacklisted ads count for user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM blacklisted_ads WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        return row["cnt"] if row else 0
+

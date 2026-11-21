@@ -29,7 +29,15 @@ from database import (
     delete_query,
     is_ad_seen,
     mark_ads_seen,
-    get_query_seen_count
+    get_query_seen_count,
+    register_or_update_user,
+    get_all_users,
+    get_user_count,
+    add_to_blacklist,
+    remove_from_blacklist,
+    is_ad_blacklisted,
+    get_user_blacklist,
+    get_blacklist_count
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -82,11 +90,28 @@ REGIONS = [
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
-        [{"text": "⚡ Проверить сейчас"}, {"text": "⏱ Интервал"}],
+        [{"text": "📦 Вывести все объявления"}, {"text": "⏱ Интервал"}],
         [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
     ],
     "resize_keyboard": True
 }
+
+
+def make_ad_keyboard(ad_link: str, ad_id: int, is_blacklisted: bool = False) -> Dict[str, Any]:
+    """Builds inline action keyboard for an advertisement."""
+    if is_blacklisted:
+        return {
+            "inline_keyboard": [
+                [{"text": "🔗 Открыть на Kufar", "url": ad_link}],
+                [{"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"}]
+            ]
+        }
+    return {
+        "inline_keyboard": [
+            [{"text": "🔗 Открыть на Kufar", "url": ad_link}],
+            [{"text": "🚫 Не интересно (в ЧС)", "callback_data": f"cb:bl:{ad_id}"}]
+        ]
+    }
 
 
 class HealthHandler(http.server.SimpleHTTPRequestHandler):
@@ -277,24 +302,26 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = ""
             clean_desc = clean_desc[:360] + "..."
         lines.append(f"\n📝 <b>Описание:</b>\n<i>{clean_desc}</i>")
 
-    lines.append(f"\n👉 <a href=\"{link}\">Открыть объявление на Kufar</a>")
-
     return "\n".join(lines)
 
 
 def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], query_name: str) -> bool:
-    """Sends notification with all photos (album) if multiple, plus description and phone."""
-    # Fetch description from Kufar item page
-    description = fetch_ad_description(ad["ad_id"])
+    """Sends notification with all photos (album) if multiple, plus description, phone, and action buttons."""
+    ad_id = ad["ad_id"]
+    if is_ad_blacklisted(chat_id, ad_id):
+        logger.info(f"Ad {ad_id} is blacklisted by chat {chat_id}, skipping")
+        return False
+
+    description = ad.get("description")
+    if description is None:
+        description = fetch_ad_description(ad_id)
+        ad["description"] = description
+
     caption = format_ad_caption(ad, query_name, description=description)
-
     image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
+    ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
 
-    markup = {
-        "inline_keyboard": [
-            [{"text": "🔗 Открыть на Kufar", "url": ad.get("ad_link", "https://kufar.by")}]
-        ]
-    }
+    markup = make_ad_keyboard(ad_link, ad_id)
 
     # Case 1: Multiple photos -> Send as Telegram Media Group Album (up to 10 photos)
     if len(image_urls) >= 2:
@@ -303,9 +330,11 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
             media.append({"type": "photo", "media": u})
         ok = tg.send_media_group(chat_id, media)
         if ok:
+            # Action button bar directly below album
+            tg.send_message(chat_id, "⚡ <b>Действия с объявлением:</b>", reply_markup=markup)
             return True
 
-    # Case 2: Single photo -> sendPhoto with button
+    # Case 2: Single photo -> sendPhoto with action buttons attached directly
     if len(image_urls) == 1:
         ok = tg.send_photo(chat_id, image_urls[0], caption=caption, reply_markup=markup)
         if ok:
@@ -339,22 +368,29 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
         mark_ads_seen(qid, all_ids)
         return 0
 
+    bl = get_user_blacklist(chat_id)
     new_ads = [a for a in ads if not is_ad_seen(qid, a["ad_id"])]
     if not new_ads:
         return 0
 
     logger.info(f"Found {len(new_ads)} new ads for query '{name}'!")
 
+    sent_count = 0
     for ad in reversed(new_ads):
+        ad_id = ad["ad_id"]
+        mark_ads_seen(qid, [ad_id])
+        if ad_id in bl:
+            logger.info(f"Ad {ad_id} is in blacklist for chat {chat_id}, skipping notification")
+            continue
         try:
-            send_ad_notification(tg, chat_id, ad, name)
-            mark_ads_seen(qid, [ad["ad_id"]])
-            NEW_ADS_FOUND += 1
-            time.sleep(1.0)
+            if send_ad_notification(tg, chat_id, ad, name):
+                sent_count += 1
+                NEW_ADS_FOUND += 1
+                time.sleep(1.0)
         except Exception as e:
             logger.error(f"Error sending ad notification: {e}")
 
-    return len(new_ads)
+    return sent_count
 
 
 def hunter_loop(tg: TelegramClient, config: dict):
@@ -386,11 +422,180 @@ def hunter_loop(tg: TelegramClient, config: dict):
 
 # ==================== UI & COMMAND HANDLERS ====================
 
+def check_and_notify_new_user(tg: TelegramClient, user: Dict[str, Any], config: dict):
+    """Registers user in database and notifies admin if this user is new."""
+    chat_id = user.get("id")
+    if not chat_id:
+        return
+    username = user.get("username")
+    first_name = user.get("first_name", "")
+    last_name = user.get("last_name", "")
+
+    is_new = register_or_update_user(chat_id, username, first_name, last_name)
+    admin_chat_id = config.get("admin_chat_id", 0)
+
+    if is_new and admin_chat_id and chat_id != admin_chat_id:
+        full_name = f"{first_name} {last_name}".strip() or "Без имени"
+        u_str = f"@{username}" if username else "<i>нет username</i>"
+        text = (
+            f"👤 <b>Новый пользователь запустил бота!</b>\n\n"
+            f"🆔 <b>Chat ID:</b> <code>{chat_id}</code>\n"
+            f"👤 <b>Имя:</b> {html.escape(full_name)}\n"
+            f"🔗 <b>Username:</b> {u_str}\n"
+            f"📅 <b>Дата:</b> {datetime.now().strftime('%d.%m.%Y в %H:%M:%S')}"
+        )
+        try:
+            tg.send_message(admin_chat_id, text)
+        except Exception as e:
+            logger.error(f"Error notifying admin of new user: {e}")
+
+
+def notify_admin_new_filter(
+    tg: TelegramClient,
+    chat_id: int,
+    user: Dict[str, Any],
+    qid: int,
+    name: str,
+    params: Dict[str, Any],
+    config: dict
+):
+    """Notifies admin whenever any user adds a new search filter."""
+    admin_chat_id = config.get("admin_chat_id", 0)
+    if not admin_chat_id:
+        return
+
+    username = user.get("username")
+    first_name = user.get("first_name", "")
+    last_name = user.get("last_name", "")
+    full_name = f"{first_name} {last_name}".strip() or "Без имени"
+    u_str = f"@{username}" if username else f"ID: {chat_id}"
+
+    who = "Вы (админ)" if chat_id == admin_chat_id else f"{html.escape(full_name)} ({u_str})"
+
+    text = (
+        f"🎯 <b>Пользователь добавил фильтр!</b>\n\n"
+        f"👤 <b>Пользователь:</b> {who}\n"
+        f"🆔 <b>Chat ID:</b> <code>{chat_id}</code>\n"
+        f"🏷 <b>Поиск [ID: {qid}]:</b> {html.escape(name)}\n\n"
+        f"{format_params_human(params)}"
+    )
+    if chat_id != admin_chat_id:
+        try:
+            tg.send_message(admin_chat_id, text)
+        except Exception as e:
+            logger.error(f"Error notifying admin of new filter: {e}")
+
+
+def output_all_user_ads(tg: TelegramClient, chat_id: int):
+    """Outputs current listings for all active user searches, respecting blacklisted items."""
+    queries = get_user_queries(chat_id)
+    if not queries:
+        text = (
+            "📭 <b>У вас пока нет активных поисков.</b>\n\n"
+            "Нажмите кнопку <b>«➕ Добавить поиск»</b>, чтобы создать первый фильтр!"
+        )
+        tg.send_message(chat_id, text, reply_markup=MAIN_KEYBOARD)
+        return
+
+    tg.send_message(
+        chat_id,
+        f"🔍 <b>Загружаю актуальные объявления по вашим фильтрам...</b>\n"
+        f"<i>Фильтров: {len(queries)}. Пожалуйста, подождите...</i>"
+    )
+
+    bl = get_user_blacklist(chat_id)
+    seen_in_run = set()
+    total_shown = 0
+
+    for q in queries:
+        q_name = q["name"]
+        params = q["params"]
+        try:
+            ads = fetch_ads(params)
+        except Exception as e:
+            logger.error(f"Error fetching ads for query {q.get('id')}: {e}")
+            continue
+
+        valid_ads = [a for a in ads if a["ad_id"] not in bl and a["ad_id"] not in seen_in_run]
+        # Show top 10 most recent listings per query
+        for ad in valid_ads[:10]:
+            seen_in_run.add(ad["ad_id"])
+            try:
+                if send_ad_notification(tg, chat_id, ad, q_name):
+                    total_shown += 1
+                    time.sleep(0.8)
+            except Exception as e:
+                logger.error(f"Error displaying ad {ad.get('ad_id')}: {e}")
+
+    if total_shown == 0:
+        tg.send_message(
+            chat_id,
+            "📭 <b>На Куфаре пока нет подходящих объявлений</b> (или все имеющиеся добавлены вами в чёрный список).",
+            reply_markup=MAIN_KEYBOARD
+        )
+    else:
+        tg.send_message(
+            chat_id,
+            f"✅ <b>Вывод завершён! Всего показано: {total_shown} объявлений.</b>\n\n"
+            f"💡 <i>Если объявление вам не подходит, нажмите кнопку «🚫 Не интересно», чтобы оно больше никогда не показывалось.</i>",
+            reply_markup=MAIN_KEYBOARD
+        )
+
+
+def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
+    """Outputs current listings for a specific search query."""
+    queries = get_user_queries(chat_id)
+    target = next((q for q in queries if q["id"] == qid), None)
+    if not target:
+        tg.send_message(chat_id, "⚠️ Этот поиск не найден или был удалён.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    q_name = target["name"]
+    params = target["params"]
+
+    tg.send_message(
+        chat_id,
+        f"🔍 <b>Загружаю актуальные объявления для «{html.escape(q_name)}»...</b>"
+    )
+
+    bl = get_user_blacklist(chat_id)
+    try:
+        ads = fetch_ads(params)
+    except Exception as e:
+        logger.error(f"Error fetching ads for query {qid}: {e}")
+        tg.send_message(chat_id, f"⚠️ Ошибка загрузки объявлений: {e}", reply_markup=MAIN_KEYBOARD)
+        return
+
+    valid_ads = [a for a in ads if a["ad_id"] not in bl]
+    total_shown = 0
+
+    for ad in valid_ads[:10]:
+        try:
+            if send_ad_notification(tg, chat_id, ad, q_name):
+                total_shown += 1
+                time.sleep(0.8)
+        except Exception as e:
+            logger.error(f"Error displaying ad {ad.get('ad_id')}: {e}")
+
+    if total_shown == 0:
+        tg.send_message(
+            chat_id,
+            f"📭 По поиску «{html.escape(q_name)}» нет подходящих объявлений (или все добавлены в ЧС).",
+            reply_markup=MAIN_KEYBOARD
+        )
+    else:
+        tg.send_message(
+            chat_id,
+            f"✅ <b>Показано {total_shown} объявлений по поиску «{html.escape(q_name)}».</b>",
+            reply_markup=MAIN_KEYBOARD
+        )
+
+
 def show_main_menu(tg: TelegramClient, chat_id: int):
     """Sends greeting with main keyboard menu."""
     text = (
         "👋 <b>Главное меню Kufar Hunter</b>\n\n"
-        "Бот настроен исключительно под ваш аккаунт и готов ловить объявления по точным фильтрам Куфара.\n\n"
+        "Бот непрерывно мониторит Kufar и мгновенно присылает новые объявления по вашим точным фильтрам.\n\n"
         "Выберите действие на кнопках ниже 👇"
     )
     tg.send_message(chat_id, text, reply_markup=MAIN_KEYBOARD)
@@ -444,7 +649,7 @@ def show_my_searches(tg: TelegramClient, chat_id: int):
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "⚡ Проверить этот поиск", "callback_data": f"cb:check:{qid}"}],
+                [{"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"}],
                 [{"text": "🗑 Удалить этот поиск", "callback_data": f"cb:del:{qid}"}]
             ]
         }
@@ -644,10 +849,8 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     msg = cb.get("message", {})
     msg_id = msg.get("message_id")
 
-    admin_chat_id = config.get("admin_chat_id", 0)
-    if admin_chat_id != 0 and chat_id != admin_chat_id:
-        tg.answer_callback_query(cb_id, text="⛔ Доступ закрыт", show_alert=True)
-        return
+    # Register user and notify admin if new
+    check_and_notify_new_user(tg, from_user, config)
 
     tg.answer_callback_query(cb_id)
 
@@ -696,6 +899,9 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         if item["initial_ads"]:
             mark_ads_seen(qid, item["initial_ads"])
 
+        # Notify admin of new filter
+        notify_admin_new_filter(tg, chat_id, from_user, qid, item["name"], item["params"], config)
+
         tg.send_message(
             chat_id,
             f"🎉 <b>Поиск «{html.escape(item['name'])}» успешно активирован!</b> [ID: {qid}]\n\n"
@@ -714,30 +920,48 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         qid = int(data.split(":")[-1])
         delete_query(qid, chat_id=chat_id)
         tg.send_message(chat_id, f"🗑 Поиск <b>[ID: {qid}]</b> удален.", reply_markup=MAIN_KEYBOARD)
-
-    elif data.startswith("cb:check:"):
-        qid = int(data.split(":")[-1])
-        queries = get_user_queries(chat_id)
-        target = next((q for q in queries if q["id"] == qid), None)
-        if target:
-            tg.send_message(chat_id, f"🔍 Проверяю «{html.escape(target['name'])}» на Куфаре...")
+        admin_chat_id = config.get("admin_chat_id", 0)
+        if admin_chat_id and chat_id != admin_chat_id:
             try:
-                count = check_single_query(tg, target, chat_id_fallback=chat_id)
-                current_ads = fetch_ads(target["params"])
-                total_on_site = len(current_ads)
-                if count > 0:
-                    tg.send_message(chat_id, f"🔥 Найдено и отправлено новых объявлений: <b>{count}</b>!")
-                else:
-                    tg.send_message(
-                        chat_id,
-                        f"✅ <b>Проверка «{html.escape(target['name'])}» завершена!</b>\n\n"
-                        f"Новых объявлений с момента прошлой проверки не появлялось.\n"
-                        f"📦 Всего на сайте по этому фильтру: <b>{total_on_site}</b> объявлений (все уже просмотрены).\n\n"
-                        f"🔔 Как только кто-то выложит новое объявление — бот сразу пришлет его сюда с фото!"
-                    )
-            except Exception as e:
-                logger.error(f"Error checking single query: {e}")
-                tg.send_message(chat_id, f"⚠️ Ошибка при проверке: {e}")
+                tg.send_message(admin_chat_id, f"🗑 <b>Пользователь {chat_id} удалил свой поиск [ID: {qid}].</b>")
+            except Exception:
+                pass
+
+    elif data.startswith("cb:show_ads:") or data.startswith("cb:check:"):
+        qid = int(data.split(":")[-1])
+        output_ads_for_query(tg, chat_id, qid)
+
+    elif data.startswith("cb:bl:"):
+        ad_id = int(data.split(":")[-1])
+        add_to_blacklist(chat_id, ad_id)
+        tg.answer_callback_query(cb_id, text="🚫 Объявление скрыто и добавлено в ЧС!", show_alert=False)
+        ad_link = f"https://www.kufar.by/item/{ad_id}"
+        new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=True)
+        if msg.get("text"):
+            tg.edit_message_text(
+                chat_id,
+                msg_id,
+                text=f"🚫 <i>Объявление #{ad_id} добавлено в чёрный список (скрыто)</i>",
+                reply_markup=new_markup
+            )
+        else:
+            tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
+
+    elif data.startswith("cb:unbl:"):
+        ad_id = int(data.split(":")[-1])
+        remove_from_blacklist(chat_id, ad_id)
+        tg.answer_callback_query(cb_id, text="✅ Объявление убрано из ЧС", show_alert=False)
+        ad_link = f"https://www.kufar.by/item/{ad_id}"
+        new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=False)
+        if msg.get("text"):
+            tg.edit_message_text(
+                chat_id,
+                msg_id,
+                text="⚡ <b>Действия с объявлением:</b>",
+                reply_markup=new_markup
+            )
+        else:
+            tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
 
     elif data.startswith("cb:interval:"):
         sec = int(data.split(":")[-1])
@@ -751,30 +975,25 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         tg.send_message(chat_id, f"⏱ <b>Интервал проверки успешно изменен на {sec} сек!</b>", reply_markup=MAIN_KEYBOARD)
 
 
-def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: dict):
-    """Processes normal text messages from the user."""
+def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: dict, user_info: Optional[Dict[str, Any]] = None):
+    """Processes normal text messages from any user."""
     admin_chat_id = config.get("admin_chat_id", 0)
 
-    # If no admin configured yet, the first user sending /start becomes admin
-    if admin_chat_id == 0:
-        if text.strip() == "/start":
-            config["admin_chat_id"] = chat_id
-            admin_chat_id = chat_id
-            try:
-                config_path = os.path.join(BASE_DIR, "config.json")
-                if os.path.exists(config_path):
-                    with open(config_path, "w", encoding="utf-8") as f:
-                        json.dump(config, f, indent=4, ensure_ascii=False)
-            except Exception as e:
-                logger.error(f"Error saving admin chat id: {e}")
-        else:
-            tg.send_message(chat_id, "⚠️ Бот еще не настроен. Отправьте /start для авторизации.")
-            return
+    # Register user and notify admin if new
+    if user_info:
+        check_and_notify_new_user(tg, user_info, config)
 
-    # Strictly restrict to admin_chat_id
-    if chat_id != admin_chat_id:
-        tg.send_message(chat_id, "⛔ <b>Доступ ограничен.</b> Этот бот работает в приватном режиме.")
-        return
+    # If no admin configured yet, the first user sending /start becomes admin
+    if admin_chat_id == 0 and text.strip() == "/start":
+        config["admin_chat_id"] = chat_id
+        admin_chat_id = chat_id
+        try:
+            config_path = os.path.join(BASE_DIR, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Error saving admin chat id: {e}")
 
     text = text.strip()
 
@@ -796,44 +1015,32 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         show_interval_options(tg, chat_id, config.get("check_interval_seconds", 60))
         return
 
-    if text in ["⚡ Проверить сейчас", "/check"]:
-        queries = get_user_queries(chat_id)
-        if not queries:
-            tg.send_message(chat_id, "📭 У вас пока нет активных поисков. Сначала добавьте поиск через кнопку «➕ Добавить поиск».")
-            return
-
-        tg.send_message(chat_id, f"🔍 Запускаю внеочередную проверку (фильтров: {len(queries)})...")
-        total_new = 0
-        for q in queries:
-            try:
-                total_new += check_single_query(tg, q, chat_id_fallback=chat_id)
-            except Exception as e:
-                logger.error(f"Error checking query {q.get('id')}: {e}")
-
-        if total_new > 0:
-            tg.send_message(chat_id, f"🔥 Проверка завершена! Найдено и отправлено новых объявлений: <b>{total_new}</b>.")
-        else:
-            tg.send_message(
-                chat_id,
-                "✅ <b>Проверка завершена!</b>\n\n"
-                "Новых объявлений с момента прошлой проверки не появлялось.\n"
-                "🔔 Бот продолжает мониторить сайт каждые 30 секунд в фоне и пришлет уведомление сразу же при публикации!"
-            )
+    if text in ["📦 Вывести все объявления", "⚡ Проверить сейчас", "/check", "/all", "/ads"]:
+        output_all_user_ads(tg, chat_id)
         return
 
     if text in ["📊 Статистика", "/status"]:
         uptime_str = str(datetime.now() - START_TIME).split(".")[0]
-        active = len(get_active_queries())
-        tg.send_message(
-            chat_id,
+        user_queries = len(get_user_queries(chat_id))
+        bl_count = get_blacklist_count(chat_id)
+        status_text = (
             f"📊 <b>Статус Kufar Hunter Bot</b>\n\n"
             f"⏱ <b>Время работы:</b> {uptime_str}\n"
-            f"🎯 <b>Активных поисков:</b> {active}\n"
+            f"🎯 <b>Ваших активных поисков:</b> {user_queries}\n"
+            f"🚫 <b>В вашем чёрном списке:</b> {bl_count}\n"
             f"🔄 <b>Проверок выполнено:</b> {TOTAL_CHECKS}\n"
-            f"📨 <b>Отправлено новых объявлений:</b> {NEW_ADS_FOUND}\n"
-            f"⏳ <b>Интервал проверки:</b> {config.get('check_interval_seconds', 60)} сек.\n"
-            f"🛡 <b>Приватный режим:</b> чат <code>{admin_chat_id}</code>"
+            f"⏳ <b>Интервал проверки:</b> {config.get('check_interval_seconds', 60)} сек."
         )
+        if chat_id == admin_chat_id:
+            total_users = get_user_count()
+            total_active_q = len(get_active_queries())
+            status_text += (
+                f"\n\n👑 <b>Панель администратора:</b>\n"
+                f"👥 <b>Пользователей в боте:</b> {total_users}\n"
+                f"🎯 <b>Всего активных фильтров:</b> {total_active_q}\n"
+                f"📨 <b>Отправлено новых объявлений:</b> {NEW_ADS_FOUND}"
+            )
+        tg.send_message(chat_id, status_text, reply_markup=MAIN_KEYBOARD)
         return
 
     if text in ["❓ Помощь", "/help"]:
@@ -843,7 +1050,8 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
             "2. Выберите <b>«🔗 Вставить ссылку с Куфара»</b>.\n"
             "3. Перейдите на <b>kufar.by</b>, выставьте нужные параметры (категорию, город, районы, цену, бренд и т.д.) и скопируйте ссылку.\n"
             "4. Отправьте ссылку сюда сообщением — бот перенесет все фильтры 1 в 1!\n\n"
-            "Также можно отправить ссылку боту прямо в любой момент без нажатия кнопок."
+            "📦 <b>«Вывести все объявления»</b> — выводит актуальные объявления по вашим сохранённым фильтрам.\n"
+            "🚫 <b>«Не интересно (в ЧС)»</b> — скрывает ненужное объявление, чтобы оно больше никогда не показывалось."
         )
         tg.send_message(chat_id, help_text, reply_markup=MAIN_KEYBOARD)
         return
@@ -910,8 +1118,9 @@ def telegram_listener(tg: TelegramClient, config: dict):
                     continue
                 chat_id = msg.get("chat", {}).get("id")
                 text = msg.get("text")
+                from_user = msg.get("from", {})
                 if chat_id and text:
-                    process_text_message(tg, chat_id, text, config)
+                    process_text_message(tg, chat_id, text, config, user_info=from_user)
         except Exception as e:
             logger.error(f"Error in Telegram listener: {e}")
             time.sleep(2.0)
@@ -938,7 +1147,10 @@ def main():
 
     bot_username = bot_info.get("username", "Unknown")
     print(f"\n🚀 Бот @{bot_username} успешно авторизован!")
-    print(f"🔒 Приватный режим активирован: доступ разрешен ТОЛЬКО chat_id={config['admin_chat_id']}")
+    admin_id = config.get("admin_chat_id")
+    if admin_id:
+        print(f"👑 Администратор для оповещений: chat_id={admin_id}")
+    print("🌐 Режим работы: мультипользовательский (уведомления админу о новых пользователях и фильтрах).")
 
     # Start health server for Render
     port_env = os.getenv("PORT")

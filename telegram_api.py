@@ -94,6 +94,22 @@ class TelegramClient:
         res = self._api_call("editMessageText", payload=payload)
         return res is not None
 
+    def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        reply_markup: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Edits only the reply_markup of a message."""
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        res = self._api_call("editMessageReplyMarkup", payload=payload)
+        return res is not None
+
     def answer_callback_query(
         self,
         callback_query_id: str,
