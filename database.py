@@ -273,6 +273,15 @@ def get_blacklist_count(chat_id: int, db_path: str = DB_FILE) -> int:
         return row["cnt"] if row else 0
 
 
+def clear_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> int:
+    """Clears all blacklisted ads for a user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM blacklisted_ads WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        return cursor.rowcount
+
+
 # ==================== CLOUD STATE BACKUP & RESTORE ====================
 
 def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:

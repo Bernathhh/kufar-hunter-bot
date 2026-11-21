@@ -132,14 +132,16 @@ class TelegramClient:
         res = self._api_call("deleteMessage", payload=payload)
         return res is not None
 
-    def send_media_group(self, chat_id: int, media: List[Dict[str, Any]]) -> bool:
-        """Sends an album of photos/videos (up to 10 items)."""
+    def send_media_group(self, chat_id: int, media: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        """Sends an album of photos/videos (up to 10 items). Returns list of message dicts or None."""
         payload = {
             "chat_id": chat_id,
             "media": media
         }
         res = self._api_call("sendMediaGroup", payload=payload)
-        return res is not None
+        if isinstance(res, list):
+            return res
+        return None
 
     def send_photo(
         self,
@@ -148,7 +150,7 @@ class TelegramClient:
         caption: Optional[str] = None,
         parse_mode: str = "HTML",
         reply_markup: Optional[Dict[str, Any]] = None
-    ) -> bool:
+    ) -> Optional[Dict[str, Any]]:
         """
         Sends a photo with optional caption and reply_markup.
         Falls back to send_message if sending photo directly fails.
@@ -164,14 +166,14 @@ class TelegramClient:
             payload["reply_markup"] = reply_markup
 
         res = self._api_call("sendPhoto", payload=payload)
-        if res is not None:
-            return True
+        if res is not None and isinstance(res, dict):
+            return res
 
         # Fallback to sendMessage if photo URL is rejected by Telegram
         if caption:
             logger.info("Photo sending failed, falling back to sendMessage")
-            return self.send_message(chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup) is not None
-        return False
+            return self.send_message(chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup)
+        return None
 
     def get_chat(self, chat_id: int) -> Optional[Dict[str, Any]]:
         """Retrieves chat information, including pinned_message."""

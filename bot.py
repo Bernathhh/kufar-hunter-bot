@@ -14,7 +14,7 @@ import json
 import http.server
 import socketserver
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple, Set
 
 # Setup path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +38,7 @@ from database import (
     is_ad_blacklisted,
     get_user_blacklist,
     get_blacklist_count,
+    clear_user_blacklist,
     export_database_state,
     import_database_state
 )
@@ -69,6 +70,9 @@ BACKUP_FILE = os.path.join(os.path.dirname(__file__), "backup_state.json")
 
 # Photos cache for on-demand gallery viewing (ad_id -> list of urls)
 AD_PHOTOS_CACHE: Dict[int, List[str]] = {}
+
+# Map of (chat_id, ad_id) -> list of Telegram message IDs sent for this ad
+AD_MESSAGES_MAP: Dict[Tuple[int, int], List[int]] = {}
 
 # User session state for interactive wizard (chat_id -> dict)
 USER_STATES: Dict[int, Dict[str, Any]] = {}
@@ -319,7 +323,12 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = ""
 
 
 def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], query_name: str) -> bool:
-    """Sends notification with all photos immediately (media group if >= 2), with description, phone, and action buttons."""
+    """
+    Sends notification with all photos and attached action buttons.
+    - Multiple photos (>= 2): Clean gallery album first, then ad description card with buttons attached directly.
+    - Single photo (== 1): Single photo message with caption and buttons attached directly.
+    - No photos: Text message with buttons attached directly.
+    """
     ad_id = ad["ad_id"]
     if is_ad_blacklisted(chat_id, ad_id):
         logger.info(f"Ad {ad_id} is blacklisted by chat {chat_id}, skipping")
@@ -331,41 +340,54 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
         ad["description"] = description
 
     caption = format_ad_caption(ad, query_name, description=description)
-    if len(caption) > 1000:
-        caption = caption[:996] + "..."
-
     image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
     ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
 
-    # Cache photos
     if image_urls:
         AD_PHOTOS_CACHE[ad_id] = image_urls
 
     markup = make_ad_keyboard(ad_link, ad_id)
+    sent_mids: List[int] = []
 
-    # Case 1: Multiple photos -> Send ALL photos immediately as Telegram Media Group Album (up to 10 photos)
+    # Prune old cache entries to prevent memory growth
+    if len(AD_MESSAGES_MAP) > 1000:
+        for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
+            AD_MESSAGES_MAP.pop(old_k, None)
+
+    # Case 1: Multiple photos -> Send ALL photos as album, then ad card with buttons attached directly!
     if len(image_urls) >= 2:
-        media = [{"type": "photo", "media": image_urls[0], "caption": caption, "parse_mode": "HTML"}]
-        for u in image_urls[1:10]:
-            media.append({"type": "photo", "media": u})
-        ok = tg.send_media_group(chat_id, media)
-        if ok:
-            # Action button bar directly below album
-            tg.send_message(chat_id, "⚡ <b>Действия с объявлением:</b>", reply_markup=markup)
+        media = [{"type": "photo", "media": u} for u in image_urls[:10]]
+        res_album = tg.send_media_group(chat_id, media)
+        if res_album and isinstance(res_album, list):
+            for m in res_album:
+                if isinstance(m, dict) and "message_id" in m:
+                    sent_mids.append(m["message_id"])
+
+        res_card = tg.send_message(chat_id, caption, reply_markup=markup)
+        if res_card and isinstance(res_card, dict) and "message_id" in res_card:
+            sent_mids.append(res_card["message_id"])
+            AD_MESSAGES_MAP[(chat_id, ad_id)] = sent_mids
             return True
-        # If media group failed (e.g. broken image URL), fallback to single photo
-        ok = tg.send_photo(chat_id, image_urls[0], caption=caption, reply_markup=markup)
-        if ok:
+
+        if sent_mids:
+            AD_MESSAGES_MAP[(chat_id, ad_id)] = sent_mids
             return True
 
     # Case 2: Single photo -> send_photo with caption and buttons attached directly
     elif len(image_urls) == 1:
-        ok = tg.send_photo(chat_id, image_urls[0], caption=caption, reply_markup=markup)
-        if ok:
+        photo_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
+        res_photo = tg.send_photo(chat_id, image_urls[0], caption=photo_caption, reply_markup=markup)
+        if res_photo and isinstance(res_photo, dict) and "message_id" in res_photo:
+            AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
             return True
 
     # Case 3: Text only (no photos or image sending failed)
-    return tg.send_message(chat_id, caption, disable_web_page_preview=False, reply_markup=markup) is not None
+    res_msg = tg.send_message(chat_id, caption, disable_web_page_preview=False, reply_markup=markup)
+    if res_msg and isinstance(res_msg, dict) and "message_id" in res_msg:
+        AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_msg["message_id"]]
+        return True
+
+    return False
 
 
 def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallback: Optional[int] = None) -> int:
@@ -1117,18 +1139,17 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         ad_id = int(data.split(":")[-1])
         add_to_blacklist(chat_id, ad_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="🚫 Объявление скрыто и добавлено в ЧС!", show_alert=False)
-        ad_link = f"https://www.kufar.by/item/{ad_id}"
-        new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=True)
-        if msg.get("text"):
-            tg.edit_message_text(
-                chat_id,
-                msg_id,
-                text=f"🚫 <i>Объявление #{ad_id} добавлено в чёрный список (скрыто)</i>",
-                reply_markup=new_markup
-            )
-        else:
-            tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
+        tg.answer_callback_query(cb_id, text="🚫 Объявление добавлено в ЧС и удалено!", show_alert=False)
+
+        # Delete all messages related to this ad (album photos + description card)
+        mids = AD_MESSAGES_MAP.pop((chat_id, ad_id), [])
+        if msg_id and msg_id not in mids:
+            mids.append(msg_id)
+        for m in mids:
+            try:
+                tg.delete_message(chat_id, m)
+            except Exception as e:
+                logger.debug(f"Could not delete message {m}: {e}")
 
     elif data.startswith("cb:unbl:"):
         ad_id = int(data.split(":")[-1])
@@ -1221,6 +1242,12 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         ok = restore_state_from_telegram(tg, config)
         if not ok:
             tg.send_message(chat_id, "ℹ️ Нет доступного бэкапа для восстановления или данные уже актуальны.")
+        return
+
+    if text in ["/clear_blacklist", "/reset_blacklist"]:
+        cnt = clear_user_blacklist(chat_id)
+        save_local_backup()
+        tg.send_message(chat_id, f"✅ <b>Чёрный список очищен!</b> Удалено записей: {cnt}.", reply_markup=MAIN_KEYBOARD)
         return
 
     if text in ["📊 Статистика", "/status"]:
