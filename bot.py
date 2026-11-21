@@ -92,7 +92,7 @@ REGIONS = [
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
-        [{"text": "📦 Вывести все объявления"}, {"text": "⏱ Интервал"}],
+        [{"text": "📦 Вывести всё"}, {"text": "⏱ Интервал"}],
         [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
     ],
     "resize_keyboard": True
@@ -1159,7 +1159,17 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         show_interval_options(tg, chat_id, config.get("check_interval_seconds", 60))
         return
 
-    if text in ["📦 Вывести все объявления", "⚡ Проверить сейчас", "/check", "/all", "/ads"]:
+    if text in [
+        "📦 Вывести всё",
+        "📦 Вывести все",
+        "Вывести всё",
+        "Вывести все",
+        "📦 Вывести все объявления",
+        "⚡ Проверить сейчас",
+        "/check",
+        "/all",
+        "/ads"
+    ]:
         output_all_user_ads(tg, chat_id)
         return
 
@@ -1204,7 +1214,7 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
             "2. Выберите <b>«🔗 Вставить ссылку с Куфара»</b>.\n"
             "3. Перейдите на <b>kufar.by</b>, выставьте нужные параметры (категорию, город, районы, цену, бренд и т.д.) и скопируйте ссылку.\n"
             "4. Отправьте ссылку сюда сообщением — бот перенесет все фильтры 1 в 1!\n\n"
-            "📦 <b>«Вывести все объявления»</b> — выводит актуальные объявления по вашим сохранённым фильтрам.\n"
+            "📦 <b>«Вывести всё»</b> — выводит актуальные объявления по вашим сохранённым фильтрам.\n"
             "🚫 <b>«Не интересно (в ЧС)»</b> — скрывает ненужное объявление, чтобы оно больше никогда не показывалось."
         )
         tg.send_message(chat_id, help_text, reply_markup=MAIN_KEYBOARD)
