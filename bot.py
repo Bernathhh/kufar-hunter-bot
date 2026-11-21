@@ -39,6 +39,8 @@ from database import (
     get_user_blacklist,
     get_blacklist_count,
     clear_user_blacklist,
+    get_setting,
+    set_setting,
     export_database_state,
     import_database_state
 )
@@ -1174,13 +1176,16 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data.startswith("cb:interval:"):
         sec = int(data.split(":")[-1])
         config["check_interval_seconds"] = sec
+        set_setting("check_interval_seconds", str(sec))
+        save_local_backup()
+        FORCE_CHECK_EVENT.set()
         try:
             config_path = os.path.join(BASE_DIR, "config.json")
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Error saving interval: {e}")
-        tg.send_message(chat_id, f"⏱ <b>Интервал проверки успешно изменен на {sec} сек!</b>", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, f"⏱ <b>Интервал проверки успешно изменен на {sec} сек!</b>\nЗначение сохранено в базу данных.", reply_markup=MAIN_KEYBOARD)
 
 
 def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: dict, user_info: Optional[Dict[str, Any]] = None):
@@ -1437,6 +1442,12 @@ def main():
             tg.unpin_all_chat_messages(admin_id)
         except Exception:
             pass
+
+    # Load persistent interval setting if saved in database
+    saved_interval = get_setting("check_interval_seconds")
+    if saved_interval and saved_interval.isdigit():
+        config["check_interval_seconds"] = int(saved_interval)
+        print(f"⏱ Восстановлен интервал проверки из базы: {saved_interval} сек.")
 
     # Start health server for Render
     port_env = os.getenv("PORT")

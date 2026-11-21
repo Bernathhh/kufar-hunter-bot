@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "exported_at": "2026-11-21T23:42:26.927523",
+  "exported_at": "2026-11-21T23:47:41.924064",
   "queries": [
     {
       "chat_id": 747868993,
@@ -92,5 +92,8 @@
       "chat_id": 747868993,
       "ad_id": 1096282881
     }
-  ]
+  ],
+  "settings": {
+    "check_interval_seconds": "30"
+  }
 }

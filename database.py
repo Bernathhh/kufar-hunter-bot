@@ -70,8 +70,33 @@ def init_db(db_path: str = DB_FILE):
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_user ON blacklisted_ads(chat_id, ad_id)")
+
+        # Persistent bot settings (e.g. check_interval_seconds)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         
         conn.commit()
+
+
+def set_setting(key: str, value: str, db_path: str = DB_FILE):
+    """Sets a persistent key-value setting."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+
+
+def get_setting(key: str, default: Optional[str] = None, db_path: str = DB_FILE) -> Optional[str]:
+    """Retrieves a persistent setting value."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row["value"] if row else default
 
 
 def add_query(chat_id: int, name: str, params: Dict[str, Any], db_path: str = DB_FILE) -> int:
@@ -311,13 +336,18 @@ def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
         # Blacklist
         cursor.execute("SELECT chat_id, ad_id FROM blacklisted_ads")
         blacklisted = [dict(r) for r in cursor.fetchall()]
-        
+
+        # Settings
+        cursor.execute("SELECT key, value FROM settings")
+        settings = {r["key"]: r["value"] for r in cursor.fetchall()}
+
         return {
             "version": 1,
             "exported_at": datetime.now().isoformat(),
             "queries": queries,
             "users": users,
-            "blacklisted_ads": blacklisted
+            "blacklisted_ads": blacklisted,
+            "settings": settings
         }
 
 
@@ -371,7 +401,11 @@ def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict
                     (cid, int(ad_id))
                 )
                 imported_bl += 1
-                
+
+        # Import Settings
+        for k, v in state.get("settings", {}).items():
+            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, str(v)))
+
         conn.commit()
         
     return {
