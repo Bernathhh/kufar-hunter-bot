@@ -45,6 +45,7 @@ from kufar_api import (
     parse_kufar_url_or_query,
     fetch_ads,
     fetch_ad_description,
+    fetch_ad_photos,
     extract_phone_from_text,
     fetch_ad_phone_with_token
 )
@@ -61,6 +62,9 @@ TOTAL_CHECKS = 0
 NEW_ADS_FOUND = 0
 FORCE_CHECK_EVENT = threading.Event()
 STOP_EVENT = threading.Event()
+
+# Photos cache for on-demand gallery viewing (ad_id -> list of urls)
+AD_PHOTOS_CACHE: Dict[int, List[str]] = {}
 
 # User session state for interactive wizard (chat_id -> dict)
 USER_STATES: Dict[int, Dict[str, Any]] = {}
@@ -99,21 +103,29 @@ MAIN_KEYBOARD = {
 }
 
 
-def make_ad_keyboard(ad_link: str, ad_id: int, is_blacklisted: bool = False) -> Dict[str, Any]:
-    """Builds inline action keyboard for an advertisement."""
+def make_ad_keyboard(
+    ad_link: str,
+    ad_id: int,
+    total_photos: int = 1,
+    is_blacklisted: bool = False
+) -> Dict[str, Any]:
+    """Builds inline action keyboard attached directly to the ad photo message."""
+    buttons = []
+    
+    # 1. Open on Kufar
+    buttons.append([{"text": "🔗 Открыть на Kufar", "url": ad_link}])
+    
+    # 2. View all photos button (if multiple photos available)
+    if total_photos > 1:
+        buttons.append([{"text": f"📸 Показать все фото ({total_photos} шт.)", "callback_data": f"cb:photos:{ad_id}"}])
+    
+    # 3. Blacklist button
     if is_blacklisted:
-        return {
-            "inline_keyboard": [
-                [{"text": "🔗 Открыть на Kufar", "url": ad_link}],
-                [{"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"}]
-            ]
-        }
-    return {
-        "inline_keyboard": [
-            [{"text": "🔗 Открыть на Kufar", "url": ad_link}],
-            [{"text": "🚫 Не интересно (в ЧС)", "callback_data": f"cb:bl:{ad_id}"}]
-        ]
-    }
+        buttons.append([{"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"}])
+    else:
+        buttons.append([{"text": "🚫 Не интересно (в ЧС)", "callback_data": f"cb:bl:{ad_id}"}])
+
+    return {"inline_keyboard": buttons}
 
 
 class HealthHandler(http.server.SimpleHTTPRequestHandler):
@@ -308,7 +320,7 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = ""
 
 
 def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], query_name: str) -> bool:
-    """Sends notification with all photos (album) if multiple, plus description, phone, and action buttons."""
+    """Sends notification as ONE unified single message with photo, caption, and inline buttons."""
     ad_id = ad["ad_id"]
     if is_ad_blacklisted(chat_id, ad_id):
         logger.info(f"Ad {ad_id} is blacklisted by chat {chat_id}, skipping")
@@ -323,26 +335,20 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
     image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
     ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
 
-    markup = make_ad_keyboard(ad_link, ad_id)
+    # Cache photos for on-demand gallery viewing
+    if image_urls:
+        AD_PHOTOS_CACHE[ad_id] = image_urls
 
-    # Case 1: Multiple photos -> Send as Telegram Media Group Album (up to 10 photos)
-    if len(image_urls) >= 2:
-        media = [{"type": "photo", "media": image_urls[0], "caption": caption, "parse_mode": "HTML"}]
-        for u in image_urls[1:10]:
-            media.append({"type": "photo", "media": u})
-        ok = tg.send_media_group(chat_id, media)
-        if ok:
-            # Action button bar directly below album
-            tg.send_message(chat_id, "⚡ <b>Действия с объявлением:</b>", reply_markup=markup)
-            return True
+    total_photos = len(image_urls)
+    markup = make_ad_keyboard(ad_link, ad_id, total_photos=total_photos)
 
-    # Case 2: Single photo -> sendPhoto with action buttons attached directly
-    if len(image_urls) == 1:
+    # Case 1: Photo message with caption and buttons attached directly (ONE single message)
+    if image_urls:
         ok = tg.send_photo(chat_id, image_urls[0], caption=caption, reply_markup=markup)
         if ok:
             return True
 
-    # Case 3: Text only
+    # Case 2: Text only (ONE single message)
     return tg.send_message(chat_id, caption, disable_web_page_preview=False, reply_markup=markup) is not None
 
 
@@ -1073,13 +1079,33 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         qid = int(data.split(":")[-1])
         output_ads_for_query(tg, chat_id, qid)
 
+    elif data.startswith("cb:photos:"):
+        ad_id = int(data.split(":")[-1])
+        photos = AD_PHOTOS_CACHE.get(ad_id)
+        if not photos:
+            photos = fetch_ad_photos(ad_id)
+            if photos:
+                AD_PHOTOS_CACHE[ad_id] = photos
+
+        if photos and len(photos) >= 2:
+            tg.answer_callback_query(cb_id, text=f"📸 Отправляю {len(photos)} фото...")
+            media = [{"type": "photo", "media": photos[0], "caption": f"📸 <b>Все фотографии к объявлению #{ad_id}</b>", "parse_mode": "HTML"}]
+            for u in photos[1:10]:
+                media.append({"type": "photo", "media": u})
+            tg.send_media_group(chat_id, media)
+        elif photos:
+            tg.answer_callback_query(cb_id, text="В этом объявлении только 1 фото")
+        else:
+            tg.answer_callback_query(cb_id, text="Не удалось загрузить дополнительные фото")
+
     elif data.startswith("cb:bl:"):
         ad_id = int(data.split(":")[-1])
         add_to_blacklist(chat_id, ad_id)
         sync_backup_to_telegram(tg, config)
         tg.answer_callback_query(cb_id, text="🚫 Объявление скрыто и добавлено в ЧС!", show_alert=False)
         ad_link = f"https://www.kufar.by/item/{ad_id}"
-        new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=True)
+        total_p = len(AD_PHOTOS_CACHE.get(ad_id, []))
+        new_markup = make_ad_keyboard(ad_link, ad_id, total_photos=total_p, is_blacklisted=True)
         if msg.get("text"):
             tg.edit_message_text(
                 chat_id,
@@ -1096,7 +1122,8 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         sync_backup_to_telegram(tg, config)
         tg.answer_callback_query(cb_id, text="✅ Объявление убрано из ЧС", show_alert=False)
         ad_link = f"https://www.kufar.by/item/{ad_id}"
-        new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=False)
+        total_p = len(AD_PHOTOS_CACHE.get(ad_id, []))
+        new_markup = make_ad_keyboard(ad_link, ad_id, total_photos=total_p, is_blacklisted=False)
         if msg.get("text"):
             tg.edit_message_text(
                 chat_id,

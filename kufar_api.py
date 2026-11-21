@@ -250,6 +250,34 @@ def fetch_ad_description(ad_id: int, timeout: int = 5) -> str:
     return ""
 
 
+def fetch_ad_photos(ad_id: int, timeout: int = 5) -> List[str]:
+    """Fetches full list of photo URLs from Kufar item page."""
+    url = f"https://www.kufar.by/item/{ad_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Referer": "https://www.kufar.by/"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            html_text = r.read().decode("utf-8", errors="ignore")
+        paths = re.findall(r'\"path\":\"([^\"]+?\.(?:jpe?g|png|webp))\"', html_text)
+        if paths:
+            seen = set()
+            urls = []
+            for p in paths:
+                if p not in seen:
+                    seen.add(p)
+                    urls.append(f"{IMAGE_BASE_URL}/{p}")
+            return urls[:10]
+    except Exception as e:
+        logger.debug(f"Could not fetch photos for {ad_id}: {e}")
+    return []
+
+
 def extract_phone_from_text(text: str) -> Optional[str]:
     """Finds Belarusian phone numbers in text."""
     if not text:
