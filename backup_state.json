@@ -1,17 +1,7 @@
 {
   "version": 1,
-  "exported_at": "2026-11-21T23:47:41.924064",
+  "exported_at": "2026-11-22T20:23:31.718230",
   "queries": [
-    {
-      "chat_id": 747868993,
-      "name": "PlayStation 5 Slim",
-      "params": {
-        "query": "slim",
-        "cat": "5040",
-        "sort": "lst.d"
-      },
-      "is_active": 1
-    },
     {
       "chat_id": 747868993,
       "name": "slim",
@@ -95,5 +85,11 @@
   ],
   "settings": {
     "check_interval_seconds": "30"
-  }
+  },
+  "deleted_queries": [
+    {
+      "chat_id": 747868993,
+      "name": "PlayStation 5 Slim"
+    }
+  ]
 }

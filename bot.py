@@ -28,7 +28,10 @@ from database import (
     get_user_queries,
     delete_query,
     is_ad_seen,
+    get_ad_seen_price,
+    mark_ad_seen,
     mark_ads_seen,
+    mark_ads_seen_batch,
     get_query_seen_count,
     register_or_update_user,
     get_all_users,
@@ -116,15 +119,20 @@ MAIN_KEYBOARD = {
 def make_ad_keyboard(
     ad_link: str,
     ad_id: int,
+    photo_count: int = 0,
     is_blacklisted: bool = False
 ) -> Dict[str, Any]:
-    """Builds inline action keyboard for ad notifications."""
+    """Builds inline action keyboard attached directly to ad cards."""
     buttons = []
     
     # 1. Open on Kufar
     buttons.append([{"text": "🔗 Открыть на Kufar", "url": ad_link}])
     
-    # 2. Blacklist toggle button
+    # 2. Show all photos button if multiple photos exist
+    if photo_count > 1:
+        buttons.append([{"text": f"📸 Показать все фото ({photo_count} шт.)", "callback_data": f"cb:photos:{ad_id}"}])
+
+    # 3. Blacklist toggle button
     if is_blacklisted:
         buttons.append([{"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"}])
     else:
@@ -275,8 +283,15 @@ def resolve_phone_string(ad: Dict[str, Any], description: str) -> str:
         return "<i>Скрыт продавцом (только сообщения)</i>"
 
 
-def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = "") -> str:
-    """Creates a clean, attractive HTML caption for the ad."""
+def format_ad_caption(
+    ad: Dict[str, Any],
+    query_name: str,
+    description: str = "",
+    update_type: str = "new",
+    old_price_byn: Optional[float] = None,
+    new_price_byn: Optional[float] = None
+) -> str:
+    """Creates a clean, attractive HTML caption for the ad, including price updates."""
     subject = html.escape(ad.get("subject", "Объявление"))
     link = ad.get("ad_link", "")
     price_byn = ad.get("price_byn")
@@ -299,20 +314,48 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = ""
     location = html.escape(", ".join(loc_parts)) if loc_parts else "Беларусь"
 
     seller = html.escape(ad.get("seller", "").strip()) or "Частное лицо"
-
     time_label = "Первично создано:" if timing["is_repost"] else "Опубликовано:"
 
+    # Format header and price depending on whether this is a price update
+    if update_type == "price_change" and old_price_byn is not None and new_price_byn is not None:
+        diff_byn = old_price_byn - new_price_byn
+        if diff_byn > 0:
+            # Price decreased (discount / bargain!)
+            pct = round((diff_byn / old_price_byn) * 100) if old_price_byn > 0 else 0
+            header_text = f"📉 <b>Цена снижена! (-{diff_byn:,.0f} BYN)</b>\n"
+            price_line = (
+                f"💰 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
+                + (f" (~${price_usd:,.0f})" if price_usd is not None else "")
+                + f"\n🏷 <b>Старая цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
+                + f"\n🔻 <b>Скидка:</b> -{pct}% (дешевле на {diff_byn:,.2f} BYN!)"
+            )
+        else:
+            # Price increased
+            raise_byn = abs(diff_byn)
+            header_text = f"📈 <b>Цена изменилась (+{raise_byn:,.0f} BYN)</b>\n"
+            price_line = (
+                f"💰 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
+                + (f" (~${price_usd:,.0f})" if price_usd is not None else "")
+                + f"\n🏷 <b>Старая цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
+                + f"\n🔺 <b>Повышение:</b> +{raise_byn:,.2f} BYN"
+            )
+    else:
+        header_text = f"{timing['header']}\n"
+        price_line = f"💰 <b>Цена:</b> {price_str}"
+
     lines = [
-        f"{timing['header']}\n",
+        header_text,
         f"📌 <b>{subject}</b>",
-        f"💰 <b>Цена:</b> {price_str}",
+        price_line,
         f"🕒 <b>{time_label}</b> {timing['time_str']}",
         f"📍 <b>Локация:</b> {location}",
         f"👤 <b>Продавец:</b> {seller}",
         f"📞 <b>Телефон:</b> {phone_str}",
         f"🎯 <i>Поиск: {html.escape(query_name)}</i>"
     ]
-    if timing.get("note"):
+    if update_type == "price_change":
+        lines.append("💡 <i>Продавец обновил цену этого объявления на Куфаре.</i>")
+    elif timing.get("note"):
         lines.append(timing["note"])
 
     if description:
@@ -324,12 +367,21 @@ def format_ad_caption(ad: Dict[str, Any], query_name: str, description: str = ""
     return "\n".join(lines)
 
 
-def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], query_name: str) -> bool:
+def send_ad_notification(
+    tg: TelegramClient,
+    chat_id: int,
+    ad: Dict[str, Any],
+    query_name: str,
+    update_type: str = "new",
+    old_price_byn: Optional[float] = None,
+    new_price_byn: Optional[float] = None
+) -> bool:
     """
-    Sends notification with all photos and attached action buttons.
-    - Multiple photos (>= 2): Clean gallery album first, then ad description card with buttons attached directly.
-    - Single photo (== 1): Single photo message with caption and buttons attached directly.
-    - No photos: Text message with buttons attached directly.
+    Sends unified notification with photo, caption and action buttons attached directly.
+    Supports both new listings and price change updates.
+    - Single unified message: Photo + Full description + Inline buttons directly under it.
+    - If multiple photos: includes «📸 Показать все фото» button to view the full gallery.
+    - Text fallback if no photos available.
     """
     ad_id = ad["ad_id"]
     if is_ad_blacklisted(chat_id, ad_id):
@@ -341,52 +393,35 @@ def send_ad_notification(tg: TelegramClient, chat_id: int, ad: Dict[str, Any], q
         description = fetch_ad_description(ad_id)
         ad["description"] = description
 
-    caption = format_ad_caption(ad, query_name, description=description)
+    caption = format_ad_caption(
+        ad, query_name,
+        description=description,
+        update_type=update_type,
+        old_price_byn=old_price_byn,
+        new_price_byn=new_price_byn
+    )
     image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
     ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
 
     if image_urls:
         AD_PHOTOS_CACHE[ad_id] = image_urls
 
-    markup = make_ad_keyboard(ad_link, ad_id)
-    sent_mids: List[int] = []
+    markup = make_ad_keyboard(ad_link, ad_id, photo_count=len(image_urls))
 
     # Prune old cache entries to prevent memory growth
     if len(AD_MESSAGES_MAP) > 1000:
         for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
             AD_MESSAGES_MAP.pop(old_k, None)
 
-    # Case 1: Multiple photos -> Send ALL photos as album WITH description together in one single message!
-    if len(image_urls) >= 2:
-        album_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
-        media = [{"type": "photo", "media": image_urls[0], "caption": album_caption, "parse_mode": "HTML"}]
-        for u in image_urls[1:10]:
-            media.append({"type": "photo", "media": u})
-        res_album = tg.send_media_group(chat_id, media)
-        if res_album and isinstance(res_album, list):
-            for m in res_album:
-                if isinstance(m, dict) and "message_id" in m:
-                    sent_mids.append(m["message_id"])
-
-        res_btn = tg.send_message(chat_id, "⚡ <b>Действия с объявлением:</b>", reply_markup=markup)
-        if res_btn and isinstance(res_btn, dict) and "message_id" in res_btn:
-            sent_mids.append(res_btn["message_id"])
-            AD_MESSAGES_MAP[(chat_id, ad_id)] = sent_mids
-            return True
-
-        if sent_mids:
-            AD_MESSAGES_MAP[(chat_id, ad_id)] = sent_mids
-            return True
-
-    # Case 2: Single photo -> send_photo with caption and buttons attached directly
-    elif len(image_urls) == 1:
+    # Send unified card: Photo + Description + Action buttons attached directly
+    if image_urls:
         photo_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
         res_photo = tg.send_photo(chat_id, image_urls[0], caption=photo_caption, reply_markup=markup)
         if res_photo and isinstance(res_photo, dict) and "message_id" in res_photo:
             AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
             return True
 
-    # Case 3: Text only (no photos or image sending failed)
+    # Fallback: Text only with buttons attached directly
     res_msg = tg.send_message(chat_id, caption, disable_web_page_preview=False, reply_markup=markup)
     if res_msg and isinstance(res_msg, dict) and "message_id" in res_msg:
         AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_msg["message_id"]]
@@ -415,31 +450,68 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
     # First run: seed database to avoid spamming historical ads
     if seen_count == 0:
         logger.info(f"Seeding historical ads for query '{name}' (count: {len(ads)})")
-        all_ids = [a["ad_id"] for a in ads]
-        mark_ads_seen(qid, all_ids)
+        mark_ads_seen_batch(qid, ads)
         return 0
 
     bl = get_user_blacklist(chat_id)
-    new_ads = [a for a in ads if not is_ad_seen(qid, a["ad_id"])]
-    if not new_ads:
-        return 0
-
-    logger.info(f"Found {len(new_ads)} new ads for query '{name}'!")
-
     sent_count = 0
-    for ad in reversed(new_ads):
+
+    for ad in reversed(ads):
         ad_id = ad["ad_id"]
-        mark_ads_seen(qid, [ad_id])
         if ad_id in bl:
-            logger.info(f"Ad {ad_id} is in blacklist for chat {chat_id}, skipping notification")
             continue
-        try:
-            if send_ad_notification(tg, chat_id, ad, name):
-                sent_count += 1
-                NEW_ADS_FOUND += 1
-                time.sleep(1.0)
-        except Exception as e:
-            logger.error(f"Error sending ad notification: {e}")
+
+        curr_byn = ad.get("price_byn")
+        curr_usd = ad.get("price_usd")
+
+        is_seen, last_byn, last_usd = get_ad_seen_price(qid, ad_id)
+
+        if not is_seen:
+            # Completely new listing!
+            mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
+            try:
+                if send_ad_notification(tg, chat_id, ad, name, update_type="new"):
+                    sent_count += 1
+                    NEW_ADS_FOUND += 1
+                    time.sleep(1.0)
+            except Exception as e:
+                logger.error(f"Error sending ad notification: {e}")
+
+        else:
+            # Existing listing -> check if seller changed the price!
+            if last_byn is not None and curr_byn is not None:
+                diff = abs(curr_byn - last_byn)
+                if diff >= 1.0:  # Price changed by 1 BYN or more
+                    logger.info(f"Price change detected for ad {ad_id}: {last_byn} -> {curr_byn} BYN!")
+                    mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
+                    try:
+                        if send_ad_notification(
+                            tg, chat_id, ad, name,
+                            update_type="price_change",
+                            old_price_byn=last_byn,
+                            new_price_byn=curr_byn
+                        ):
+                            sent_count += 1
+                            NEW_ADS_FOUND += 1
+                            time.sleep(1.0)
+                    except Exception as e:
+                        logger.error(f"Error sending price update notification: {e}")
+            elif last_byn is None and curr_byn is not None:
+                # Was previously without price (free / negotiable), now has fixed price
+                logger.info(f"Price set for ad {ad_id}: -> {curr_byn} BYN!")
+                mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
+                try:
+                    if send_ad_notification(
+                        tg, chat_id, ad, name,
+                        update_type="price_change",
+                        old_price_byn=0.0,
+                        new_price_byn=curr_byn
+                    ):
+                        sent_count += 1
+                        NEW_ADS_FOUND += 1
+                        time.sleep(1.0)
+                except Exception as e:
+                    logger.error(f"Error sending price update notification: {e}")
 
     return sent_count
 
@@ -706,6 +778,7 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
         # Show top 10 most recent listings per query
         for ad in valid_ads[:10]:
             seen_in_run.add(ad["ad_id"])
+            mark_ad_seen(q["id"], ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
             try:
                 if send_ad_notification(tg, chat_id, ad, q_name):
                     total_shown += 1
@@ -756,6 +829,7 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
     total_shown = 0
 
     for ad in valid_ads[:10]:
+        mark_ad_seen(qid, ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
         try:
             if send_ad_notification(tg, chat_id, ad, q_name):
                 total_shown += 1
@@ -1134,7 +1208,13 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
             media = [{"type": "photo", "media": photos[0], "caption": f"📸 <b>Все фотографии к объявлению #{ad_id}</b>", "parse_mode": "HTML"}]
             for u in photos[1:10]:
                 media.append({"type": "photo", "media": u})
-            tg.send_media_group(chat_id, media)
+            res_album = tg.send_media_group(chat_id, media)
+            if res_album and isinstance(res_album, list):
+                mids = AD_MESSAGES_MAP.get((chat_id, ad_id), [])
+                for m in res_album:
+                    if isinstance(m, dict) and "message_id" in m:
+                        mids.append(m["message_id"])
+                AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
         elif photos:
             tg.answer_callback_query(cb_id, text="В этом объявлении только 1 фото")
         else:

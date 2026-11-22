@@ -32,21 +32,33 @@ def init_db(db_path: str = DB_FILE):
             )
         """)
         
-        # Seen ads table
+        # Seen ads table with price tracking
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS seen_ads (
                 ad_id INTEGER NOT NULL,
                 query_id INTEGER NOT NULL,
+                last_price_byn REAL,
+                last_price_usd REAL,
                 seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (ad_id, query_id),
                 FOREIGN KEY (query_id) REFERENCES queries(id) ON DELETE CASCADE
             )
         """)
-        
+
+        # Migration: add price columns if table existed without them
+        try:
+            cursor.execute("ALTER TABLE seen_ads ADD COLUMN last_price_byn REAL")
+        except Exception:
+            pass
+        try:
+            cursor.execute("ALTER TABLE seen_ads ADD COLUMN last_price_usd REAL")
+        except Exception:
+            pass
+
         # Indexes for fast lookups
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_seen_query ON seen_ads(query_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_queries_chat ON queries(chat_id)")
-        
+
         # Registered bot users
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -58,7 +70,7 @@ def init_db(db_path: str = DB_FILE):
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
         # Blacklisted / hidden ads table (per user)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS blacklisted_ads (
@@ -70,6 +82,16 @@ def init_db(db_path: str = DB_FILE):
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_user ON blacklisted_ads(chat_id, ad_id)")
+
+        # Deleted queries table (prevents deleted filters from being resurrected)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS deleted_queries (
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, name)
+            )
+        """)
 
         # Persistent bot settings (e.g. check_interval_seconds)
         cursor.execute("""
@@ -100,9 +122,10 @@ def get_setting(key: str, default: Optional[str] = None, db_path: str = DB_FILE)
 
 
 def add_query(chat_id: int, name: str, params: Dict[str, Any], db_path: str = DB_FILE) -> int:
-    """Adds a new search query to track."""
+    """Adds a new search query to track and unmarks it from deleted_queries if present."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
+        cursor.execute("DELETE FROM deleted_queries WHERE chat_id = ? AND name = ?", (chat_id, name))
         cursor.execute(
             "INSERT INTO queries (chat_id, name, params_json, is_active) VALUES (?, ?, ?, 1)",
             (chat_id, name, json.dumps(params))
@@ -149,9 +172,19 @@ def get_user_queries(chat_id: int, db_path: str = DB_FILE) -> List[Dict[str, Any
 
 
 def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: str = DB_FILE) -> bool:
-    """Deletes a query by ID (optionally verifying chat_id)."""
+    """Deletes a query by ID and marks it in deleted_queries to prevent resurrection on restart."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT chat_id, name FROM queries WHERE id = ?", (query_id,))
+        row = cursor.fetchone()
+        if row:
+            cid = row["chat_id"]
+            name = row["name"]
+            cursor.execute(
+                "INSERT OR REPLACE INTO deleted_queries (chat_id, name) VALUES (?, ?)",
+                (cid, name)
+            )
+
         if chat_id is not None:
             cursor.execute("DELETE FROM queries WHERE id = ? AND chat_id = ?", (query_id, chat_id))
         else:
@@ -163,12 +196,69 @@ def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: str = DB
         return deleted
 
 
+def mark_query_deleted(chat_id: int, name: str, db_path: str = DB_FILE):
+    """Records that a query was explicitly deleted by user to prevent resurrection on restart."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO deleted_queries (chat_id, name) VALUES (?, ?)",
+            (chat_id, name)
+        )
+        conn.commit()
+
+
+def get_deleted_queries(chat_id: int, db_path: str = DB_FILE) -> Set[str]:
+    """Returns set of query names that were deleted by user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM deleted_queries WHERE chat_id = ?", (chat_id,))
+        return {r["name"] for r in cursor.fetchall()}
+
+
 def is_ad_seen(query_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
     """Checks if an ad has already been recorded for this query."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM seen_ads WHERE query_id = ? AND ad_id = ?", (query_id, ad_id))
         return cursor.fetchone() is not None
+
+
+def get_ad_seen_price(query_id: int, ad_id: int, db_path: str = DB_FILE) -> Tuple[bool, Optional[float], Optional[float]]:
+    """
+    Returns (is_seen, last_price_byn, last_price_usd).
+    If not seen before, returns (False, None, None).
+    """
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT last_price_byn, last_price_usd FROM seen_ads WHERE query_id = ? AND ad_id = ?",
+            (query_id, ad_id)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return False, None, None
+        return True, row["last_price_byn"], row["last_price_usd"]
+
+
+def mark_ad_seen(
+    query_id: int,
+    ad_id: int,
+    price_byn: Optional[float] = None,
+    price_usd: Optional[float] = None,
+    db_path: str = DB_FILE
+):
+    """Marks an ad as seen and records its price."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO seen_ads (ad_id, query_id, last_price_byn, last_price_usd, seen_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(ad_id, query_id) DO UPDATE SET
+                last_price_byn = excluded.last_price_byn,
+                last_price_usd = excluded.last_price_usd,
+                seen_at = CURRENT_TIMESTAMP
+        """, (ad_id, query_id, price_byn, price_usd))
+        conn.commit()
 
 
 def mark_ads_seen(query_id: int, ad_ids: List[int], db_path: str = DB_FILE):
@@ -179,6 +269,31 @@ def mark_ads_seen(query_id: int, ad_ids: List[int], db_path: str = DB_FILE):
         cursor = conn.cursor()
         records = [(ad_id, query_id) for ad_id in ad_ids]
         cursor.executemany("INSERT OR IGNORE INTO seen_ads (ad_id, query_id) VALUES (?, ?)", records)
+        conn.commit()
+
+
+def mark_ads_seen_batch(
+    query_id: int,
+    ads: List[Dict[str, Any]],
+    db_path: str = DB_FILE
+):
+    """Batch marks ads as seen with their current prices."""
+    if not ads:
+        return
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        records = [
+            (a["ad_id"], query_id, a.get("price_byn"), a.get("price_usd"))
+            for a in ads
+        ]
+        cursor.executemany("""
+            INSERT INTO seen_ads (ad_id, query_id, last_price_byn, last_price_usd, seen_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(ad_id, query_id) DO UPDATE SET
+                last_price_byn = excluded.last_price_byn,
+                last_price_usd = excluded.last_price_usd,
+                seen_at = CURRENT_TIMESTAMP
+        """, records)
         conn.commit()
 
 
@@ -341,13 +456,18 @@ def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
         cursor.execute("SELECT key, value FROM settings")
         settings = {r["key"]: r["value"] for r in cursor.fetchall()}
 
+        # Deleted queries
+        cursor.execute("SELECT chat_id, name FROM deleted_queries")
+        deleted_queries = [dict(r) for r in cursor.fetchall()]
+
         return {
             "version": 1,
             "exported_at": datetime.now().isoformat(),
             "queries": queries,
             "users": users,
             "blacklisted_ads": blacklisted,
-            "settings": settings
+            "settings": settings,
+            "deleted_queries": deleted_queries
         }
 
 
@@ -374,11 +494,26 @@ def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict
                     )
                     imported_users += 1
 
+        # Import Deleted Queries
+        for d in state.get("deleted_queries", []):
+            cid = d.get("chat_id")
+            name = d.get("name")
+            if cid and name:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO deleted_queries (chat_id, name) VALUES (?, ?)",
+                    (cid, name)
+                )
+
+        cursor.execute("SELECT chat_id, name FROM deleted_queries")
+        deleted_set = {(r["chat_id"], r["name"]) for r in cursor.fetchall()}
+
         # Import Queries
         for q in state.get("queries", []):
             cid = q.get("chat_id")
             name = q.get("name")
             params = q.get("params", {})
+            if (cid, name) in deleted_set:
+                continue
             if cid and name and params:
                 cursor.execute(
                     "SELECT 1 FROM queries WHERE chat_id = ? AND name = ?",
