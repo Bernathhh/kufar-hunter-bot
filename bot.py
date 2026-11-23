@@ -162,6 +162,25 @@ def start_health_server(port: int):
         logger.warning(f"Could not start health check HTTP server on port {port}: {e}")
 
 
+def parse_price_range(prc_param: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Parses Kufar 'prc' parameter, e.g. 'r:100000,210000' -> (1000.0, 2100.0).
+    Values in prc are in kopecks (x100).
+    """
+    if not prc_param or not str(prc_param).startswith("r:"):
+        return None, None
+    raw = str(prc_param)[2:]
+    parts = raw.split(",")
+    if len(parts) != 2:
+        return None, None
+    try:
+        min_p = float(parts[0]) / 100.0 if parts[0] and parts[0] not in ("0", "") else None
+        max_p = float(parts[1]) / 100.0 if parts[1] and parts[1] not in ("999999999", "0", "") else None
+        return min_p, max_p
+    except Exception:
+        return None, None
+
+
 def format_params_human(p: Dict[str, Any]) -> str:
     """Formats Kufar search parameters into clear, human-readable Russian text."""
     lines = []
@@ -317,6 +336,7 @@ def format_ad_caption(
     time_label = "Первично создано:" if timing["is_repost"] else "Опубликовано:"
 
     # Format header and price depending on whether this is a price update
+    note_line = None
     if update_type == "price_change" and old_price_byn is not None and new_price_byn is not None:
         diff_byn = old_price_byn - new_price_byn
         if diff_byn > 0:
@@ -329,19 +349,23 @@ def format_ad_caption(
                 + f"\n🏷 <b>Старая цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
                 + f"\n🔻 <b>Скидка:</b> -{pct}% (дешевле на {diff_byn:,.2f} BYN!)"
             )
+            note_line = "💡 <i>Продавец снизил цену этого объявления на Куфаре.</i>"
         else:
-            # Price increased
+            # Price increased (seller raised the price!)
             raise_byn = abs(diff_byn)
-            header_text = f"📈 <b>Цена изменилась (+{raise_byn:,.0f} BYN)</b>\n"
+            pct = round((raise_byn / old_price_byn) * 100) if old_price_byn > 0 else 0
+            header_text = f"📈 <b>Внимание: продавец поднял цену! (+{raise_byn:,.0f} BYN)</b>\n"
             price_line = (
                 f"💰 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
                 + (f" (~${price_usd:,.0f})" if price_usd is not None else "")
-                + f"\n🏷 <b>Старая цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
-                + f"\n🔺 <b>Повышение:</b> +{raise_byn:,.2f} BYN"
+                + f"\n🏷 <b>Прежняя цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
+                + f"\n🔺 <b>Повышение:</b> +{raise_byn:,.2f} BYN (+{pct}%)"
             )
+            note_line = "⚠️ <i>Продавец только что повысил цену на это объявление на Куфаре!</i>"
     else:
         header_text = f"{timing['header']}\n"
         price_line = f"💰 <b>Цена:</b> {price_str}"
+        note_line = timing.get("note")
 
     lines = [
         header_text,
@@ -353,10 +377,8 @@ def format_ad_caption(
         f"📞 <b>Телефон:</b> {phone_str}",
         f"🎯 <i>Поиск: {html.escape(query_name)}</i>"
     ]
-    if update_type == "price_change":
-        lines.append("💡 <i>Продавец обновил цену этого объявления на Куфаре.</i>")
-    elif timing.get("note"):
-        lines.append(timing["note"])
+    if note_line:
+        lines.append(note_line)
 
     if description:
         clean_desc = html.escape(description.strip())
@@ -431,7 +453,7 @@ def send_ad_notification(
 
 
 def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallback: Optional[int] = None) -> int:
-    """Checks Kufar for a specific query and sends notifications for new listings."""
+    """Checks Kufar for a specific query and sends notifications for new listings and price changes."""
     global NEW_ADS_FOUND
     qid = query["id"]
     chat_id = query.get("chat_id") or chat_id_fallback
@@ -441,7 +463,26 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
     name = query["name"]
     params = query["params"]
 
-    ads = fetch_ads(params)
+    # 1. Parse user's desired budget range
+    min_budget, max_budget = parse_price_range(params.get("prc"))
+
+    # 2. Build search params for Kufar API without upper price ceiling,
+    # so we can detect price raises above user filter (e.g. 2100 -> 2500 BYN)
+    # as well as price drops from above into the filter!
+    api_params = dict(params)
+    api_params["size"] = "50"  # Check top 50 items to never miss quick edits or price changes
+    if min_budget is not None:
+        # Keep min price on Kufar API to filter out tiny irrelevant accessories/cables
+        api_params["prc"] = f"r:{int(min_budget * 100)},999999999"
+    else:
+        api_params.pop("prc", None)
+
+    try:
+        ads = fetch_ads(api_params)
+    except Exception as e:
+        logger.error(f"Error fetching ads for query '{name}': {e}")
+        return 0
+
     if not ads:
         return 0
 
@@ -468,50 +509,65 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
 
         if not is_seen:
             # Completely new listing!
-            mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
-            try:
-                if send_ad_notification(tg, chat_id, ad, name, update_type="new"):
-                    sent_count += 1
-                    NEW_ADS_FOUND += 1
-                    time.sleep(1.0)
-            except Exception as e:
-                logger.error(f"Error sending ad notification: {e}")
+            # Check if this new listing is within user's budget:
+            is_within_budget = True
+            if max_budget is not None and curr_byn is not None and curr_byn > max_budget:
+                is_within_budget = False
+            if min_budget is not None and curr_byn is not None and curr_byn < min_budget:
+                is_within_budget = False
 
-        else:
-            # Existing listing -> check if seller changed the price!
-            if last_byn is not None and curr_byn is not None:
-                diff = abs(curr_byn - last_byn)
-                if diff >= 1.0:  # Price changed by 1 BYN or more
-                    logger.info(f"Price change detected for ad {ad_id}: {last_byn} -> {curr_byn} BYN!")
-                    mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
-                    try:
-                        if send_ad_notification(
-                            tg, chat_id, ad, name,
-                            update_type="price_change",
-                            old_price_byn=last_byn,
-                            new_price_byn=curr_byn
-                        ):
-                            sent_count += 1
-                            NEW_ADS_FOUND += 1
-                            time.sleep(1.0)
-                    except Exception as e:
-                        logger.error(f"Error sending price update notification: {e}")
-            elif last_byn is None and curr_byn is not None:
-                # Was previously without price (free / negotiable), now has fixed price
-                logger.info(f"Price set for ad {ad_id}: -> {curr_byn} BYN!")
-                mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
+            # Always record current price in DB
+            mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
+
+            # Only notify if within user's budget
+            if is_within_budget:
                 try:
-                    if send_ad_notification(
-                        tg, chat_id, ad, name,
-                        update_type="price_change",
-                        old_price_byn=0.0,
-                        new_price_byn=curr_byn
-                    ):
+                    if send_ad_notification(tg, chat_id, ad, name, update_type="new"):
                         sent_count += 1
                         NEW_ADS_FOUND += 1
                         time.sleep(1.0)
                 except Exception as e:
-                    logger.error(f"Error sending price update notification: {e}")
+                    logger.error(f"Error sending ad notification: {e}")
+
+        else:
+            # Existing listing -> check if seller changed the price!
+            if last_byn is not None and curr_byn is not None:
+                diff = curr_byn - last_byn
+                if abs(diff) >= 1.0:  # Price changed by 1 BYN or more
+                    # Update price in DB immediately
+                    mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
+
+                    should_notify = False
+                    if diff > 0:
+                        # Price INCREASED! (e.g. 2100 -> 2500 BYN)
+                        # Notify if it was previously within budget (user received it before)
+                        if max_budget is None or last_byn <= max_budget:
+                            should_notify = True
+                            logger.info(f"Price RAISED for ad {ad_id}: {last_byn} -> {curr_byn} BYN (+{diff})!")
+                    else:
+                        # Price DECREASED! (e.g. 2500 -> 1950 BYN or 2100 -> 1900 BYN)
+                        # Notify if new price is within user's budget
+                        if max_budget is None or curr_byn <= max_budget:
+                            should_notify = True
+                            logger.info(f"Price DROPPED for ad {ad_id}: {last_byn} -> {curr_byn} BYN ({diff})!")
+
+                    if should_notify:
+                        try:
+                            if send_ad_notification(
+                                tg, chat_id, ad, name,
+                                update_type="price_change",
+                                old_price_byn=last_byn,
+                                new_price_byn=curr_byn
+                            ):
+                                sent_count += 1
+                                NEW_ADS_FOUND += 1
+                                time.sleep(1.0)
+                        except Exception as e:
+                            logger.error(f"Error sending price update notification: {e}")
+
+            elif last_byn is None and curr_byn is not None:
+                # Was previously without price recorded in DB, silently update price
+                mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
 
     return sent_count
 
