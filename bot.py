@@ -116,6 +116,7 @@ AD_MESSAGES_MAP: Dict[Tuple[int, int], List[int]] = {}
 # User session state for interactive wizard (chat_id -> dict)
 USER_STATES: Dict[int, Dict[str, Any]] = {}
 PENDING_QUERIES: Dict[str, Dict[str, Any]] = {}
+STOP_OUTPUT_REQUESTED: Set[int] = set()
 
 CATEGORIES = [
     ("5040", "🎮 Приставки и игры"),
@@ -1106,6 +1107,7 @@ def notify_admin_new_filter(
 
 def output_all_user_ads(tg: TelegramClient, chat_id: int):
     """Outputs current listings for all active user searches, respecting blacklisted items."""
+    STOP_OUTPUT_REQUESTED.discard(chat_id)
     queries = get_user_queries(chat_id)
     if not queries:
         text = (
@@ -1115,17 +1117,29 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
         tg.send_message(chat_id, text, reply_markup=get_main_keyboard(chat_id))
         return
 
+    stop_markup = {
+        "inline_keyboard": [
+            [{"text": "🛑 Остановить вывод объявлений", "callback_data": "cb:stop_output"}]
+        ]
+    }
+
     tg.send_message(
         chat_id,
         f"🔍 <b>Загружаю актуальные объявления по вашим фильтрам...</b>\n"
-        f"<i>Фильтров: {len(queries)}. Пожалуйста, подождите...</i>"
+        f"<i>Фильтров: {len(queries)}. Пожалуйста, подождите...</i>",
+        reply_markup=stop_markup
     )
 
     bl = get_user_blacklist(chat_id)
     seen_in_run = set()
     total_shown = 0
+    stopped_early = False
 
     for q in queries:
+        if chat_id in STOP_OUTPUT_REQUESTED:
+            stopped_early = True
+            break
+
         q_name = q["name"]
         params = q["params"]
         try:
@@ -1143,14 +1157,34 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
         ]
         # Show top 10 most recent listings per query
         for ad in valid_ads[:10]:
+            if chat_id in STOP_OUTPUT_REQUESTED:
+                stopped_early = True
+                break
             seen_in_run.add(ad["ad_id"])
             mark_ad_seen(q["id"], ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
             try:
                 if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
                     total_shown += 1
-                    time.sleep(0.8)
+                    for _ in range(4):
+                        if chat_id in STOP_OUTPUT_REQUESTED:
+                            stopped_early = True
+                            break
+                        time.sleep(0.2)
+                    if stopped_early:
+                        break
             except Exception as e:
                 logger.error(f"Error displaying ad {ad.get('ad_id')}: {e}")
+        if stopped_early:
+            break
+
+    if stopped_early:
+        STOP_OUTPUT_REQUESTED.discard(chat_id)
+        tg.send_message(
+            chat_id,
+            f"🛑 <b>Вывод объявлений остановлен!</b>\nВсего показано: {total_shown} объявлений.",
+            reply_markup=get_main_keyboard(chat_id)
+        )
+        return
 
     if total_shown == 0:
         tg.send_message(
@@ -1162,13 +1196,14 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
         tg.send_message(
             chat_id,
             f"✅ <b>Вывод завершён! Всего показано: {total_shown} объявлений.</b>\n\n"
-            f"💡 <i>Если объявление вам не подходит, нажмите кнопку «🚫 Не интересно», чтобы оно больше никогда не показывалось.</i>",
+            f"💡 <i>Если объявление вам не подходит, нажмите кнопку «🚫 В ЧС (скрыть)», чтобы оно больше никогда не показывалось.</i>",
             reply_markup=get_main_keyboard(chat_id)
         )
 
 
 def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
     """Outputs current listings for a specific search query."""
+    STOP_OUTPUT_REQUESTED.discard(chat_id)
     queries = get_user_queries(chat_id)
     target = next((q for q in queries if q["id"] == qid), None)
     if not target:
@@ -1178,9 +1213,16 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
     q_name = target["name"]
     params = target["params"]
 
+    stop_markup = {
+        "inline_keyboard": [
+            [{"text": "🛑 Остановить вывод объявлений", "callback_data": "cb:stop_output"}]
+        ]
+    }
+
     tg.send_message(
         chat_id,
-        f"🔍 <b>Загружаю актуальные объявления для «{html.escape(q_name)}»...</b>"
+        f"🔍 <b>Загружаю актуальные объявления для «{html.escape(q_name)}»...</b>",
+        reply_markup=stop_markup
     )
 
     bl = get_user_blacklist(chat_id)
@@ -1198,15 +1240,34 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
         and not is_seller_blacklisted(chat_id, a.get("seller", ""), a.get("account_id"))
     ]
     total_shown = 0
+    stopped_early = False
 
     for ad in valid_ads[:10]:
+        if chat_id in STOP_OUTPUT_REQUESTED:
+            stopped_early = True
+            break
         mark_ad_seen(qid, ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
         try:
             if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
                 total_shown += 1
-                time.sleep(0.8)
+                for _ in range(4):
+                    if chat_id in STOP_OUTPUT_REQUESTED:
+                        stopped_early = True
+                        break
+                    time.sleep(0.2)
+                if stopped_early:
+                    break
         except Exception as e:
             logger.error(f"Error displaying ad {ad.get('ad_id')}: {e}")
+
+    if stopped_early:
+        STOP_OUTPUT_REQUESTED.discard(chat_id)
+        tg.send_message(
+            chat_id,
+            f"🛑 <b>Вывод объявлений остановлен!</b>\nВсего показано: {total_shown} объявлений.",
+            reply_markup=get_main_keyboard(chat_id)
+        )
+        return
 
     if total_shown == 0:
         tg.send_message(
@@ -1685,6 +1746,10 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     if data == "cb:menu":
         USER_STATES.pop(chat_id, None)
         show_main_menu(tg, chat_id)
+
+    elif data == "cb:stop_output":
+        STOP_OUTPUT_REQUESTED.add(chat_id)
+        tg.answer_callback_query(cb_id, text="🛑 Остановка вывода объявлений...", show_alert=False)
 
     elif data in ("cb:my_searches", "cb:list"):
         USER_STATES.pop(chat_id, None)
@@ -2230,6 +2295,18 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         return
 
     if text in [
+        "🛑 Остановить вывод",
+        "Остановить вывод",
+        "остановить вывод",
+        "хватит",
+        "/stop_output",
+        "/abort"
+    ]:
+        STOP_OUTPUT_REQUESTED.add(chat_id)
+        tg.send_message(chat_id, "🛑 Останавливаю вывод объявлений...")
+        return
+
+    if text in [
         "⏸ Стоп (пауза)",
         "⏸ Стоп",
         "Стоп",
@@ -2241,6 +2318,7 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         "/pause",
         "стоп бот"
     ]:
+        STOP_OUTPUT_REQUESTED.add(chat_id)
         USER_STATES.pop(chat_id, None)
         set_user_monitoring_paused(chat_id, True)
         save_local_backup()
