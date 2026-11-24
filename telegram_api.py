@@ -53,6 +53,9 @@ class TelegramClient:
                     logger.warning(f"Telegram rate limit (429) on {method}, sleeping {wait_sec:.1f}s before retry...")
                     time.sleep(wait_sec)
                     continue
+                if "message is not modified" in err_body:
+                    logger.debug(f"Telegram {method}: message not modified")
+                    return None
                 logger.error(f"HTTPError on {method}: {e.code} - {err_body}")
                 return None
             except Exception as e:
@@ -70,6 +73,21 @@ class TelegramClient:
     def set_my_commands(self, commands: List[Dict[str, str]]) -> bool:
         """Registers slash commands in Telegram's bot command menu."""
         res = self._api_call("setMyCommands", payload={"commands": commands})
+        return res is not None
+
+    def set_chat_menu_button(self, web_app_url: Optional[str] = None, text: str = "📱 Приложение") -> bool:
+        """Configures the Telegram chat menu button to launch the Mini App or default commands."""
+        if web_app_url:
+            payload = {
+                "menu_button": {
+                    "type": "web_app",
+                    "text": text,
+                    "web_app": {"url": web_app_url}
+                }
+            }
+        else:
+            payload = {"menu_button": {"type": "commands"}}
+        res = self._api_call("setChatMenuButton", payload=payload)
         return res is not None
 
     def get_updates(self, offset: Optional[int] = None, timeout: int = 25) -> List[Dict[str, Any]]:
@@ -107,14 +125,16 @@ class TelegramClient:
         message_id: int,
         text: str,
         parse_mode: str = "HTML",
-        reply_markup: Optional[Dict[str, Any]] = None
+        reply_markup: Optional[Dict[str, Any]] = None,
+        disable_web_page_preview: bool = False
     ) -> bool:
         """Edits an existing text message."""
-        payload = {
+        payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
-            "parse_mode": parse_mode
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": disable_web_page_preview
         }
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup

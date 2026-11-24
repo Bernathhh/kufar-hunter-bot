@@ -85,6 +85,7 @@ from kufar_api import (
     fetch_ad_phone_with_token
 )
 from telegram_api import TelegramClient
+from webapp_ui import create_http_handler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,25 +147,25 @@ REGIONS = [
     ("all", "🇧🇾 Вся Беларусь")
 ]
 
-def get_main_keyboard(chat_id: int = 0) -> Dict[str, Any]:
-    """Generates the main reply keyboard with dynamic Pause/Resume state."""
-    paused = is_user_monitoring_paused(chat_id) if chat_id else False
-    pause_btn = {"text": "▶️ Возобновить"} if paused else {"text": "⏸ Стоп (пауза)"}
-    return {
-        "keyboard": [
-            [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
-            [{"text": "📦 Вывести всё"}, {"text": "⭐️ Избранное"}],
-            [pause_btn, {"text": "🌙 Ночной режим"}],
-            [{"text": "⛔ Стоп-слова"}, {"text": "💬 Мой шаблон"}],
-            [{"text": "🚫 Чёрный список"}, {"text": "⏱ Интервал"}],
-            [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": True
-    }
+def get_webapp_url() -> Optional[str]:
+    """Returns HTTPS Mini App URL if configured or running on Render."""
+    base = (
+        os.getenv("WEBAPP_URL")
+        or os.getenv("RENDER_EXTERNAL_URL")
+        or GLOBAL_CONFIG.get("webapp_url")
+        or ""
+    ).strip()
+    if base.startswith("https://"):
+        return base.rstrip("/") + "/webapp"
+    return None
 
-# Fallback default keyboard
-MAIN_KEYBOARD = get_main_keyboard(0)
+
+def get_main_keyboard(chat_id: int = 0) -> Optional[Dict[str, Any]]:
+    """Legacy reply keyboard removed in favor of inline Dashboard Hub & Mini App."""
+    return None
+
+
+MAIN_KEYBOARD = None
 
 
 def make_ad_keyboard(
@@ -175,34 +176,25 @@ def make_ad_keyboard(
     is_blacklisted: bool = False,
     is_fav: bool = False
 ) -> Dict[str, Any]:
-    """Builds clean inline action keyboard attached directly to ad cards."""
-    buttons = []
-    
-    # Row 1: Direct link to listing on Kufar + Contact template
-    buttons.append([
-        {"text": "🔗 Открыть на Kufar", "url": ad_link},
-        {"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}
-    ])
-
-    # Row 2: Favorite toggle + Blacklist toggle (in 2 ergonomic columns)
-    fav_text = "⭐️ В избранном" if is_fav else "⭐️ В Избранное"
+    """Builds compact 2-row inline action keyboard attached to ad cards without label truncation."""
+    fav_text = "⭐️ Убрать" if is_fav else "⭐️ В избр."
     fav_cb = f"cb:unfav:{ad_id}" if is_fav else f"cb:fav:{ad_id}"
-    bl_text = "↩️ Из ЧС" if is_blacklisted else "🚫 В ЧС"
+    bl_text = "↩️ Вернуть" if is_blacklisted else "🚫 Скрыть"
     bl_cb = f"cb:unbl:{ad_id}" if is_blacklisted else f"cb:bl:{ad_id}"
-    buttons.append([
-        {"text": fav_text, "callback_data": fav_cb},
-        {"text": bl_text, "callback_data": bl_cb}
-    ])
 
-    # Row 3: Seller blacklist button
-    if seller_name:
-        clean_s = seller_name.strip()
-        short_s = clean_s[:16] + "…" if len(clean_s) > 17 else clean_s
-        buttons.append([{"text": f"👤 В ЧС: {short_s}", "callback_data": f"cb:bl_seller:{ad_id}"}])
-    else:
-        buttons.append([{"text": "👤 В ЧС продавца", "callback_data": f"cb:bl_seller:{ad_id}"}])
-
-    return {"inline_keyboard": buttons}
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔗 На Kufar", "url": ad_link},
+                {"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}
+            ],
+            [
+                {"text": fav_text, "callback_data": fav_cb},
+                {"text": bl_text, "callback_data": bl_cb},
+                {"text": "⛔ Автор", "callback_data": f"cb:bl_seller:{ad_id}"}
+            ]
+        ]
+    }
 
 
 def calculate_market_stats(ads: List[Dict[str, Any]]) -> Optional[float]:
@@ -294,38 +286,33 @@ def extract_smart_badges(subject: str, description: Optional[str]) -> List[str]:
     return badges
 
 
-class HealthHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json; charset=utf-8")
-        self.end_headers()
-        uptime = str(datetime.now() - START_TIME).split(".")[0]
-        status = {
-            "status": "online",
-            "bot": "Kufar Hunter Bot",
-            "uptime": uptime,
-            "total_checks": TOTAL_CHECKS,
-            "active_queries": len(get_active_queries()),
-            "timestamp": datetime.now().isoformat()
-        }
-        self.wfile.write(json.dumps(status, ensure_ascii=False).encode("utf-8"))
-
-    def log_message(self, format, *args):
-        pass
-
-
-class ReusableTCPServer(socketserver.TCPServer):
+class ReusableThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def start_health_server(port: int):
     try:
-        server = ReusableTCPServer(("0.0.0.0", port), HealthHandler)
+        app_ctx = {
+            "tg": GLOBAL_TG,
+            "config": GLOBAL_CONFIG,
+            "start_time": START_TIME,
+            "get_counters": lambda: (TOTAL_CHECKS, NEW_ADS_FOUND),
+            "sync_backup": save_local_backup,
+            "trigger_force_check": lambda: FORCE_CHECK_EVENT.set(),
+            "send_query_ads_to_chat": lambda cid, qid: output_ads_for_query(GLOBAL_TG, cid, qid, background=True) if GLOBAL_TG else None,
+            "send_all_ads_to_chat": lambda cid: output_all_user_ads(GLOBAL_TG, cid, background=True) if GLOBAL_TG else None,
+            "send_single_ad_to_chat": lambda cid, ad, qn, med: send_ad_notification(GLOBAL_TG, cid, ad, qn, market_median=med) if GLOBAL_TG else False,
+            "categories": CATEGORIES,
+            "regions": REGIONS,
+        }
+        handler_cls = create_http_handler(app_ctx)
+        server = ReusableThreadingTCPServer(("0.0.0.0", port), handler_cls)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        logger.info(f"Health check HTTP server running on port {port}")
+        logger.info(f"Mini App & Health HTTP server running on port {port}")
     except Exception as e:
-        logger.warning(f"Could not start health check HTTP server on port {port}: {e}")
+        logger.warning(f"Could not start HTTP server on port {port}: {e}")
 
 
 def keep_alive_loop():
@@ -1446,110 +1433,277 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int, background:
         _run_batch_ad_output(tg, chat_id, [target], header, empty, done_fn)
 
 
-def show_main_menu(tg: TelegramClient, chat_id: int):
-    """Sends greeting with main keyboard menu."""
-    paused = is_user_monitoring_paused(chat_id)
-    status_icon = "⏸ <b>Мониторинг:</b> На паузе (остановлен)" if paused else "🟢 <b>Мониторинг:</b> Активен (отслеживает)"
-    text = (
-        "👋 <b>Главное меню Kufar Hunter</b>\n\n"
-        f"⚡ {status_icon}\n\n"
-        "Бот непрерывно мониторит Kufar и мгновенно присылает новые объявления по вашим точным фильтрам.\n\n"
-        "Выберите действие на кнопках ниже 👇"
+def _send_or_edit(
+    tg: TelegramClient,
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[Dict[str, Any]] = None,
+    edit_msg_id: Optional[int] = None,
+    disable_web_page_preview: bool = True
+):
+    """Edits the dashboard hub message in-place when possible, preventing chat clutter."""
+    if edit_msg_id:
+        ok = tg.edit_message_text(
+            chat_id,
+            edit_msg_id,
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=disable_web_page_preview
+        )
+        if ok:
+            return
+    tg.send_message(
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+        disable_web_page_preview=disable_web_page_preview
     )
-    tg.send_message(chat_id, text, reply_markup=get_main_keyboard(chat_id))
 
 
-def prompt_add_search_options(tg: TelegramClient, chat_id: int):
-    """Shows options to add search: by link or by step-by-step wizard."""
+def show_main_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays unified compact Inline Dashboard Hub (clears legacy ReplyKeyboard once)."""
+    if not edit_msg_id and get_setting(f"ui_v2_{chat_id}") != "1":
+        set_setting(f"ui_v2_{chat_id}", "1")
+        tg.send_message(
+            chat_id,
+            "✨ <b>Панель обновлена!</b> Громоздкие кнопки убраны — всё управление теперь в едином меню и Mini App.",
+            reply_markup={"remove_keyboard": True},
+            disable_notification=True
+        )
+
+    paused = is_user_monitoring_paused(chat_id)
+    queries = get_user_queries(chat_id)
+    fav_cnt = get_favorites_count(chat_id)
+    sw_cnt = len(get_stop_words(chat_id))
+    interval = int(GLOBAL_CONFIG.get("check_interval_seconds", 60))
+    silent_mode = get_silent_mode(chat_id)
+    silent_str = "выкл" if silent_mode in ("off", "") else silent_mode
+
+    status_icon = "⏸ <b>На паузе</b>" if paused else f"🟢 <b>Активен</b> ({interval}с)"
     text = (
-        "➕ <b>Как вы хотите настроить фильтры?</b>\n\n"
-        "1️⃣ <b>Вставить ссылку с Куфара (Рекомендуется)</b> — настройте любые тонкие фильтры на сайте kufar.by в браузере (категория, состояние, районы, бренд, цена), скопируйте ссылку и отправьте боту. Он скопирует все фильтры 1 в 1!\n\n"
-        "2️⃣ <b>Конструктор по кнопкам</b> — пошагово выбрать категорию, регион, цену и ключевые слова прямо в Telegram."
+        f"🏹 <b>Kufar Hunter</b>  •  {status_icon}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Поисков: <b>{len(queries)}</b>  •  ⭐️ Избранное: <b>{fav_cnt}</b>\n"
+        f"⛔ Стоп-слова: <b>{sw_cnt}</b>  •  🌙 Тишина: <b>{html.escape(silent_str)}</b>\n\n"
+        f"<i>Отправьте ссылку с kufar.by прямо в чат или выберите раздел:</i>"
+    )
+
+    buttons: List[List[Dict[str, Any]]] = []
+    webapp_url = get_webapp_url()
+    if webapp_url:
+        buttons.append([{"text": "📱 Открыть Mini App", "web_app": {"url": webapp_url}}])
+
+    pause_btn = (
+        {"text": "▶️ Запустить", "callback_data": "cb:hub_resume"}
+        if paused else
+        {"text": "⏸ На паузу", "callback_data": "cb:hub_pause"}
+    )
+    buttons.append([
+        {"text": "📦 Вывести всё", "callback_data": "cb:all_ads"},
+        pause_btn
+    ])
+    buttons.append([
+        {"text": f"🎯 Поиски ({len(queries)})", "callback_data": "cb:my_searches"},
+        {"text": f"⭐️ Избранное ({fav_cnt})", "callback_data": "cb:fav_menu"}
+    ])
+    buttons.append([
+        {"text": "⚙️ Фильтры и ЧС", "callback_data": "cb:settings"},
+        {"text": "📊 Статус", "callback_data": "cb:stats"}
+    ])
+
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
+
+
+def show_settings_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Unified settings & filters submenu rendered cleanly in-place."""
+    interval = int(GLOBAL_CONFIG.get("check_interval_seconds", 60))
+    silent_mode = get_silent_mode(chat_id)
+    silent_badge = "Выкл" if silent_mode in ("off", "") else silent_mode
+    sw_cnt = len(get_stop_words(chat_id))
+    bl_ads = get_blacklist_count(chat_id)
+    bl_sellers = len(get_blacklisted_sellers(chat_id))
+
+    text = (
+        f"⚙️ <b>Настройки, фильтры и ЧС</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ <b>Интервал:</b> {interval} сек.\n"
+        f"🌙 <b>Тихие часы:</b> {html.escape(silent_badge)}\n"
+        f"⛔ <b>Стоп-слова:</b> {sw_cnt} шт.\n"
+        f"🚫 <b>В ЧС:</b> {bl_ads} объявл. / {bl_sellers} авт.\n"
+    )
+    buttons = [
+        [
+            {"text": f"⏱ Интервал ({interval}с)", "callback_data": "cb:interval_menu"},
+            {"text": "🌙 Тихий режим", "callback_data": "cb:silent_menu"}
+        ],
+        [
+            {"text": f"⛔ Стоп-слова ({sw_cnt})", "callback_data": "cb:sw_menu"},
+            {"text": "🚫 Чёрный список", "callback_data": "cb:bl_menu"}
+        ],
+        [
+            {"text": "💬 Шаблон ответа", "callback_data": "cb:tpl_menu"},
+            {"text": "❓ Помощь", "callback_data": "cb:help"}
+        ],
+        [{"text": "⬅️ Назад в меню", "callback_data": "cb:menu"}]
+    ]
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
+
+
+def show_stats_menu(tg: TelegramClient, chat_id: int, config: dict, edit_msg_id: Optional[int] = None):
+    """Displays clean bot statistics in-place inside Hub."""
+    admin_chat_id = config.get("admin_chat_id", 0)
+    uptime_str = str(datetime.now() - START_TIME).split(".")[0]
+    user_queries = len(get_user_queries(chat_id))
+    bl_count = get_blacklist_count(chat_id)
+    fav_count = get_favorites_count(chat_id)
+    sw_count = len(get_stop_words(chat_id))
+    bl_sellers_count = len(get_blacklisted_sellers(chat_id))
+    silent_mode_str = get_silent_mode(chat_id)
+    silent_display = "Выключен" if silent_mode_str in ("off", "") else f"Включен ({silent_mode_str})"
+    backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y в %H:%M') if LAST_BACKUP_TIME else "актуальна"
+    paused_str = "⏸ На паузе" if is_user_monitoring_paused(chat_id) else "🟢 Активен"
+
+    status_text = (
+        f"📊 <b>Статус Kufar Hunter</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <b>Мониторинг:</b> {paused_str}\n"
+        f"⏱ <b>Аптайм:</b> {uptime_str} • <b>Проверок:</b> {TOTAL_CHECKS}\n"
+        f"⏳ <b>Интервал:</b> {config.get('check_interval_seconds', 60)} сек.\n"
+        f"🎯 <b>Поисков:</b> {user_queries} • ⭐️ <b>Избранное:</b> {fav_count}\n"
+        f"⛔ <b>Стоп-слов:</b> {sw_count} • 🚫 <b>ЧС:</b> {bl_count} / {bl_sellers_count} авт.\n"
+        f"🌙 <b>Тихий режим:</b> {html.escape(silent_display)}\n"
+        f"💾 <b>Синхронизация:</b> {backup_str}"
+    )
+    if chat_id == admin_chat_id:
+        status_text += (
+            f"\n\n👑 <b>Админ:</b> 👥 {get_user_count()} польз. • "
+            f"🎯 {len(get_active_queries())} фильтров • 📨 {NEW_ADS_FOUND} отпр."
+        )
+    buttons = [
+        [
+            {"text": "🔄 Обновить", "callback_data": "cb:stats"},
+            {"text": "⬅️ Назад", "callback_data": "cb:menu"}
+        ]
+    ]
+    _send_or_edit(tg, chat_id, status_text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
+
+
+def show_help_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays structured help guide inside Hub."""
+    help_text = (
+        "📖 <b>Как пользоваться Kufar Hunter</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ Настройте нужные фильтры на <b>kufar.by</b> (категория, город, бренд, цена) и просто <b>отправьте ссылку сюда в чат</b>.\n"
+        "2️⃣ Бот сам присылает свежие объявления <b>полным фотоальбомом</b>, сравнивает цену с рынком и отслеживает скидки.\n"
+        "3️⃣ Для максимального удобства откройте <b>📱 Mini App</b> — там лента, конструкторы, аналитика цен и фильтры как в нативном приложении.\n\n"
+        "💡 <i>Команды:</i> /start • /all • /favs • /blacklist • /pause • /resume"
     )
     markup = {
         "inline_keyboard": [
-            [{"text": "🔗 Вставить ссылку с Куфара (1 в 1)", "callback_data": "cb:add_link"}],
-            [{"text": "🛠 Пошаговый конструктор", "callback_data": "cb:wiz_start"}],
-            [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+            [{"text": "➕ Добавить поиск", "callback_data": "cb:add_options"}],
+            [{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}]
         ]
     }
-    tg.send_message(chat_id, text, reply_markup=markup)
+    _send_or_edit(tg, chat_id, help_text, reply_markup=markup, edit_msg_id=edit_msg_id)
 
 
-def show_my_searches(tg: TelegramClient, chat_id: int):
-    """Lists all active searches with interactive management buttons."""
+def prompt_add_search_options(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Shows options to add search: by link, constructor, or Mini App."""
+    text = (
+        "➕ <b>Добавление поиска</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "• <b>🔗 Ссылка с Kufar.by</b> — скопируйте URL с нужными фильтрами и отправьте сюда (перенос 1-в-1).\n"
+        "• <b>🛠 Конструктор</b> — пошаговый выбор категории, региона, ключевых слов и цены."
+    )
+    buttons: List[List[Dict[str, Any]]] = [
+        [{"text": "🔗 Вставить ссылку Kufar", "callback_data": "cb:add_link"}],
+        [{"text": "🛠 Пошаговый конструктор", "callback_data": "cb:wiz_start"}],
+    ]
+    webapp_url = get_webapp_url()
+    if webapp_url:
+        buttons.append([{"text": "📱 Настроить в Mini App", "web_app": {"url": webapp_url}}])
+    buttons.append([{"text": "⬅️ Назад", "callback_data": "cb:my_searches"}])
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
+
+
+def show_my_searches(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays all searches cleanly packaged in ONE in-place hub card with per-query sub-controls."""
     queries = get_user_queries(chat_id)
     if not queries:
         text = (
-            "📭 <b>У вас пока нет сохранённых поисков.</b>\n\n"
-            "Нажмите кнопку <b>«➕ Добавить поиск»</b>, чтобы создать первый фильтр!"
+            "🎯 <b>Ваши поиски</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📭 У вас пока нет сохранённых фильтров.\n\n"
+            "Отправьте ссылку с <b>kufar.by</b> прямо в чат или нажмите «➕ Добавить»."
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "➕ Добавить поиск", "callback_data": "cb:add_link"}]
+                [{"text": "➕ Добавить поиск", "callback_data": "cb:add_options"}],
+                [{"text": "⬅️ Назад", "callback_data": "cb:menu"}]
             ]
         }
-        tg.send_message(chat_id, text, reply_markup=markup)
+        _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
         return
 
     paused_user = is_user_monitoring_paused(chat_id)
-    pause_note = " <i>(Все проверки на паузе ⏸)</i>" if paused_user else ""
-    tg.send_message(chat_id, f"📋 <b>Ваши поиски (всего: {len(queries)}):</b>{pause_note}")
+    header_note = " <i>(общая пауза ⏸)</i>" if paused_user else ""
+    blocks = [f"🎯 <b>Ваши поиски ({len(queries)} шт.)</b>{header_note}\n━━━━━━━━━━━━━━━━━━━━"]
+    buttons: List[List[Dict[str, Any]]] = []
 
-    for q in queries:
+    for idx, q in enumerate(queries[:6], 1):
         qid = q["id"]
         name = q["name"]
         params = q["params"]
         seen = get_query_seen_count(qid)
         is_active = q.get("is_active", True)
+        dot = "🟢" if is_active else "⏸"
 
-        status_str = "🟢 Активен" if is_active else "⏸ На паузе"
+        blocks.append(f"{dot} <b>{idx}. {html.escape(name)}</b>\n{format_params_human(params)}\n📦 <i>Просмотрено: {seen}</i>")
+        short_lbl = name[:14] + "…" if len(name) > 15 else name
+        prefix = f"{idx}. " if len(queries) > 1 else ""
         toggle_btn = (
-            {"text": "⏸ На паузу", "callback_data": f"cb:toggle_q:{qid}:0"}
+            {"text": f"⏸ Пауза {idx}" if len(queries) > 1 else "⏸ Пауза", "callback_data": f"cb:toggle_q:{qid}:0"}
             if is_active else
-            {"text": "▶️ Включить", "callback_data": f"cb:toggle_q:{qid}:1"}
+            {"text": f"▶️ Вкл {idx}" if len(queries) > 1 else "▶️ Включить", "callback_data": f"cb:toggle_q:{qid}:1"}
         )
+        buttons.append([
+            {"text": f"📦 {prefix}{short_lbl}", "callback_data": f"cb:show_ads:{qid}"},
+            {"text": f"📊 Цены {idx}" if len(queries) > 1 else "📊 Цены", "callback_data": f"cb:market_stats:{qid}"}
+        ])
+        buttons.append([
+            toggle_btn,
+            {"text": f"🗑 Удалить {idx}" if len(queries) > 1 else "🗑 Удалить", "callback_data": f"cb:del:{qid}"}
+        ])
 
-        text = (
-            f"📌 <b>Поиск [ID: {qid}]: {html.escape(name)}</b>\n"
-            f"⚡ <b>Статус:</b> {status_str}\n\n"
-            f"{format_params_human(params)}\n\n"
-            f"📦 <i>Просмотрено объявлений: {seen}</i>"
-        )
-        markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"},
-                    {"text": "📊 Аналитика цен", "callback_data": f"cb:market_stats:{qid}"}
-                ],
-                [
-                    toggle_btn,
-                    {"text": "🗑 Удалить этот поиск", "callback_data": f"cb:del:{qid}"}
-                ]
-            ]
-        }
-        tg.send_message(chat_id, text, reply_markup=markup)
+    if len(queries) > 6:
+        blocks.append(f"<i>...и ещё {len(queries) - 6} поисков (все доступны в Mini App).</i>")
+
+    buttons.append([
+        {"text": "➕ Добавить", "callback_data": "cb:add_options"},
+        {"text": "⬅️ Назад", "callback_data": "cb:menu"}
+    ])
+    _send_or_edit(tg, chat_id, "\n\n".join(blocks), reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
-def show_favorites_menu(tg: TelegramClient, chat_id: int):
-    """Displays saved favorite ads with links and quick actions."""
+def show_favorites_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays saved favorite ads cleanly."""
     favs = get_user_favorites(chat_id)
     if not favs:
         text = (
-            "⭐️ <b>Ваше Избранное пока пусто.</b>\n\n"
-            "Чтобы отложить понравившееся объявление, нажмите кнопку <b>«⭐️ В Избранное»</b> прямо под карточкой товара в чате!\n"
-            "Бот сохранит его сюда, и вы в любой момент сможете быстро вернуться к нему."
+            "⭐️ <b>Избранное</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Пока пусто. Нажимайте <b>«⭐️ В избр.»</b> под понравившимися объявлениями!"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "📦 Вывести все объявления", "callback_data": "cb:all_ads"}],
-                [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+                [{"text": "📦 Свежие объявления", "callback_data": "cb:all_ads"}],
+                [{"text": "⬅️ Назад", "callback_data": "cb:menu"}]
             ]
         }
-        tg.send_message(chat_id, text, reply_markup=markup)
+        _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
         return
 
-    tg.send_message(chat_id, f"⭐️ <b>Ваши сохранённые объявления ({len(favs)} шт.):</b>")
+    tg.send_message(chat_id, f"⭐️ <b>Ваше Избранное ({len(favs)} шт.):</b>")
 
     for f in favs[:10]:
         ad_id = f["ad_id"]
@@ -1569,8 +1723,7 @@ def show_favorites_menu(tg: TelegramClient, chat_id: int):
         item_text = (
             f"⭐️ <b>{title}</b>\n"
             f"{price_str}\n"
-            f"👤 Продавец: {sname}\n"
-            f"🔗 <a href=\"{link}\">Открыть объявление на Kufar</a>"
+            f"👤 Продавец: {sname}"
         )
         markup = {
             "inline_keyboard": [
@@ -1578,9 +1731,7 @@ def show_favorites_menu(tg: TelegramClient, chat_id: int):
                     {"text": "🔗 На Kufar", "url": link},
                     {"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}
                 ],
-                [
-                    {"text": "❌ Удалить из Избранного", "callback_data": f"cb:unfav_list:{ad_id}"}
-                ]
+                [{"text": "❌ Убрать из Избранного", "callback_data": f"cb:unfav_list:{ad_id}"}]
             ]
         }
         img_url = f.get("image_url")
@@ -1590,19 +1741,18 @@ def show_favorites_menu(tg: TelegramClient, chat_id: int):
             tg.send_message(chat_id, item_text, reply_markup=markup, disable_web_page_preview=True)
 
     if len(favs) > 10:
-        tg.send_message(chat_id, f"<i>...и ещё {len(favs) - 10} объявлений в Избранном.</i>")
+        tg.send_message(chat_id, f"<i>...и ещё {len(favs) - 10} объявлений (откройте Mini App для полного списка).</i>")
 
     clear_markup = {
         "inline_keyboard": [
-            [{"text": "🧹 Очистить всё Избранное", "callback_data": "cb:fav_clear"}],
-            [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+            [{"text": "🧹 Очистить всё", "callback_data": "cb:fav_clear"}, {"text": "⬅️ В меню", "callback_data": "cb:menu"}]
         ]
     }
     tg.send_message(chat_id, "⚙️ <b>Управление Избранным:</b>", reply_markup=clear_markup)
 
 
-def show_blacklist_menu(tg: TelegramClient, chat_id: int):
-    """Displays blacklisted ads count and blocked sellers with one-click unblocking."""
+def show_blacklist_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays blacklisted ads count and blocked sellers with one-click unblocking in-place."""
     bl_ads_count = get_blacklist_count(chat_id)
     bl_sellers = sorted(get_blacklisted_sellers(chat_id))
 
@@ -1611,129 +1761,138 @@ def show_blacklist_menu(tg: TelegramClient, chat_id: int):
         if bl_sellers else "<i>нет заблокированных продавцов</i>"
     )
     text = (
-        f"🚫 <b>Управление Чёрным списком</b>\n\n"
+        f"🚫 <b>Чёрный список</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 <b>Скрытых объявлений:</b> {bl_ads_count} шт.\n"
         f"👤 <b>Заблокированных продавцов ({len(bl_sellers)}):</b>\n{sellers_str}\n\n"
-        f"<i>Скрытые объявления и товары продавцов из ЧС никогда не приходят в поиске и уведомлениях.</i>"
+        f"<i>Скрытые объявления и товары этих продавцов никогда не приходят.</i>"
     )
     buttons = []
-    for idx, sname in enumerate(bl_sellers[:10]):
-        short_s = sname[:22] + "…" if len(sname) > 23 else sname
+    for idx, sname in enumerate(bl_sellers[:8]):
+        short_s = sname[:20] + "…" if len(sname) > 21 else sname
         buttons.append([{"text": f"↩️ Разблокировать: {short_s}", "callback_data": f"cb:unbl_seller:{idx}"}])
     if bl_ads_count > 0:
-        buttons.append([{"text": f"🧹 Очистить ЧС объявлений ({bl_ads_count})", "callback_data": "cb:bl_clear_ads"}])
-    buttons.append([{"text": "🔙 В главное меню", "callback_data": "cb:menu"}])
-    tg.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
+        buttons.append([{"text": f"🧹 Очистить ЧС объявл. ({bl_ads_count})", "callback_data": "cb:bl_clear_ads"}])
+    buttons.append([{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}])
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
-def show_silent_mode_menu(tg: TelegramClient, chat_id: int):
-    """Displays menu for configuring night/silent hours."""
+def show_silent_mode_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays menu for configuring night/silent hours in-place."""
     current_mode = get_silent_mode(chat_id)
     is_active_now = is_in_silent_hours(chat_id)
 
     if not current_mode or current_mode.lower() in ("off", "none", "disabled", "0"):
-        status_str = "☀️ <b>Выключен</b>\n<i>(Новые объявления приходят со звуком круглосуточно)</i>"
+        status_str = "☀️ <b>Выключен</b>\n<i>(Уведомления приходят со звуком круглосуточно)</i>"
     else:
-        active_badge = " 🟢 <b>[СЕЙЧАС ДЕЙСТВУЕТ ТИШИНА]</b>" if is_active_now else ""
+        active_badge = " 🟢 <b>[ТИШИНА СЕЙЧАС]</b>" if is_active_now else ""
         status_str = (
             f"🌙 <b>Включен: {html.escape(current_mode)}</b>{active_badge}\n"
-            f"<i>(В эти часы бот присылает объявления полностью БЕЗ ЗВУКА и вибрации, не беспокоя вас ночью)</i>"
+            f"<i>(В эти часы объявления приходят полностью БЕЗ ЗВУКА)</i>"
         )
 
     text = (
-        f"🌙 <b>Опциональный ночной (тихий) режим</b>\n\n"
-        f"Текущий статус:\n{status_str}\n\n"
-        f"Выберите предустановку или настройте свои часы тишины:"
+        f"🌙 <b>Ночной (тихий) режим</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{status_str}\n\n"
+        f"Выберите предустановку или задайте своё время:"
     )
     buttons = [
-        [{"text": "🌙 Включить (23:00 — 08:00)", "callback_data": "cb:silent_set:23:00-08:00"}],
-        [{"text": "🌙 Включить (00:00 — 09:00)", "callback_data": "cb:silent_set:00:00-09:00"}],
-        [{"text": "☀️ Выключить (звук всегда)", "callback_data": "cb:silent_set:off"}],
-        [{"text": "✏️ Настроить свои часы", "callback_data": "cb:silent_custom"}],
-        [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+        [
+            {"text": "🌙 23:00 — 08:00", "callback_data": "cb:silent_set:23:00-08:00"},
+            {"text": "🌙 00:00 — 09:00", "callback_data": "cb:silent_set:00:00-09:00"}
+        ],
+        [
+            {"text": "✏️ Свои часы", "callback_data": "cb:silent_custom"},
+            {"text": "☀️ Выключить", "callback_data": "cb:silent_set:off"}
+        ],
+        [{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}]
     ]
-    tg.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
-def show_interval_options(tg: TelegramClient, chat_id: int, current: int):
-    """Shows speed/interval options."""
+def show_interval_options(tg: TelegramClient, chat_id: int, current: int, edit_msg_id: Optional[int] = None):
+    """Shows speed/interval options in-place."""
     text = (
-        f"⏱ <b>Скорость проверки Куфара</b>\n\n"
+        f"⏱ <b>Интервал проверки Куфара</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Текущий интервал: <b>{current} сек.</b>\n"
-        f"Выберите, как часто бот должен опрашивать сайт:"
+        f"Выберите частоту проверки:"
     )
+    def _lbl(sec: int, ico: str) -> str:
+        return f"• {ico} {sec} сек •" if int(current) == sec else f"{ico} {sec} сек"
+
     markup = {
         "inline_keyboard": [
             [
-                {"text": "⚡ 15 сек", "callback_data": "cb:interval:15"},
-                {"text": "🚀 30 сек", "callback_data": "cb:interval:30"}
+                {"text": _lbl(15, "⚡"), "callback_data": "cb:interval:15"},
+                {"text": _lbl(30, "🚀"), "callback_data": "cb:interval:30"}
             ],
             [
-                {"text": "⏱ 60 сек", "callback_data": "cb:interval:60"},
-                {"text": "⏳ 120 сек", "callback_data": "cb:interval:120"}
+                {"text": _lbl(60, "⏱"), "callback_data": "cb:interval:60"},
+                {"text": _lbl(120, "⏳"), "callback_data": "cb:interval:120"}
             ],
-            [{"text": "🔙 Назад", "callback_data": "cb:menu"}]
+            [{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}]
         ]
     }
-    tg.send_message(chat_id, text, reply_markup=markup)
+    _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
 
 
-def show_stop_words_menu(tg: TelegramClient, chat_id: int):
-    """Displays current stop words and interactive management buttons."""
+def show_stop_words_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays current stop words and interactive management buttons in-place."""
     sw_list = get_stop_words(chat_id)
     if sw_list:
         words_str = ", ".join(f"<code>{html.escape(w)}</code>" for w in sw_list)
         text = (
-            f"⛔ <b>Ваши стоп-слова (минус-слова):</b>\n\n"
+            f"⛔ <b>Стоп-слова (минус-слова)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{words_str}\n\n"
-            f"💡 <i>Объявления, содержащие эти слова в названии или описании, будут автоматически скрываться.</i>"
+            f"💡 <i>Объявления с этими словами скрываются автоматически.</i>"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "➕ Добавить стоп-слова", "callback_data": "cb:sw_add"}],
-                [{"text": "🗑 Удалить конкретное слово", "callback_data": "cb:sw_del_menu"}],
-                [{"text": "🧹 Очистить все слова", "callback_data": "cb:sw_clear"}],
-                [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+                [
+                    {"text": "➕ Добавить", "callback_data": "cb:sw_add"},
+                    {"text": "🗑 Удалить слово", "callback_data": "cb:sw_del_menu"}
+                ],
+                [{"text": "🧹 Очистить все", "callback_data": "cb:sw_clear"}],
+                [{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}]
             ]
         }
     else:
         text = (
-            "⛔ <b>Стоп-слова (минус-слова)</b>\n\n"
-            "У вас пока не добавлено ни одного стоп-слова.\n\n"
-            "Вы можете добавить слова, которые вам не интересны (например: <code>аренда, чехол, запчасти, коробка, обмен</code>), "
-            "и бот будет автоматически скрывать такие объявления!"
+            "⛔ <b>Стоп-слова (минус-слова)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Список пуст. Добавьте слова-исключения (напр. <code>аренда, чехол, запчасти, обмен</code>)."
         )
         markup = {
             "inline_keyboard": [
                 [{"text": "➕ Добавить стоп-слова", "callback_data": "cb:sw_add"}],
-                [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+                [{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}]
             ]
         }
-    tg.send_message(chat_id, text, reply_markup=markup)
+    _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
 
 
-def show_template_menu(tg: TelegramClient, chat_id: int):
-    """Displays current quick contact message template."""
+def show_template_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Displays current quick contact message template in-place."""
     tpl = get_user_template(chat_id)
     text = (
-        "💬 <b>Умный шаблон первого сообщения продавцу</b>\n\n"
-        "В карточке каждого объявления есть кнопка <b>«💬 Написать»</b>. "
-        "Бот выдаёт готовый текст, который можно скопировать в один клик и отправить продавцу на Куфаре!\n\n"
-        f"<b>Текущий шаблон:</b>\n<code>{html.escape(tpl)}</code>\n\n"
-        "💡 <b>Поддерживаемые переменные (подставляются автоматически):</b>\n"
-        "• <code>{name}</code> — имя продавца (напр. <i>Алексей</i>)\n"
-        "• <code>{item}</code> — название товара (напр. <i>PlayStation 5 Slim</i>)\n"
-        "• <code>{price}</code> — цена объявления (напр. <i>2 100 BYN</i>)\n\n"
-        "<i>Пример шаблона: «Здравствуйте, {name}! По поводу {item}, готов забрать сегодня за наличные. Актуально?»</i>"
+        "💬 <b>Шаблон первого сообщения продавцу</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Текущий текст:</b>\n<code>{html.escape(tpl)}</code>\n\n"
+        "💡 <b>Переменные:</b> <code>{name}</code> • <code>{item}</code> • <code>{price}</code>"
     )
     markup = {
         "inline_keyboard": [
-            [{"text": "✏️ Изменить текст шаблона", "callback_data": "cb:tpl_edit"}],
-            [{"text": "🔄 Сбросить по умолчанию", "callback_data": "cb:tpl_reset"}],
-            [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+            [
+                {"text": "✏️ Изменить", "callback_data": "cb:tpl_edit"},
+                {"text": "🔄 Сбросить", "callback_data": "cb:tpl_reset"}
+            ],
+            [{"text": "⬅️ Назад в настройки", "callback_data": "cb:settings"}]
         ]
     }
-    tg.send_message(chat_id, text, reply_markup=markup)
+    _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
 
 
 def handle_link_submission(tg: TelegramClient, chat_id: int, url: str):
@@ -1805,8 +1964,8 @@ def handle_link_submission(tg: TelegramClient, chat_id: int, url: str):
 
 # ==================== WIZARD STEPS ====================
 
-def wizard_step_category(tg: TelegramClient, chat_id: int):
-    """Step 1: Category selection."""
+def wizard_step_category(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Step 1: Category selection (in-place)."""
     USER_STATES[chat_id] = {"step": "CAT", "data": {}}
     text = "🛠 <b>Шаг 1 из 4: Выберите категорию товаров:</b>"
     buttons = []
@@ -1818,13 +1977,13 @@ def wizard_step_category(tg: TelegramClient, chat_id: int):
             row = []
     if row:
         buttons.append(row)
-    buttons.append([{"text": "❌ Отмена", "callback_data": "cb:menu"}])
+    buttons.append([{"text": "⬅️ Назад", "callback_data": "cb:add_options"}])
 
-    tg.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
-def wizard_step_region(tg: TelegramClient, chat_id: int):
-    """Step 2: Region selection."""
+def wizard_step_region(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Step 2: Region selection (in-place)."""
     USER_STATES[chat_id]["step"] = "RGN"
     text = "🏙 <b>Шаг 2 из 4: Выберите регион поиска:</b>"
     buttons = []
@@ -1836,38 +1995,37 @@ def wizard_step_region(tg: TelegramClient, chat_id: int):
             row = []
     if row:
         buttons.append(row)
-    buttons.append([{"text": "❌ Отмена", "callback_data": "cb:menu"}])
+    buttons.append([{"text": "⬅️ Отмена", "callback_data": "cb:menu"}])
 
-    tg.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
+    _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
-def wizard_step_query(tg: TelegramClient, chat_id: int):
-    """Step 3: Keyword prompt."""
+def wizard_step_query(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Step 3: Keyword prompt (in-place)."""
     USER_STATES[chat_id]["step"] = "QUERY"
     text = (
         "🔍 <b>Шаг 3 из 4: Введите ключевые слова для поиска</b>\n\n"
         "Например: <code>ps5 slim</code>, <code>rtx 4070</code> или <code>iphone 13</code>.\n"
-        "Или нажмите кнопку «Пропустить», если хотите отслеживать всю категорию без фильтра по словам."
+        "Или пропустите, чтобы отслеживать всю категорию:"
     )
     markup = {
         "inline_keyboard": [
-            [{"text": "⏩ Пропустить ключевые слова", "callback_data": "cb:wiz_skip_query"}],
+            [{"text": "⏩ Пропустить слова", "callback_data": "cb:wiz_skip_query"}],
             [{"text": "❌ Отмена", "callback_data": "cb:menu"}]
         ]
     }
-    tg.send_message(chat_id, text, reply_markup=markup)
+    _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
 
 
-def wizard_step_price(tg: TelegramClient, chat_id: int):
-    """Step 4: Price bounds prompt."""
+def wizard_step_price(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Step 4: Price bounds prompt (in-place)."""
     USER_STATES[chat_id]["step"] = "PRICE"
     text = (
         "💰 <b>Шаг 4 из 4: Укажите цену в BYN</b>\n\n"
         "Напишите в ответ диапазоном или пределом:\n"
         "• <code>1000 2100</code> (от 1000 до 2100 BYN)\n"
         "• <code>до 1500</code> (максимум 1500 BYN)\n"
-        "• <code>от 800</code> (минимум 800 BYN)\n\n"
-        "Или нажмите кнопку «Любая цена», если фильтр цен не нужен."
+        "• <code>от 800</code> (минимум 800 BYN)"
     )
     markup = {
         "inline_keyboard": [
@@ -1875,7 +2033,7 @@ def wizard_step_price(tg: TelegramClient, chat_id: int):
             [{"text": "❌ Отмена", "callback_data": "cb:menu"}]
         ]
     }
-    tg.send_message(chat_id, text, reply_markup=markup)
+    _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
 
 
 def wizard_finish(tg: TelegramClient, chat_id: int):
@@ -1968,11 +2126,41 @@ def _dispatch_callback_query(
     config: dict,
     ack
 ):
-    """Routes inline callback queries and answers each callback once with proper toast/alert feedback."""
+    """Routes inline callback queries with in-place submenu navigation and proper toast feedback."""
     if data == "cb:menu":
         ack()
         USER_STATES.pop(chat_id, None)
-        show_main_menu(tg, chat_id)
+        show_main_menu(tg, chat_id, edit_msg_id=msg_id)
+
+    elif data == "cb:close_msg":
+        ack()
+        if msg_id:
+            tg.delete_message(chat_id, msg_id)
+
+    elif data == "cb:settings":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        show_settings_menu(tg, chat_id, edit_msg_id=msg_id)
+
+    elif data == "cb:stats":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        show_stats_menu(tg, chat_id, config, edit_msg_id=msg_id)
+
+    elif data == "cb:help":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        show_help_menu(tg, chat_id, edit_msg_id=msg_id)
+
+    elif data == "cb:add_options":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        prompt_add_search_options(tg, chat_id, edit_msg_id=msg_id)
+
+    elif data == "cb:interval_menu":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        show_interval_options(tg, chat_id, config.get("check_interval_seconds", 60), edit_msg_id=msg_id)
 
     elif data == "cb:stop_output":
         STOP_OUTPUT_REQUESTED.add(chat_id)
@@ -1981,40 +2169,27 @@ def _dispatch_callback_query(
     elif data in ("cb:my_searches", "cb:list"):
         ack()
         USER_STATES.pop(chat_id, None)
-        show_my_searches(tg, chat_id)
+        show_my_searches(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:all_ads":
         ack(text="📦 Загружаю актуальные объявления...")
         USER_STATES.pop(chat_id, None)
         output_all_user_ads(tg, chat_id)
 
-    elif data == "cb:pause":
+    elif data in ("cb:pause", "cb:hub_pause"):
         set_user_monitoring_paused(chat_id, True)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
         ack(text="⏸ Мониторинг поставлен на паузу")
-        reply_kb = get_main_keyboard(chat_id)
-        text = (
-            "⏸ <b>Мониторинг Kufar временно приостановлен!</b>\n\n"
-            "• Проверка новых объявлений и отправка уведомлений остановлены.\n"
-            "• Все ваши поисковые фильтры, стоп-слова и чёрный список сохранены в безопасности.\n\n"
-            "Чтобы возобновить мониторинг в любое время, нажмите кнопку <b>«▶️ Возобновить»</b> в меню или отправьте /resume."
-        )
-        tg.send_message(chat_id, text, reply_markup=reply_kb)
+        show_main_menu(tg, chat_id, edit_msg_id=msg_id if data == "cb:hub_pause" else None)
 
-    elif data == "cb:resume":
+    elif data in ("cb:resume", "cb:hub_resume"):
         set_user_monitoring_paused(chat_id, False)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
         ack(text="▶️ Мониторинг возобновлен!")
         FORCE_CHECK_EVENT.set()
-        reply_kb = get_main_keyboard(chat_id)
-        text = (
-            "▶️ <b>Мониторинг Kufar возобновлен!</b>\n\n"
-            "• Бот снова активно отслеживает появление новых товаров по вашим фильтрам.\n"
-            "• При обнаружении свежих предложений вы сразу получите уведомление!"
-        )
-        tg.send_message(chat_id, text, reply_markup=reply_kb)
+        show_main_menu(tg, chat_id, edit_msg_id=msg_id if data == "cb:hub_resume" else None)
 
     elif data.startswith("cb:toggle_q:"):
         parts = data.split(":")
@@ -2025,36 +2200,46 @@ def _dispatch_callback_query(
         sync_backup_to_telegram(tg, config, force_notify=False)
         status_txt = "возобновлен (активен)" if make_active else "поставлен на паузу"
         ack(text=f"Поиск [ID: {qid}] {status_txt}")
-        show_my_searches(tg, chat_id)
+        show_my_searches(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:add_link":
+        ack()
         USER_STATES[chat_id] = {"step": "WAIT_URL", "data": {}}
         text = (
             "🔗 <b>Отправьте ссылку на поиск с Kufar.by</b>\n\n"
-            "Настройте любые фильтры на сайте (категория, районы, цена, состояние и т.д.), скопируйте ссылку из адресной строки браузера и отправьте её мне сюда сообщением 👇"
+            "Настройте любые фильтры на сайте (категория, районы, цена, бренд, состояние), скопируйте ссылку из адресной строки и отправьте сообщением сюда 👇"
         )
-        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:menu"}]]}
-        tg.send_message(chat_id, text, reply_markup=markup)
+        markup = {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "cb:add_options"}]]}
+        _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=msg_id)
 
     elif data == "cb:wiz_start":
-        wizard_step_category(tg, chat_id)
+        ack()
+        wizard_step_category(tg, chat_id, edit_msg_id=msg_id)
 
     elif data.startswith("cb:wiz_cat:"):
+        ack()
         cat_id = data.split(":")[-1]
-        if chat_id in USER_STATES:
-            USER_STATES[chat_id]["data"]["cat"] = cat_id
-        wizard_step_region(tg, chat_id)
+        if chat_id not in USER_STATES:
+            USER_STATES[chat_id] = {"step": "CAT", "data": {}}
+        USER_STATES[chat_id]["data"]["cat"] = cat_id
+        wizard_step_region(tg, chat_id, edit_msg_id=msg_id)
 
     elif data.startswith("cb:wiz_rgn:"):
+        ack()
         rgn_id = data.split(":")[-1]
-        if chat_id in USER_STATES:
-            USER_STATES[chat_id]["data"]["rgn"] = rgn_id
-        wizard_step_query(tg, chat_id)
+        if chat_id not in USER_STATES:
+            USER_STATES[chat_id] = {"step": "RGN", "data": {}}
+        USER_STATES[chat_id]["data"]["rgn"] = rgn_id
+        wizard_step_query(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:wiz_skip_query":
-        wizard_step_price(tg, chat_id)
+        ack()
+        if chat_id not in USER_STATES:
+            USER_STATES[chat_id] = {"step": "QUERY", "data": {}}
+        wizard_step_price(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:wiz_skip_price":
+        ack()
         wizard_finish(tg, chat_id)
 
     elif data.startswith("cb:cat_fix:"):
@@ -2131,7 +2316,8 @@ def _dispatch_callback_query(
         qid = int(data.split(":")[-1])
         delete_query(qid, chat_id=chat_id)
         sync_backup_to_telegram(tg, config)
-        tg.send_message(chat_id, f"🗑 Поиск <b>[ID: {qid}]</b> удален.", reply_markup=get_main_keyboard(chat_id))
+        ack(text=f"🗑 Поиск [ID: {qid}] удалён")
+        show_my_searches(tg, chat_id, edit_msg_id=msg_id)
         admin_chat_id = config.get("admin_chat_id", 0)
         if admin_chat_id and chat_id != admin_chat_id:
             try:
@@ -2167,17 +2353,18 @@ def _dispatch_callback_query(
         if "{price}" in personalized_msg:
             personalized_msg = personalized_msg.replace("{price}", price_str)
 
+        ack()
         text = (
             f"💬 <b>Готовое сообщение продавцу:</b>\n"
             f"👤 Продавец: <b>{html.escape(seller_raw or 'Не указан')}</b>\n"
             f"📌 Товар: <b>{html.escape(subject_raw or 'Товар')}</b>\n\n"
-            f"<i>Нажмите на текст в рамке ниже, чтобы скопировать его в буфер обмена одним кликом:</i>\n\n"
-            f"<code>{html.escape(personalized_msg)}</code>\n\n"
-            f"Затем нажмите кнопку ниже, чтобы открыть чат с продавцом на Kufar 👇"
+            f"<i>Нажмите на текст в рамке ниже, чтобы скопировать его в один клик:</i>\n\n"
+            f"<code>{html.escape(personalized_msg)}</code>"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "💬 Открыть диалог на Kufar", "url": ad_link}]
+                [{"text": "💬 Открыть диалог на Kufar", "url": ad_link}],
+                [{"text": "✖️ Закрыть", "callback_data": "cb:close_msg"}]
             ]
         }
         tg.send_message(chat_id, text, reply_markup=markup)
@@ -2247,12 +2434,13 @@ def _dispatch_callback_query(
         cnt = clear_user_favorites(chat_id)
         save_local_backup()
         ack(text=f"Удалено {cnt} объявлений из Избранного", show_alert=True)
-        show_favorites_menu(tg, chat_id)
+        show_favorites_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:fav_menu":
         ack()
         USER_STATES.pop(chat_id, None)
-        show_favorites_menu(tg, chat_id)
+        favs = get_user_favorites(chat_id)
+        show_favorites_menu(tg, chat_id, edit_msg_id=msg_id if not favs else None)
 
     elif data.startswith("cb:market_stats:"):
         qid = int(data.split(":")[-1])
@@ -2302,22 +2490,25 @@ def _dispatch_callback_query(
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"}],
-                [{"text": "📋 К моим поискам", "callback_data": "cb:my_searches"}]
+                [
+                    {"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"},
+                    {"text": "✖️ Закрыть", "callback_data": "cb:close_msg"}
+                ]
             ]
         }
         tg.send_message(chat_id, report, reply_markup=markup, disable_web_page_preview=True)
 
     elif data == "cb:silent_menu":
+        ack()
         USER_STATES.pop(chat_id, None)
-        show_silent_mode_menu(tg, chat_id)
+        show_silent_mode_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data.startswith("cb:silent_set:"):
         val = data.split(":", 2)[-1]
         set_silent_mode(chat_id, val)
         save_local_backup()
-        ack(text="Настройки сохранены!", show_alert=False)
-        show_silent_mode_menu(tg, chat_id)
+        ack(text="Настройки тишины обновлены!")
+        show_silent_mode_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:silent_custom":
         ack()
@@ -2327,13 +2518,13 @@ def _dispatch_callback_query(
             "Отправьте сообщением желаемый интервал в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>\n"
             "(например: <code>22:30-07:30</code> или <code>01:00-09:00</code>):"
         )
-        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:silent_menu"}]]}
-        tg.send_message(chat_id, text, reply_markup=markup)
+        markup = {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "cb:silent_menu"}]]}
+        _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=msg_id)
 
     elif data == "cb:bl_menu":
         ack()
         USER_STATES.pop(chat_id, None)
-        show_blacklist_menu(tg, chat_id)
+        show_blacklist_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data.startswith("cb:unbl_seller:"):
         idx = int(data.split(":")[-1])
@@ -2345,13 +2536,13 @@ def _dispatch_callback_query(
             ack(text=f"✅ Продавец «{sname}» разблокирован!", show_alert=False)
         else:
             ack(text="Продавец уже удалён из ЧС", show_alert=False)
-        show_blacklist_menu(tg, chat_id)
+        show_blacklist_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:bl_clear_ads":
         cnt = clear_user_blacklist(chat_id)
         save_local_backup()
         ack(text=f"🧹 ЧС объявлений очищен! Удалено: {cnt}", show_alert=True)
-        show_blacklist_menu(tg, chat_id)
+        show_blacklist_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data.startswith("cb:bl:"):
         ad_id = int(data.split(":")[-1])
@@ -2420,7 +2611,7 @@ def _dispatch_callback_query(
     elif data == "cb:sw_menu":
         ack()
         USER_STATES.pop(chat_id, None)
-        show_stop_words_menu(tg, chat_id)
+        show_stop_words_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:sw_add":
         ack()
@@ -2428,56 +2619,57 @@ def _dispatch_callback_query(
         text = (
             "⛔ <b>Добавление стоп-слов</b>\n\n"
             "Отправьте слова, при наличии которых в названии или описании объявление будет скрыто.\n"
-            "Можно отправлять через запятую или пробел (например: <code>аренда, чехол, запчасти, коробка, обмен</code>):"
+            "Можно через запятую (напр.: <code>аренда, чехол, запчасти, коробка</code>):"
         )
-        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:sw_menu"}]]}
-        tg.send_message(chat_id, text, reply_markup=markup)
+        markup = {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "cb:sw_menu"}]]}
+        _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=msg_id)
 
     elif data == "cb:sw_del_menu":
         ack()
         sw_list = get_stop_words(chat_id)
         if not sw_list:
-            tg.send_message(chat_id, "ℹ️ Список стоп-слов пуст.", reply_markup=get_main_keyboard(chat_id))
+            show_stop_words_menu(tg, chat_id, edit_msg_id=msg_id)
             return
         buttons = []
         for w in sw_list:
             buttons.append([{"text": f"❌ {w}", "callback_data": f"cb:sw_del:{w}"}])
-        buttons.append([{"text": "🔙 Назад", "callback_data": "cb:sw_menu"}])
-        tg.send_message(chat_id, "Выберите слово, которое хотите удалить:", reply_markup={"inline_keyboard": buttons})
+        buttons.append([{"text": "⬅️ Назад", "callback_data": "cb:sw_menu"}])
+        _send_or_edit(tg, chat_id, "Выберите слово для удаления:", reply_markup={"inline_keyboard": buttons}, edit_msg_id=msg_id)
 
     elif data.startswith("cb:sw_del:"):
         word = data[len("cb:sw_del:"):]
         remove_stop_word(chat_id, word)
         save_local_backup()
         ack(text=f"Удалено: {word}")
-        show_stop_words_menu(tg, chat_id)
+        show_stop_words_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:sw_clear":
         cnt = clear_stop_words(chat_id)
         save_local_backup()
         ack(text=f"🧹 Удалено {cnt} стоп-слов!", show_alert=True)
-        show_stop_words_menu(tg, chat_id)
+        show_stop_words_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:tpl_menu":
         ack()
         USER_STATES.pop(chat_id, None)
-        show_template_menu(tg, chat_id)
+        show_template_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data == "cb:tpl_edit":
         ack()
         USER_STATES[chat_id] = {"step": "WAIT_TEMPLATE"}
         text = (
             "✏️ <b>Редактирование шаблона</b>\n\n"
-            "Отправьте мне новым сообщением текст, который вы хотите отправлять продавцам первым делом:"
+            "Отправьте новым сообщением текст для первого сообщения продавцу\n"
+            "(можно использовать <code>{name}</code>, <code>{item}</code>, <code>{price}</code>):"
         )
-        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:tpl_menu"}]]}
-        tg.send_message(chat_id, text, reply_markup=markup)
+        markup = {"inline_keyboard": [[{"text": "⬅️ Назад", "callback_data": "cb:tpl_menu"}]]}
+        _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=msg_id)
 
     elif data == "cb:tpl_reset":
         set_user_template(chat_id, DEFAULT_CONTACT_TEMPLATE)
         save_local_backup()
         ack(text="🔄 Шаблон сброшен к исходному!", show_alert=True)
-        show_template_menu(tg, chat_id)
+        show_template_menu(tg, chat_id, edit_msg_id=msg_id)
 
     elif data.startswith("cb:interval:"):
         sec = int(data.split(":")[-1])
@@ -2492,7 +2684,7 @@ def _dispatch_callback_query(
                 json.dump(config, f, indent=4, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Error saving interval: {e}")
-        tg.send_message(chat_id, f"⏱ <b>Интервал проверки успешно изменен на {sec} сек!</b>\nЗначение сохранено в базу данных.", reply_markup=get_main_keyboard(chat_id))
+        show_interval_options(tg, chat_id, sec, edit_msg_id=msg_id)
 
 
 def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: dict, user_info: Optional[Dict[str, Any]] = None):
@@ -2574,14 +2766,8 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         set_user_monitoring_paused(chat_id, True)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
-        reply_kb = get_main_keyboard(chat_id)
-        msg = (
-            "⏸ <b>Мониторинг Kufar временно приостановлен!</b>\n\n"
-            "• Проверка новых объявлений и отправка уведомлений остановлены.\n"
-            "• Все ваши поисковые фильтры, стоп-слова и чёрный список сохранены в безопасности.\n\n"
-            "Чтобы возобновить мониторинг в любое время, нажмите кнопку <b>«▶️ Возобновить»</b> в меню или отправьте /resume."
-        )
-        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        tg.send_message(chat_id, "⏸ <b>Мониторинг Kufar приостановлен.</b> Ваши фильтры и ЧС сохранены.")
+        show_main_menu(tg, chat_id)
         return
 
     if text in [
@@ -2600,13 +2786,8 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
         FORCE_CHECK_EVENT.set()
-        reply_kb = get_main_keyboard(chat_id)
-        msg = (
-            "▶️ <b>Мониторинг Kufar возобновлен!</b>\n\n"
-            "• Бот снова активно отслеживает появление новых товаров по вашим фильтрам.\n"
-            "• При обнаружении свежих предложений вы сразу получите уведомление!"
-        )
-        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        tg.send_message(chat_id, "▶️ <b>Мониторинг Kufar возобновлён!</b>")
+        show_main_menu(tg, chat_id)
         return
 
     if text in ["🚫 Чёрный список", "🚫 Черный список", "/blacklist", "/bl"]:
@@ -2658,58 +2839,32 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         tg.send_message(chat_id, f"✅ <b>Чёрный список очищен!</b> Удалено записей: {cnt}.", reply_markup=get_main_keyboard(chat_id))
         return
 
-    if text in ["📊 Статистика", "/status"]:
-        uptime_str = str(datetime.now() - START_TIME).split(".")[0]
-        user_queries = len(get_user_queries(chat_id))
-        bl_count = get_blacklist_count(chat_id)
-        fav_count = get_favorites_count(chat_id)
-        sw_count = len(get_stop_words(chat_id))
-        bl_sellers_count = len(get_blacklisted_sellers(chat_id))
-        silent_mode_str = get_silent_mode(chat_id)
-        silent_display = "Выключен" if silent_mode_str in ("off", "") else f"Включен ({silent_mode_str})"
-        backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y в %H:%M:%S') if LAST_BACKUP_TIME else "сохранена"
-        paused_user = is_user_monitoring_paused(chat_id)
-        paused_str = "⏸ На паузе (остановлен)" if paused_user else "🟢 Активен (отслеживает)"
-        status_text = (
-            f"📊 <b>Статус Kufar Hunter Bot</b>\n\n"
-            f"⚡ <b>Мониторинг:</b> {paused_str}\n"
-            f"⏱ <b>Время работы:</b> {uptime_str}\n"
-            f"🎯 <b>Ваших поисков:</b> {user_queries}\n"
-            f"⭐️ <b>Объявлений в избранном:</b> {fav_count}\n"
-            f"⛔ <b>Стоп-слов настроено:</b> {sw_count}\n"
-            f"👤 <b>Продавцов в ЧС:</b> {bl_sellers_count}\n"
-            f"🚫 <b>Объявлений в ЧС:</b> {bl_count}\n"
-            f"🌙 <b>Ночной режим:</b> {silent_display}\n"
-            f"💾 <b>Резервная копия:</b> {backup_str}\n"
-            f"🔄 <b>Проверок выполнено:</b> {TOTAL_CHECKS}\n"
-            f"⏳ <b>Интервал проверки:</b> {config.get('check_interval_seconds', 60)} сек."
-        )
-        if chat_id == admin_chat_id:
-            total_users = get_user_count()
-            total_active_q = len(get_active_queries())
-            status_text += (
-                f"\n\n👑 <b>Панель администратора:</b>\n"
-                f"👥 <b>Пользователей в боте:</b> {total_users}\n"
-                f"🎯 <b>Всего активных фильтров:</b> {total_active_q}\n"
-                f"📨 <b>Отправлено новых объявлений:</b> {NEW_ADS_FOUND}"
+    if text in ["/app", "📱 Приложение", "🚀 Приложение"]:
+        USER_STATES.pop(chat_id, None)
+        webapp_url = get_webapp_url()
+        if webapp_url:
+            tg.send_message(
+                chat_id,
+                "📱 <b>Kufar Hunter Mini App</b>\n<i>Откройте интерактивное приложение для управления поисками, аналитики цен, фильтров и избранного:</i>",
+                reply_markup={"inline_keyboard": [[{"text": "📱 Открыть Mini App", "web_app": {"url": webapp_url}}]]}
             )
-        tg.send_message(chat_id, status_text, reply_markup=get_main_keyboard(chat_id))
+        else:
+            show_main_menu(tg, chat_id)
+        return
+
+    if text in ["⚙️ Настройки", "/settings"]:
+        USER_STATES.pop(chat_id, None)
+        show_settings_menu(tg, chat_id)
+        return
+
+    if text in ["📊 Статистика", "/status", "/stats"]:
+        USER_STATES.pop(chat_id, None)
+        show_stats_menu(tg, chat_id, config)
         return
 
     if text in ["❓ Помощь", "/help"]:
-        help_text = (
-            "📖 <b>Как пользоваться ботом:</b>\n\n"
-            "1. Нажмите <b>«➕ Добавить поиск»</b>.\n"
-            "2. Выберите <b>«🔗 Вставить ссылку с Куфара»</b>.\n"
-            "3. Перейдите на <b>kufar.by</b>, выставьте нужные параметры (категорию, город, районы, цену, бренд и т.д.) и скопируйте ссылку.\n"
-            "4. Отправьте ссылку сюда сообщением — бот перенесет все фильтры 1 в 1!\n\n"
-            "⏸ <b>«Стоп (пауза)» / «Возобновить»</b> — приостановить или продолжить проверку объявлений.\n"
-            "📦 <b>«Вывести всё»</b> — выводит актуальные объявления (со всеми фото сразу) по вашим активным фильтрам.\n"
-            "⭐️ <b>«Избранное»</b> — список отложенных вами объявлений.\n"
-            "🌙 <b>«Ночной режим»</b> — тихие часы (без звука/вибрации) ночью.\n"
-            "🚫 <b>«В ЧС» / «Чёрный список»</b> — скрытие ненужных объявлений и продавцов с возможностью разблокировки."
-        )
-        tg.send_message(chat_id, help_text, reply_markup=get_main_keyboard(chat_id))
+        USER_STATES.pop(chat_id, None)
+        show_help_menu(tg, chat_id)
         return
 
     # Check if this is a direct Kufar link submission
@@ -2909,18 +3064,24 @@ def main():
     # Register sleek slash commands menu in Telegram
     tg.set_my_commands([
         {"command": "start", "description": "🏠 Главное меню"},
-        {"command": "add", "description": "➕ Добавить поиск"},
-        {"command": "list", "description": "📋 Мои поиски"},
+        {"command": "app", "description": "📱 Открыть Mini App"},
         {"command": "all", "description": "📦 Вывести актуальные объявления"},
+        {"command": "list", "description": "🎯 Мои поиски"},
+        {"command": "add", "description": "➕ Добавить поиск"},
         {"command": "favs", "description": "⭐️ Избранное"},
-        {"command": "blacklist", "description": "🚫 Чёрный список"},
-        {"command": "stopwords", "description": "⛔ Стоп-слова"},
-        {"command": "silent", "description": "🌙 Ночной режим"},
+        {"command": "settings", "description": "⚙️ Настройки и ЧС"},
         {"command": "pause", "description": "⏸ Поставить на паузу"},
         {"command": "resume", "description": "▶️ Возобновить мониторинг"},
-        {"command": "status", "description": "📊 Статистика и статус"},
+        {"command": "status", "description": "📊 Статистика"},
         {"command": "help", "description": "❓ Помощь"}
     ])
+
+    webapp_url = get_webapp_url()
+    if webapp_url:
+        tg.set_chat_menu_button(webapp_url, text="📱 Приложение")
+        print(f"📱 Telegram Mini App включен: {webapp_url}")
+    else:
+        tg.set_chat_menu_button(None)
     admin_id = config.get("admin_chat_id")
     if admin_id:
         print(f"👑 Администратор для оповещений: chat_id={admin_id}")
