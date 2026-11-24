@@ -217,6 +217,30 @@ def get_user_queries(chat_id: int, db_path: Optional[str] = None) -> List[Dict[s
         return result
 
 
+# ==================== MONITORING PAUSE / RESUME ====================
+
+def set_user_monitoring_paused(chat_id: int, paused: bool, db_path: Optional[str] = None):
+    """Sets whether background monitoring is paused for a user."""
+    set_setting(f"paused_{chat_id}", "1" if paused else "0", db_path=db_path)
+
+
+def is_user_monitoring_paused(chat_id: int, db_path: Optional[str] = None) -> bool:
+    """Checks if background monitoring is paused for a user."""
+    return get_setting(f"paused_{chat_id}", "0", db_path=db_path) == "1"
+
+
+def toggle_query_active(query_id: int, is_active: bool, chat_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
+    """Toggles active state of a specific search query."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        if chat_id is not None:
+            cursor.execute("UPDATE queries SET is_active = ? WHERE id = ? AND chat_id = ?", (1 if is_active else 0, query_id, chat_id))
+        else:
+            cursor.execute("UPDATE queries SET is_active = ? WHERE id = ?", (1 if is_active else 0, query_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
     """Deletes a query by ID and marks it in deleted_queries to prevent resurrection on restart."""
     with get_connection(db_path) as conn:
@@ -708,6 +732,7 @@ def is_in_silent_hours(chat_id: int, current_dt: Optional[datetime] = None, db_p
 
 def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
     """Exports all queries, users, and blacklisted ads to a dictionary."""
+    init_db(db_path)
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         
@@ -824,6 +849,11 @@ def import_database_state(state: Dict[str, Any], db_path: Optional[str] = None) 
                         (cid, name, json.dumps(params), q.get("is_active", 1))
                     )
                     imported_queries += 1
+                else:
+                    cursor.execute(
+                        "UPDATE queries SET is_active = ? WHERE chat_id = ? AND name = ?",
+                        (q.get("is_active", 1), cid, name)
+                    )
 
         # Import Blacklist
         for b in state.get("blacklisted_ads", []):

@@ -69,7 +69,10 @@ from database import (
     clear_user_favorites,
     get_silent_mode,
     set_silent_mode,
-    is_in_silent_hours
+    is_in_silent_hours,
+    set_user_monitoring_paused,
+    is_user_monitoring_paused,
+    toggle_query_active
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -136,18 +139,25 @@ REGIONS = [
     ("all", "🇧🇾 Вся Беларусь")
 ]
 
-# Persistent Reply Keyboard Menu (with auto-collapse on tap)
-MAIN_KEYBOARD = {
-    "keyboard": [
-        [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
-        [{"text": "📦 Вывести всё"}, {"text": "⭐️ Избранное"}],
-        [{"text": "⛔ Стоп-слова"}, {"text": "💬 Мой шаблон"}],
-        [{"text": "⏱ Интервал"}, {"text": "🌙 Ночной режим"}],
-        [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
-    ],
-    "resize_keyboard": True,
-    "one_time_keyboard": True
-}
+def get_main_keyboard(chat_id: int = 0) -> Dict[str, Any]:
+    """Generates the main reply keyboard with dynamic Pause/Resume state."""
+    paused = is_user_monitoring_paused(chat_id) if chat_id else False
+    pause_btn = {"text": "▶️ Возобновить"} if paused else {"text": "⏸ Стоп (пауза)"}
+    return {
+        "keyboard": [
+            [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
+            [{"text": "📦 Вывести всё"}, {"text": "⭐️ Избранное"}],
+            [pause_btn, {"text": "🌙 Ночной режим"}],
+            [{"text": "⛔ Стоп-слова"}, {"text": "💬 Мой шаблон"}],
+            [{"text": "⏱ Интервал"}, {"text": "📊 Статистика"}],
+            [{"text": "❓ Помощь"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+
+# Fallback default keyboard
+MAIN_KEYBOARD = get_main_keyboard(0)
 
 
 def make_ad_keyboard(
@@ -693,6 +703,8 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
     if not chat_id:
         logger.error(f"Cannot check query {qid}: chat_id is missing")
         return 0
+    if is_user_monitoring_paused(chat_id):
+        return 0
     name = query["name"]
     params = query["params"]
 
@@ -1097,7 +1109,7 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
             "📭 <b>У вас пока нет активных поисков.</b>\n\n"
             "Нажмите кнопку <b>«➕ Добавить поиск»</b>, чтобы создать первый фильтр!"
         )
-        tg.send_message(chat_id, text, reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, text, reply_markup=get_main_keyboard(chat_id))
         return
 
     tg.send_message(
@@ -1141,14 +1153,14 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
         tg.send_message(
             chat_id,
             "📭 <b>На Куфаре пока нет подходящих объявлений</b> (или все имеющиеся добавлены вами в чёрный список).",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=get_main_keyboard(chat_id)
         )
     else:
         tg.send_message(
             chat_id,
             f"✅ <b>Вывод завершён! Всего показано: {total_shown} объявлений.</b>\n\n"
             f"💡 <i>Если объявление вам не подходит, нажмите кнопку «🚫 Не интересно», чтобы оно больше никогда не показывалось.</i>",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=get_main_keyboard(chat_id)
         )
 
 
@@ -1157,7 +1169,7 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
     queries = get_user_queries(chat_id)
     target = next((q for q in queries if q["id"] == qid), None)
     if not target:
-        tg.send_message(chat_id, "⚠️ Этот поиск не найден или был удалён.", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, "⚠️ Этот поиск не найден или был удалён.", reply_markup=get_main_keyboard(chat_id))
         return
 
     q_name = target["name"]
@@ -1173,7 +1185,7 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
         ads = fetch_ads(params)
     except Exception as e:
         logger.error(f"Error fetching ads for query {qid}: {e}")
-        tg.send_message(chat_id, f"⚠️ Ошибка загрузки объявлений: {e}", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, f"⚠️ Ошибка загрузки объявлений: {e}", reply_markup=get_main_keyboard(chat_id))
         return
 
     q_median = calculate_market_stats(ads)
@@ -1197,24 +1209,27 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
         tg.send_message(
             chat_id,
             f"📭 По поиску «{html.escape(q_name)}» нет подходящих объявлений (или все добавлены в ЧС).",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=get_main_keyboard(chat_id)
         )
     else:
         tg.send_message(
             chat_id,
             f"✅ <b>Показано {total_shown} объявлений по поиску «{html.escape(q_name)}».</b>",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=get_main_keyboard(chat_id)
         )
 
 
 def show_main_menu(tg: TelegramClient, chat_id: int):
     """Sends greeting with main keyboard menu."""
+    paused = is_user_monitoring_paused(chat_id)
+    status_icon = "⏸ <b>Мониторинг:</b> На паузе (остановлен)" if paused else "🟢 <b>Мониторинг:</b> Активен (отслеживает)"
     text = (
         "👋 <b>Главное меню Kufar Hunter</b>\n\n"
+        f"⚡ {status_icon}\n\n"
         "Бот непрерывно мониторит Kufar и мгновенно присылает новые объявления по вашим точным фильтрам.\n\n"
         "Выберите действие на кнопках ниже 👇"
     )
-    tg.send_message(chat_id, text, reply_markup=MAIN_KEYBOARD)
+    tg.send_message(chat_id, text, reply_markup=get_main_keyboard(chat_id))
 
 
 def prompt_add_search_options(tg: TelegramClient, chat_id: int):
@@ -1239,7 +1254,7 @@ def show_my_searches(tg: TelegramClient, chat_id: int):
     queries = get_user_queries(chat_id)
     if not queries:
         text = (
-            "📭 <b>У вас пока нет активных поисков.</b>\n\n"
+            "📭 <b>У вас пока нет сохранённых поисков.</b>\n\n"
             "Нажмите кнопку <b>«➕ Добавить поиск»</b>, чтобы создать первый фильтр!"
         )
         markup = {
@@ -1250,16 +1265,27 @@ def show_my_searches(tg: TelegramClient, chat_id: int):
         tg.send_message(chat_id, text, reply_markup=markup)
         return
 
-    tg.send_message(chat_id, f"📋 <b>Ваши активные поиски (всего: {len(queries)}):</b>")
+    paused_user = is_user_monitoring_paused(chat_id)
+    pause_note = " <i>(Все проверки на паузе ⏸)</i>" if paused_user else ""
+    tg.send_message(chat_id, f"📋 <b>Ваши поиски (всего: {len(queries)}):</b>{pause_note}")
 
     for q in queries:
         qid = q["id"]
         name = q["name"]
         params = q["params"]
         seen = get_query_seen_count(qid)
+        is_active = q.get("is_active", True)
+
+        status_str = "🟢 Активен" if is_active else "⏸ На паузе"
+        toggle_btn = (
+            {"text": "⏸ На паузу", "callback_data": f"cb:toggle_q:{qid}:0"}
+            if is_active else
+            {"text": "▶️ Включить", "callback_data": f"cb:toggle_q:{qid}:1"}
+        )
 
         text = (
-            f"📌 <b>Поиск [ID: {qid}]: {html.escape(name)}</b>\n\n"
+            f"📌 <b>Поиск [ID: {qid}]: {html.escape(name)}</b>\n"
+            f"⚡ <b>Статус:</b> {status_str}\n\n"
             f"{format_params_human(params)}\n\n"
             f"📦 <i>Просмотрено объявлений: {seen}</i>"
         )
@@ -1269,7 +1295,10 @@ def show_my_searches(tg: TelegramClient, chat_id: int):
                     {"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"},
                     {"text": "📊 Аналитика цен", "callback_data": f"cb:market_stats:{qid}"}
                 ],
-                [{"text": "🗑 Удалить этот поиск", "callback_data": f"cb:del:{qid}"}]
+                [
+                    toggle_btn,
+                    {"text": "🗑 Удалить этот поиск", "callback_data": f"cb:del:{qid}"}
+                ]
             ]
         }
         tg.send_message(chat_id, text, reply_markup=markup)
@@ -1638,6 +1667,44 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         USER_STATES.pop(chat_id, None)
         output_all_user_ads(tg, chat_id)
 
+    elif data == "cb:pause":
+        set_user_monitoring_paused(chat_id, True)
+        save_local_backup()
+        sync_backup_to_telegram(tg, config, force_notify=False)
+        reply_kb = get_main_keyboard(chat_id)
+        msg = (
+            "⏸ <b>Мониторинг Kufar временно приостановлен!</b>\n\n"
+            "• Проверка новых объявлений и отправка уведомлений остановлены.\n"
+            "• Все ваши поисковые фильтры, стоп-слова и чёрный список сохранены в безопасности.\n\n"
+            "Чтобы возобновить мониторинг в любое время, нажмите кнопку ниже 👇"
+        )
+        markup = {"inline_keyboard": [[{"text": "▶️ Возобновить мониторинг", "callback_data": "cb:resume"}]]}
+        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+
+    elif data == "cb:resume":
+        set_user_monitoring_paused(chat_id, False)
+        save_local_backup()
+        sync_backup_to_telegram(tg, config, force_notify=False)
+        reply_kb = get_main_keyboard(chat_id)
+        msg = (
+            "▶️ <b>Мониторинг Kufar возобновлен!</b>\n\n"
+            "• Бот снова активно отслеживает появление новых товаров по вашим фильтрам.\n"
+            "• При обнаружении свежих предложений вы сразу получите уведомление!"
+        )
+        markup = {"inline_keyboard": [[{"text": "⏸ Приостановить мониторинг", "callback_data": "cb:pause"}]]}
+        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+
+    elif data.startswith("cb:toggle_q:"):
+        parts = data.split(":")
+        qid = int(parts[2])
+        make_active = bool(int(parts[3]))
+        toggle_query_active(qid, make_active, chat_id=chat_id)
+        save_local_backup()
+        sync_backup_to_telegram(tg, config, force_notify=False)
+        status_txt = "возобновлен (активен)" if make_active else "поставлен на паузу"
+        tg.answer_callback_query(cb_id, text=f"Поиск [ID: {qid}] {status_txt}")
+        show_my_searches(tg, chat_id)
+
     elif data == "cb:add_link":
         USER_STATES[chat_id] = {"step": "WAIT_URL", "data": {}}
         text = (
@@ -1689,7 +1756,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
             chat_id,
             f"🎉 <b>Поиск «{html.escape(item['name'])}» успешно активирован!</b> [ID: {qid}]\n\n"
             f"🔔 Теперь я буду непрерывно мониторить Kufar и <b>мгновенно</b> присылать новые объявления!",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=get_main_keyboard(chat_id)
         )
 
     elif data.startswith("cb:cancel:"):
@@ -1697,13 +1764,13 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         PENDING_QUERIES.pop(pending_id, None)
         if msg_id:
             tg.delete_message(chat_id, msg_id)
-        tg.send_message(chat_id, "❌ Настройка поиска отменена.", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, "❌ Настройка поиска отменена.", reply_markup=get_main_keyboard(chat_id))
 
     elif data.startswith("cb:del:"):
         qid = int(data.split(":")[-1])
         delete_query(qid, chat_id=chat_id)
         sync_backup_to_telegram(tg, config)
-        tg.send_message(chat_id, f"🗑 Поиск <b>[ID: {qid}]</b> удален.", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, f"🗑 Поиск <b>[ID: {qid}]</b> удален.", reply_markup=get_main_keyboard(chat_id))
         admin_chat_id = config.get("admin_chat_id", 0)
         if admin_chat_id and chat_id != admin_chat_id:
             try:
@@ -1998,7 +2065,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data == "cb:sw_del_menu":
         sw_list = get_stop_words(chat_id)
         if not sw_list:
-            tg.send_message(chat_id, "ℹ️ Список стоп-слов пуст.", reply_markup=MAIN_KEYBOARD)
+            tg.send_message(chat_id, "ℹ️ Список стоп-слов пуст.", reply_markup=get_main_keyboard(chat_id))
             return
         buttons = []
         for w in sw_list:
@@ -2050,7 +2117,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
                 json.dump(config, f, indent=4, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Error saving interval: {e}")
-        tg.send_message(chat_id, f"⏱ <b>Интервал проверки успешно изменен на {sec} сек!</b>\nЗначение сохранено в базу данных.", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, f"⏱ <b>Интервал проверки успешно изменен на {sec} сек!</b>\nЗначение сохранено в базу данных.", reply_markup=get_main_keyboard(chat_id))
 
 
 def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: dict, user_info: Optional[Dict[str, Any]] = None):
@@ -2103,6 +2170,66 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         show_silent_mode_menu(tg, chat_id)
         return
 
+    if text in [
+        "⏸ Стоп (пауза)",
+        "⏸ Стоп",
+        "Стоп",
+        "стоп",
+        "Пауза",
+        "пауза",
+        "⏸ Пауза",
+        "/stop",
+        "/pause",
+        "стоп бот"
+    ]:
+        USER_STATES.pop(chat_id, None)
+        set_user_monitoring_paused(chat_id, True)
+        save_local_backup()
+        sync_backup_to_telegram(tg, config, force_notify=False)
+        reply_kb = get_main_keyboard(chat_id)
+        msg = (
+            "⏸ <b>Мониторинг Kufar временно приостановлен!</b>\n\n"
+            "• Проверка новых объявлений и отправка уведомлений остановлены.\n"
+            "• Все ваши поисковые фильтры, стоп-слова и чёрный список сохранены в безопасности.\n\n"
+            "Чтобы возобновить мониторинг в любое время, нажмите кнопку <b>«▶️ Возобновить»</b> ниже или введите /resume."
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "▶️ Возобновить мониторинг", "callback_data": "cb:resume"}]
+            ]
+        }
+        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        return
+
+    if text in [
+        "▶️ Возобновить",
+        "Возобновить",
+        "возобновить",
+        "Пуск",
+        "пуск",
+        "/resume",
+        "/play",
+        "старт мониторинга",
+        "продолжить"
+    ]:
+        USER_STATES.pop(chat_id, None)
+        set_user_monitoring_paused(chat_id, False)
+        save_local_backup()
+        sync_backup_to_telegram(tg, config, force_notify=False)
+        reply_kb = get_main_keyboard(chat_id)
+        msg = (
+            "▶️ <b>Мониторинг Kufar возобновлен!</b>\n\n"
+            "• Бот снова активно отслеживает появление новых товаров по вашим фильтрам.\n"
+            "• При обнаружении свежих предложений вы сразу получите уведомление!"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "⏸ Приостановить мониторинг", "callback_data": "cb:pause"}]
+            ]
+        }
+        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        return
+
     if text in ["⏱ Интервал", "/interval"]:
         show_interval_options(tg, chat_id, config.get("check_interval_seconds", 60))
         return
@@ -2144,7 +2271,7 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
     if text in ["/clear_blacklist", "/reset_blacklist"]:
         cnt = clear_user_blacklist(chat_id)
         save_local_backup()
-        tg.send_message(chat_id, f"✅ <b>Чёрный список очищен!</b> Удалено записей: {cnt}.", reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, f"✅ <b>Чёрный список очищен!</b> Удалено записей: {cnt}.", reply_markup=get_main_keyboard(chat_id))
         return
 
     if text in ["📊 Статистика", "/status"]:
@@ -2157,10 +2284,13 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         silent_mode_str = get_silent_mode(chat_id)
         silent_display = "Выключен" if silent_mode_str in ("off", "") else f"Включен ({silent_mode_str})"
         backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y в %H:%M:%S') if LAST_BACKUP_TIME else "сохранена"
+        paused_user = is_user_monitoring_paused(chat_id)
+        paused_str = "⏸ На паузе (остановлен)" if paused_user else "🟢 Активен (отслеживает)"
         status_text = (
             f"📊 <b>Статус Kufar Hunter Bot</b>\n\n"
+            f"⚡ <b>Мониторинг:</b> {paused_str}\n"
             f"⏱ <b>Время работы:</b> {uptime_str}\n"
-            f"🎯 <b>Ваших активных поисков:</b> {user_queries}\n"
+            f"🎯 <b>Ваших поисков:</b> {user_queries}\n"
             f"⭐️ <b>Объявлений в избранном:</b> {fav_count}\n"
             f"⛔ <b>Стоп-слов настроено:</b> {sw_count}\n"
             f"👤 <b>Продавцов в ЧС:</b> {bl_sellers_count}\n"
@@ -2179,7 +2309,7 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
                 f"🎯 <b>Всего активных фильтров:</b> {total_active_q}\n"
                 f"📨 <b>Отправлено новых объявлений:</b> {NEW_ADS_FOUND}"
             )
-        tg.send_message(chat_id, status_text, reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, status_text, reply_markup=get_main_keyboard(chat_id))
         return
 
     if text in ["❓ Помощь", "/help"]:
@@ -2189,12 +2319,13 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
             "2. Выберите <b>«🔗 Вставить ссылку с Куфара»</b>.\n"
             "3. Перейдите на <b>kufar.by</b>, выставьте нужные параметры (категорию, город, районы, цену, бренд и т.д.) и скопируйте ссылку.\n"
             "4. Отправьте ссылку сюда сообщением — бот перенесет все фильтры 1 в 1!\n\n"
+            "⏸ <b>«Стоп (пауза)» / «Возобновить»</b> — приостановить или продолжить проверку объявлений.\n"
             "📦 <b>«Вывести всё»</b> — выводит актуальные объявления по вашим сохранённым фильтрам.\n"
             "⭐️ <b>«⭐️ Избранное»</b> — список отложенных вами объявлений.\n"
             "🌙 <b>«🌙 Ночной режим»</b> — тихие часы (без звука/вибрации) ночью.\n"
             "🚫 <b>«В ЧС (скрыть)»</b> — скрывает ненужное объявление, чтобы оно больше никогда не показывалось."
         )
-        tg.send_message(chat_id, help_text, reply_markup=MAIN_KEYBOARD)
+        tg.send_message(chat_id, help_text, reply_markup=get_main_keyboard(chat_id))
         return
 
     # Check if this is a direct Kufar link submission
@@ -2228,7 +2359,7 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
                     chat_id,
                     f"🌙 <b>Ночной режим успешно настроен на часы: {clean_val}!</b>\n"
                     f"В этот интервал времени объявления будут приходить полностью без звука.",
-                    reply_markup=MAIN_KEYBOARD
+                    reply_markup=get_main_keyboard(chat_id)
                 )
                 show_silent_mode_menu(tg, chat_id)
             else:
@@ -2254,10 +2385,10 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
                     f"✅ <b>Добавлено стоп-слов: {len(added_words)}!</b>\n"
                     f"({', '.join(added_words)})\n\n"
                     f"Теперь объявления, содержащие эти слова, будут автоматически отсекаться.",
-                    reply_markup=MAIN_KEYBOARD
+                    reply_markup=get_main_keyboard(chat_id)
                 )
             else:
-                tg.send_message(chat_id, "ℹ️ Эти слова уже есть в списке или введены некорректно.", reply_markup=MAIN_KEYBOARD)
+                tg.send_message(chat_id, "ℹ️ Эти слова уже есть в списке или введены некорректно.", reply_markup=get_main_keyboard(chat_id))
             show_stop_words_menu(tg, chat_id)
             return
 
@@ -2270,7 +2401,7 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
                 tg.send_message(
                     chat_id,
                     f"✅ <b>Новый шаблон для связи сохранён!</b>\n\n<code>{html.escape(new_tpl)}</code>",
-                    reply_markup=MAIN_KEYBOARD
+                    reply_markup=get_main_keyboard(chat_id)
                 )
                 show_template_menu(tg, chat_id)
             else:
@@ -2345,7 +2476,7 @@ def telegram_listener(tg: TelegramClient, config: dict):
                                         f"• Поисков добавлено: <b>{stats['queries']}</b>\n"
                                         f"• В чёрный список: <b>{stats['blacklisted']}</b>\n"
                                         f"• Пользователей: <b>{stats['users']}</b>",
-                                        reply_markup=MAIN_KEYBOARD
+                                        reply_markup=get_main_keyboard(chat_id)
                                     )
                                     sync_backup_to_telegram(tg, config)
                                 except Exception as e:

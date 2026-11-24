@@ -1,7 +1,19 @@
 {
   "version": 1,
-  "exported_at": "2026-11-24T15:52:22.727470",
-  "queries": [],
+  "exported_at": "2026-11-24T16:28:08.662464",
+  "queries": [
+    {
+      "chat_id": 747868993,
+      "name": "Куфар поиск",
+      "params": {
+        "prc": "r:150000,220000",
+        "sort": "lst.d",
+        "rgn": "7",
+        "size": "30"
+      },
+      "is_active": 1
+    }
+  ],
   "users": [
     {
       "chat_id": 747868993,
@@ -70,7 +82,8 @@
   ],
   "settings": {
     "template_747868993": "Здравствуйте! Готов забрать сегодня за наличные, актуально?",
-    "check_interval_seconds": "30"
+    "check_interval_seconds": "30",
+    "paused_747868993": "1"
   },
   "deleted_queries": [
     {
@@ -82,6 +95,12 @@
       "name": "slim"
     }
   ],
-  "stop_words": [],
-  "blacklisted_sellers": []
+  "stop_words": [
+    {
+      "chat_id": 747868993,
+      "word": "playstation 4"
+    }
+  ],
+  "blacklisted_sellers": [],
+  "favorites": []
 }
