@@ -55,7 +55,13 @@ from database import (
     update_favorite_crm,
     update_query,
 )
-from kufar_api import fetch_ads, parse_kufar_url_or_query
+from kufar_api import clean_kufar_api_params, compute_market_analysis, fetch_ads, parse_kufar_url_or_query
+from kufar_filters import (
+    PARENT_CATEGORIES,
+    fetch_kufar_filter_schema,
+    find_parent_category,
+    get_category_label,
+)
 
 logger = logging.getLogger("kufar_webapp")
 
@@ -146,9 +152,14 @@ def _build_query_chips(
     if p.get("query"):
         chips.append({"icon": "search", "text": str(p["query"])})
     cat_id = str(p.get("cat", ""))
+    prn_id = str(p.get("prn", ""))
     if cat_id and cat_id != "all":
-        chips.append({"icon": "grid", "text": cat_map.get(cat_id, f"Категория {cat_id}")})
-    cte_map = {"1": "Приставки", "2": "Игры", "3": "Аксессуары"}
+        lbl = get_category_label(cat_id) or cat_map.get(cat_id, f"Категория {cat_id}")
+        chips.append({"icon": "grid", "text": lbl})
+    elif prn_id and prn_id != "all":
+        lbl = get_category_label(prn_id) or f"Раздел {prn_id}"
+        chips.append({"icon": "grid", "text": lbl})
+    cte_map = {"1": "Приставки", "2": "Игры", "3": "Аксессуары", "6": "Геймпады"}
     if str(p.get("cte", "")) in cte_map:
         chips.append({"icon": "layers", "text": cte_map[str(p["cte"])]})
     pb_map = {"5": "Apple", "24": "Samsung", "35": "Xiaomi", "11": "Huawei", "12": "Honor"}
@@ -174,6 +185,19 @@ def _build_query_chips(
         chips.append({"icon": "users", "text": cmp_map[str(p["cmp"])]})
 
     m = meta or {}
+    # Human-readable labels for any dynamic Kufar subfilters (model, memory, Blu-ray, year, etc.)
+    already_shown_keys = {"query", "cat", "prn", "rgn", "prc", "cnd", "cmp", "ar", "sort", "size", "lang", "brand"}
+    if str(p.get("cte", "")) in cte_map:
+        already_shown_keys.add("cte")
+    if brand:
+        already_shown_keys.update({"pb", "cbc"})
+    filter_labels = m.get("filter_labels") or {}
+    if isinstance(filter_labels, dict):
+        for fk, flbl in filter_labels.items():
+            if fk in already_shown_keys or not p.get(fk) or not flbl:
+                continue
+            chips.append({"icon": "tag", "text": str(flbl)})
+
     if m.get("private_only"):
         chips.append({"icon": "user", "text": "Только частники"})
     if int(m.get("only_bargain_pct") or 0) > 0:
@@ -255,6 +279,16 @@ def _merge_query_meta(existing_meta: Optional[Dict[str, Any]], body: Dict[str, A
             meta["silent_query"] = True
         else:
             meta.pop("silent_query", None)
+    if "filter_labels" in body and isinstance(body.get("filter_labels"), dict):
+        cleaned_labels = {
+            str(k).strip(): str(v).strip()[:80]
+            for k, v in body["filter_labels"].items()
+            if str(k).strip() and str(v).strip()
+        }
+        if cleaned_labels:
+            meta["filter_labels"] = cleaned_labels
+        else:
+            meta.pop("filter_labels", None)
     return meta
 
 
@@ -271,6 +305,7 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
             "id": q["id"],
             "name": _plain_label(q["name"]),
             "params": q["params"],
+            "prn": q["params"].get("prn") or find_parent_category(q["params"].get("cat", "")),
             "meta": meta,
             "chips": _build_query_chips(q["params"], app_ctx, meta=meta),
             "is_active": bool(q.get("is_active", True)),
@@ -318,8 +353,29 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
         "blacklisted_ads_count": bl_ads_count,
         "stats": stats,
         "categories": [{"id": c[0], "name": _plain_label(c[1])} for c in app_ctx.get("categories", [])],
+        "parent_categories": [{"id": c[0], "name": c[1]} for c in PARENT_CATEGORIES],
         "regions": [{"id": r[0], "name": _plain_label(r[1])} for r in app_ctx.get("regions", [])],
     }
+
+
+def _apply_dynamic_kufar_fields(params: Dict[str, Any], body: Dict[str, Any]):
+    """Applies dynamic Kufar form parameters (kufar_params dict + region areas) onto params."""
+    dyn = body.get("kufar_params")
+    if isinstance(dyn, dict):
+        # Clear any prior dynamic keys when full dynamic map is submitted, except base navigation/meta
+        keep_base = {"query", "cat", "prn", "rgn", "ar", "prc", "sort", "size", "lang", "brand"}
+        for existing_k in list(params.keys()):
+            if existing_k not in keep_base:
+                params.pop(existing_k, None)
+        for k, v in dyn.items():
+            ks = str(k).strip()
+            if not ks or ks in ("prc", "query", "sort", "size", "lang"):
+                continue
+            vs = str(v or "").strip()
+            if vs and vs.lower() != "all":
+                params[ks] = vs
+            else:
+                params.pop(ks, None)
 
 
 def _params_from_body(body: Dict[str, Any], app_ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
@@ -327,28 +383,38 @@ def _params_from_body(body: Dict[str, Any], app_ctx: Dict[str, Any]) -> Tuple[Di
     url_raw = (body.get("url") or "").strip()
     if url_raw:
         params = parse_kufar_url_or_query(url_raw)
-        cat_name = cat_map.get(str(params.get("cat", "")), "Куфар поиск")
+        cat_name = get_category_label(str(params.get("cat", ""))) or cat_map.get(str(params.get("cat", "")), "Куфар поиск")
         brand = params.get("brand") or ("Sony" if str(params.get("cbc")) == "31" else "")
-        name = params.get("query") or (f"{cat_name} ({brand})" if brand else cat_name)
+        name = (body.get("name") or "").strip() or params.get("query") or (f"{cat_name} ({brand})" if brand else cat_name)
         return params, name
 
-    params = {"sort": "lst.d", "size": "30"}
+    params: Dict[str, Any] = {"sort": "lst.d", "size": "30"}
     kw = (body.get("query") or "").strip()
     if kw:
         params["query"] = kw
-    cat_id = (body.get("cat") or "").strip()
+
+    prn_id = str(body.get("prn") or "").strip()
+    cat_id = str(body.get("cat") or "").strip()
     if cat_id and cat_id != "all":
         params["cat"] = cat_id
-    rgn_id = (body.get("rgn") or "").strip()
+    elif prn_id and prn_id != "all":
+        params["prn"] = prn_id
+
+    rgn_id = str(body.get("rgn") or "").strip()
     if rgn_id and rgn_id != "all":
         params["rgn"] = rgn_id
-        if rgn_id == "7":
+        ar_val = str(body.get("ar") or "").strip()
+        if ar_val:
+            params["ar"] = ar_val
+        elif rgn_id == "7":
             params["ar"] = "v.or:22,23,24,25,26,27,28,29,30"
 
     min_raw = str(body.get("min_price") or "").strip()
     max_raw = str(body.get("max_price") or "").strip()
     min_p = int(float(min_raw)) if min_raw and min_raw.replace(".", "", 1).isdigit() else None
     max_p = int(float(max_raw)) if max_raw and max_raw.replace(".", "", 1).isdigit() else None
+    if min_p is not None and max_p is not None and min_p > max_p:
+        min_p, max_p = max_p, min_p
     if min_p is not None and max_p is not None:
         params["prc"] = f"r:{min_p * 100},{max_p * 100}"
     elif min_p is not None:
@@ -356,7 +422,10 @@ def _params_from_body(body: Dict[str, Any], app_ctx: Dict[str, Any]) -> Tuple[Di
     elif max_p is not None:
         params["prc"] = f"r:0,{max_p * 100}"
 
-    name = kw or cat_map.get(cat_id, "Куфар поиск")
+    _apply_dynamic_kufar_fields(params, body)
+
+    auto_cat = get_category_label(cat_id) or get_category_label(prn_id) or cat_map.get(cat_id, "Куфар поиск")
+    name = (body.get("name") or "").strip() or kw or auto_cat
     return params, name
 
 
@@ -370,7 +439,7 @@ def _merge_edited_params(
     url_raw = (body.get("url") or "").strip()
     if url_raw:
         params = parse_kufar_url_or_query(url_raw)
-        cat_name = cat_map.get(str(params.get("cat", "")), "Куфар поиск")
+        cat_name = get_category_label(str(params.get("cat", ""))) or cat_map.get(str(params.get("cat", "")), "Куфар поиск")
         brand = params.get("brand") or ("Sony" if str(params.get("cbc")) == "31" else "")
         auto_name = params.get("query") or (f"{cat_name} ({brand})" if brand else cat_name)
         name_val = (body.get("name") or "").strip() or auto_name
@@ -387,12 +456,18 @@ def _merge_edited_params(
         else:
             params.pop("query", None)
 
-    if "cat" in body:
+    if "prn" in body or "cat" in body:
         cat_id = str(body.get("cat") or "").strip()
-        if not cat_id or cat_id == "all":
-            params.pop("cat", None)
-        else:
+        prn_id = str(body.get("prn") or "").strip()
+        if cat_id and cat_id != "all":
             params["cat"] = cat_id
+            params.pop("prn", None)
+        elif prn_id and prn_id != "all":
+            params.pop("cat", None)
+            params["prn"] = prn_id
+        else:
+            params.pop("cat", None)
+            params.pop("prn", None)
 
     if "rgn" in body:
         old_rgn = str(params.get("rgn", ""))
@@ -402,7 +477,13 @@ def _merge_edited_params(
             params.pop("ar", None)
         else:
             params["rgn"] = rgn_id
-            if rgn_id != old_rgn:
+            if "ar" in body:
+                ar_val = str(body.get("ar") or "").strip()
+                if ar_val:
+                    params["ar"] = ar_val
+                else:
+                    params.pop("ar", None)
+            elif rgn_id != old_rgn:
                 if rgn_id == "7":
                     params["ar"] = "v.or:22,23,24,25,26,27,28,29,30"
                 else:
@@ -424,19 +505,21 @@ def _merge_edited_params(
         else:
             params.pop("prc", None)
 
-    if "cnd" in body:
-        cnd = str(body.get("cnd") or "").strip()
-        if cnd in ("1", "2"):
-            params["cnd"] = cnd
-        else:
-            params.pop("cnd", None)
-
-    if "cmp" in body:
-        cmp_val = str(body.get("cmp") or "").strip()
-        if cmp_val in ("0", "1"):
-            params["cmp"] = cmp_val
-        else:
-            params.pop("cmp", None)
+    if "kufar_params" in body:
+        _apply_dynamic_kufar_fields(params, body)
+    else:
+        if "cnd" in body:
+            cnd = str(body.get("cnd") or "").strip()
+            if cnd in ("1", "2"):
+                params["cnd"] = cnd
+            else:
+                params.pop("cnd", None)
+        if "cmp" in body:
+            cmp_val = str(body.get("cmp") or "").strip()
+            if cmp_val in ("0", "1"):
+                params["cmp"] = cmp_val
+            else:
+                params.pop("cmp", None)
 
     if "sort" in body:
         sort_val = str(body.get("sort") or "").strip()
@@ -680,6 +763,45 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   .log-time { color: var(--hint); font-weight: 700; flex-shrink: 0; }
   .log-err { color: var(--red); }
   .log-ok { color: var(--green); }
+  .dyn-section {
+    margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  }
+  .dyn-title {
+    font-size: 11.5px; font-weight: 700; color: var(--accent); text-transform: uppercase;
+    letter-spacing: 0.4px; margin-bottom: 6px; display: flex; align-items: center; gap: 6px;
+  }
+  .dyn-bools { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 8px; }
+  .dyn-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  .picker-btn {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 11px; font-size: 14px; font-family: inherit;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    cursor: pointer; text-align: left;
+  }
+  .picker-btn .val-txt {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+  }
+  .picker-btn .val-placeholder { color: var(--hint); }
+  .picker-list { max-height: 52dvh; overflow-y: auto; -webkit-overflow-scrolling: touch; margin-top: 10px; }
+  .picker-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 11px 10px; border-radius: 10px; cursor: pointer;
+    border-bottom: 1px solid var(--border); font-size: 14px;
+  }
+  .picker-row.selected { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  details.dyn-extra {
+    margin-top: 12px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 9px 11px;
+  }
+  details.dyn-extra summary {
+    cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--hint);
+    list-style: none; display: flex; align-items: center; justify-content: space-between;
+  }
+  .market-bars { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .bar-row { display: grid; grid-template-columns: 112px 1fr 44px; align-items: center; gap: 8px; font-size: 11px; }
+  .bar-track { height: 7px; border-radius: 999px; background: var(--surface-hover); overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), #6366f1); }
   .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .field-label { display: block; font-size: 12px; font-weight: 600; color: var(--hint); margin: 10px 0 5px; }
 
@@ -955,12 +1077,31 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div id="addFormPane" style="display:none">
-      <span class="field-label">Категория</span>
-      <select id="addCatSelect" class="input"></select>
-      <span class="field-label">Регион</span>
-      <select id="addRgnSelect" class="input"></select>
+      <div class="row-2">
+        <div>
+          <span class="field-label">Раздел Kufar</span>
+          <select id="addPrnSelect" class="input" onchange="onFormCategoryChange('add', 'prn')"></select>
+        </div>
+        <div>
+          <span class="field-label">Подкатегория</span>
+          <select id="addCatSelect" class="input" onchange="onFormCategoryChange('add', 'cat')"></select>
+        </div>
+      </div>
+
+      <div class="row-2">
+        <div>
+          <span class="field-label">Регион</span>
+          <select id="addRgnSelect" class="input" onchange="onFormCategoryChange('add', 'rgn')"></select>
+        </div>
+        <div id="addAreaWrap" style="display:none">
+          <span class="field-label">Город / Район</span>
+          <button type="button" id="addAreaBtn" class="picker-btn" onclick="openAreaPicker('add')"></button>
+        </div>
+      </div>
+
       <span class="field-label">Ключевые слова (необязательно)</span>
-      <input id="addQueryInput" class="input" placeholder="playstation 5, iphone 15..." />
+      <input id="addQueryInput" class="input" placeholder="ps5 slim, iphone 15 pro..." />
+
       <div class="row-2">
         <div>
           <span class="field-label">Цена от (BYN)</span>
@@ -971,6 +1112,8 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
           <input id="addMaxInput" type="number" class="input" placeholder="Любая" />
         </div>
       </div>
+
+      <div id="addDynamicFilters" class="dyn-section" style="display:none"></div>
     </div>
 
     <div id="previewBox" class="card" style="display:none;margin-top:12px;background:var(--bg)"></div>
@@ -998,12 +1141,23 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 
     <div class="row-2">
       <div>
-        <span class="field-label">Категория</span>
-        <select id="editCatSelect" class="input"></select>
+        <span class="field-label">Раздел Kufar</span>
+        <select id="editPrnSelect" class="input" onchange="onFormCategoryChange('edit', 'prn')"></select>
       </div>
       <div>
+        <span class="field-label">Подкатегория</span>
+        <select id="editCatSelect" class="input" onchange="onFormCategoryChange('edit', 'cat')"></select>
+      </div>
+    </div>
+
+    <div class="row-2">
+      <div>
         <span class="field-label">Регион</span>
-        <select id="editRgnSelect" class="input"></select>
+        <select id="editRgnSelect" class="input" onchange="onFormCategoryChange('edit', 'rgn')"></select>
+      </div>
+      <div id="editAreaWrap" style="display:none">
+        <span class="field-label">Город / Район</span>
+        <button type="button" id="editAreaBtn" class="picker-btn" onclick="openAreaPicker('edit')"></button>
       </div>
     </div>
 
@@ -1024,24 +1178,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       <button type="button" class="pill-mini" onclick="resetEditPrice()">Сбросить цену</button>
     </div>
 
-    <div class="row-2">
-      <div>
-        <span class="field-label">Состояние</span>
-        <select id="editCndSelect" class="input">
-          <option value="">Любое</option>
-          <option value="1">Б/У</option>
-          <option value="2">Новое</option>
-        </select>
-      </div>
-      <div>
-        <span class="field-label">Продавец</span>
-        <select id="editCmpSelect" class="input">
-          <option value="">Все</option>
-          <option value="0">Частные</option>
-          <option value="1">Компании</option>
-        </select>
-      </div>
-    </div>
+    <div id="editDynamicFilters" class="dyn-section" style="display:none"></div>
 
     <span class="field-label">Локальные стоп-слова только для этого поиска</span>
     <input id="editLocalStops" class="input" placeholder="чехол, коробка, обмен..." />
@@ -1096,6 +1233,22 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       <button class="btn btn-sm btn-ghost btn-icon" title="Копировать ссылку Kufar" onclick="copyFeedKufarUrl()" id="btnFeedCopyUrl"></button>
     </div>
     <div id="feedItems"></div>
+  </div>
+</div>
+
+<!-- MULTI-SELECT PICKER MODAL -->
+<div id="pickerModal" class="modal-bg" style="z-index:160" onclick="if(event.target===this)closeModal('pickerModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title" id="pickerTitle">Выбор параметров</div>
+      <button class="btn btn-sm btn-ghost btn-icon" onclick="closeModal('pickerModal')" id="btnClosePicker"></button>
+    </div>
+    <input id="pickerSearch" class="input" placeholder="Быстрый поиск..." oninput="renderPickerOptions()" />
+    <div id="pickerList" class="picker-list"></div>
+    <div class="row-2" style="margin-top:12px">
+      <button class="btn btn-ghost btn-block" onclick="clearPickerSelection()">Сбросить</button>
+      <button class="btn btn-block" onclick="applyPickerSelection()">Применить</button>
+    </div>
   </div>
 </div>
 
@@ -1200,6 +1353,7 @@ function initStaticIcons() {
   document.getElementById('btnCloseAdd').innerHTML = icon('x');
   document.getElementById('btnCloseEdit').innerHTML = icon('x');
   document.getElementById('btnCloseFeed').innerHTML = icon('x');
+  document.getElementById('btnClosePicker').innerHTML = icon('x');
   document.getElementById('btnFeedCopyUrl').innerHTML = icon('copy', 'ic ic-sm');
   document.getElementById('btnLightboxClose').innerHTML = icon('x');
   document.getElementById('btnLightboxPrev').innerHTML = `${icon('chevronLeft', 'ic ic-sm')} Назад`;
@@ -1475,22 +1629,20 @@ function renderAll() {
     document.getElementById('adminApiLog').innerHTML = '';
   }
 
-  const catSel = document.getElementById('addCatSelect');
-  if (!catSel.options.length) {
-    STATE.categories.forEach(c => catSel.add(new Option(c.name, c.id)));
-  }
-  const rgnSel = document.getElementById('addRgnSelect');
-  if (!rgnSel.options.length) {
-    STATE.regions.forEach(r => rgnSel.add(new Option(r.name, r.id)));
-  }
-  const editCatSel = document.getElementById('editCatSelect');
-  if (!editCatSel.options.length) {
-    STATE.categories.forEach(c => editCatSel.add(new Option(c.name, c.id)));
-  }
-  const editRgnSel = document.getElementById('editRgnSelect');
-  if (!editRgnSel.options.length) {
-    STATE.regions.forEach(r => editRgnSel.add(new Option(r.name, r.id)));
-  }
+  const fillPrnAndRgn = (prnId, rgnId) => {
+    const prnEl = document.getElementById(prnId);
+    if (!prnEl.options.length) {
+      prnEl.add(new Option('Все разделы', 'all'));
+      (STATE.parent_categories || STATE.categories).forEach(c => prnEl.add(new Option(c.name, c.id)));
+    }
+    const rgnEl = document.getElementById(rgnId);
+    if (!rgnEl.options.length) {
+      rgnEl.add(new Option('Вся Беларусь', 'all'));
+      STATE.regions.filter(r => r.id !== 'all').forEach(r => rgnEl.add(new Option(r.name, r.id)));
+    }
+  };
+  fillPrnAndRgn('addPrnSelect', 'addRgnSelect');
+  fillPrnAndRgn('editPrnSelect', 'editRgnSelect');
 }
 
 async function loadState() {
@@ -1553,11 +1705,440 @@ async function sendAllToChat() {
   showToast('Вывод объявлений запущен в чате');
 }
 
+const SCHEMA_CACHE_CLIENT = {};
+const FORM_STATE = {
+  add: { prn: 'all', cat: 'all', rgn: 'all', ar: '', kufar_params: {}, schema: null },
+  edit: { prn: 'all', cat: 'all', rgn: 'all', ar: '', kufar_params: {}, schema: null },
+};
+let PICKER_CTX = null;
+
+function renderMarketBucketsHtml(a) {
+  if (!a || !a.buckets || !a.buckets.length) return '';
+  const maxCnt = Math.max(...a.buckets.map(b => b.count || 0), 1);
+  return `
+    <div class="market-bars">
+      ${a.buckets.map(b => `
+        <div class="bar-row">
+          <span style="color:var(--hint);white-space:nowrap">${esc(b.label)}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${Math.round((b.count / maxCnt) * 100)}%"></div></div>
+          <span style="text-align:right;font-weight:700">${b.count} шт</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderMarketSummaryHtml(a) {
+  if (!a || !a.count) return '';
+  const extraHint = a.above_budget_count > 0
+    ? ` · выше лимита ещё ${a.above_budget_count}`
+    : (a.unbounded ? ' · весь рынок без обрезки цены' : '');
+  return `
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+      <div class="query-meta" style="margin-bottom:8px">${icon('barChart', 'ic ic-sm')} Рынок целиком: <b>${a.count}</b> релевант.${extraHint}</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center">
+        <div><div style="font-weight:800">${fmtMoney(a.min)}</div><div class="query-meta" style="justify-content:center">Минимум</div></div>
+        <div><div style="font-weight:800;color:var(--accent)">${fmtMoney(a.median)}</div><div class="query-meta" style="justify-content:center">Медиана</div></div>
+        <div><div style="font-weight:800">${fmtMoney(a.max)}</div><div class="query-meta" style="justify-content:center">Максимум</div></div>
+      </div>
+      ${renderMarketBucketsHtml(a)}
+    </div>
+  `;
+}
+
+async function loadFormSchema(mode) {
+  const st = FORM_STATE[mode];
+  const reqParams = { ...st.kufar_params };
+  if (st.prn && st.prn !== 'all') reqParams.prn = st.prn;
+  if (st.cat && st.cat !== 'all') reqParams.cat = st.cat;
+  if (st.rgn && st.rgn !== 'all') reqParams.rgn = st.rgn;
+
+  const cacheKey = JSON.stringify(Object.keys(reqParams).sort().reduce((acc, k) => {
+    if (!['prc', 'query', 'sort', 'size', 'ar', 'cnd', 'cmp'].includes(k)) acc[k] = reqParams[k];
+    return acc;
+  }, {}));
+
+  const dynEl = document.getElementById(mode + 'DynamicFilters');
+  if (dynEl && (st.cat !== 'all' || st.prn !== 'all')) {
+    dynEl.style.display = 'block';
+    if (!SCHEMA_CACHE_CLIENT[cacheKey]) {
+      dynEl.innerHTML = `<div class="query-meta">Загружаю фильтры категории с Kufar...</div>`;
+    }
+  }
+
+  let schema = SCHEMA_CACHE_CLIENT[cacheKey];
+  if (!schema) {
+    schema = await api('/api/kufar/schema', 'POST', { params: reqParams });
+    SCHEMA_CACHE_CLIENT[cacheKey] = schema;
+  }
+  st.schema = schema;
+  if (!st.prn || st.prn === 'all') {
+    if (schema.prn) st.prn = schema.prn;
+  }
+
+  // Sync section & subcategory selects
+  const prnEl = document.getElementById(mode + 'PrnSelect');
+  if (prnEl) prnEl.value = st.prn || 'all';
+
+  const catEl = document.getElementById(mode + 'CatSelect');
+  if (catEl) {
+    const subs = schema.subcategories || [];
+    catEl.innerHTML = '';
+    catEl.add(new Option(subs.length ? 'Весь раздел' : 'Все подкатегории', 'all'));
+    subs.forEach(s => catEl.add(new Option(s.name, s.id)));
+    catEl.value = (st.cat && Array.from(catEl.options).some(o => o.value === st.cat)) ? st.cat : 'all';
+    if (st.cat !== 'all' && catEl.value === 'all' && st.cat) {
+      // Preserve custom cat even if not in current subcategory list
+      catEl.add(new Option('Категория #' + st.cat, st.cat));
+      catEl.value = st.cat;
+    }
+  }
+
+  // Sync area picker visibility & label
+  const areas = schema.areas || [];
+  const areaWrap = document.getElementById(mode + 'AreaWrap');
+  if (areaWrap) {
+    if (st.rgn && st.rgn !== 'all' && areas.length) {
+      areaWrap.style.display = 'block';
+      updateAreaButtonLabel(mode, areas);
+    } else {
+      areaWrap.style.display = 'none';
+    }
+  }
+
+  renderDynamicFilters(mode);
+}
+
+function updateAreaButtonLabel(mode, areas) {
+  const st = FORM_STATE[mode];
+  const btn = document.getElementById(mode + 'AreaBtn');
+  if (!btn) return;
+  const selectedIds = parseMultiVal(st.ar);
+  if (!selectedIds.length) {
+    btn.innerHTML = `<span class="val-txt val-placeholder">Любой район</span>${icon('chevronRight', 'ic ic-sm')}`;
+  } else {
+    const map = Object.fromEntries((areas || []).map(a => [String(a.id), a.name]));
+    const names = selectedIds.map(id => map[id] || id).join(', ');
+    btn.innerHTML = `<span class="val-txt">${esc(names)}</span>${icon('chevronRight', 'ic ic-sm')}`;
+  }
+}
+
+function parseMultiVal(raw) {
+  if (!raw) return [];
+  const s = String(raw);
+  if (s.startsWith('v.or:')) return s.slice(5).split(',').filter(Boolean);
+  return s.split(',').filter(Boolean);
+}
+
+function encodeMultiVal(ids, isSingle = false) {
+  const arr = (ids || []).filter(Boolean);
+  if (!arr.length) return '';
+  if (isSingle || arr.length === 1) return arr.length === 1 ? arr[0] : 'v.or:' + arr.join(',');
+  return 'v.or:' + arr.join(',');
+}
+
+function parseRangeClient(raw) {
+  if (!raw || !String(raw).startsWith('r:')) return ['', ''];
+  const parts = String(raw).slice(2).split(',');
+  return [parts[0] && parts[0] !== '0' ? parts[0] : '', parts[1] && parts[1] !== '999999999' ? parts[1] : ''];
+}
+
+function renderDynamicFilters(mode) {
+  const st = FORM_STATE[mode];
+  const container = document.getElementById(mode + 'DynamicFilters');
+  if (!container) return;
+  const fields = (st.schema && st.schema.fields) || [];
+  if (!fields.length) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+  container.style.display = 'block';
+
+  const primary = fields.filter(f => f.group === 'primary');
+  const common = fields.filter(f => f.group === 'common');
+  const extra = fields.filter(f => f.group === 'extra');
+
+  const renderField = (f) => {
+    const curVal = String(st.kufar_params[f.key] || '');
+    if (f.kind === 'select') {
+      const opts = f.options.map(o => `<option value="${esc(o.value)}" ${curVal === o.value ? 'selected' : ''}>${esc(o.label)}</option>`).join('');
+      return `
+        <div>
+          <span class="field-label">${esc(f.label)}</span>
+          <select class="input" onchange="onDynFieldChange('${mode}', '${esc(f.key)}', this.value, ${Boolean(f.reload_on_change)})">
+            <option value="">Любой</option>
+            ${opts}
+          </select>
+        </div>
+      `;
+    }
+    if (f.kind === 'multiselect') {
+      const selIds = parseMultiVal(curVal);
+      const map = Object.fromEntries(f.options.map(o => [String(o.value), o.label]));
+      const txt = selIds.length ? selIds.map(id => map[id] || id).join(', ') : 'Любой';
+      return `
+        <div>
+          <span class="field-label">${esc(f.label)}</span>
+          <button type="button" class="picker-btn" onclick="openDynPicker('${mode}', '${esc(f.key)}')">
+            <span class="val-txt ${selIds.length ? '' : 'val-placeholder'}">${esc(txt)}</span>
+            ${icon('chevronRight', 'ic ic-sm')}
+          </button>
+        </div>
+      `;
+    }
+    if (f.kind === 'chips') {
+      return `
+        <div>
+          <span class="field-label">${esc(f.label)}</span>
+          <div class="dyn-chips">
+            <button type="button" class="crm-pill ${!curVal ? 'active' : ''}" onclick="onDynFieldChange('${mode}', '${esc(f.key)}', '', false)">Все</button>
+            ${f.options.map(o => `
+              <button type="button" class="crm-pill ${curVal === o.value ? 'active' : ''}" onclick="onDynFieldChange('${mode}', '${esc(f.key)}', '${curVal === o.value ? '' : esc(o.value)}', false)">${esc(o.label)}</button>
+            `).join('')}
+          </div>
+        </div>
+      `;
+    }
+    if (f.kind === 'range') {
+      const [rFrom, rTo] = parseRangeClient(curVal);
+      const phFrom = f.range && f.range.lower !== null ? String(f.range.lower) : 'От';
+      const phTo = f.range && f.range.upper !== null && f.range.upper < 10000000 ? String(f.range.upper) : 'До';
+      return `
+        <div>
+          <span class="field-label">${esc(f.label)}</span>
+          <div class="row-2">
+            <input type="number" class="input" value="${esc(rFrom)}" placeholder="${esc(phFrom)}" oninput="onDynRangeChange('${mode}', '${esc(f.key)}', this.value, null)" />
+            <input type="number" class="input" value="${esc(rTo)}" placeholder="${esc(phTo)}" oninput="onDynRangeChange('${mode}', '${esc(f.key)}', null, this.value)" />
+          </div>
+        </div>
+      `;
+    }
+    return '';
+  };
+
+  const primaryNonBool = primary.filter(f => f.kind !== 'bool');
+  const primaryBool = primary.filter(f => f.kind === 'bool');
+  const commonHtml = common.map(renderField).join('');
+
+  let html = '';
+  if (primary.length) {
+    html += `<div class="dyn-title">${icon('sliders', 'ic ic-sm')} Характеристики категории</div>`;
+    html += primaryNonBool.map(renderField).join('');
+    if (primaryBool.length) {
+      html += `<div class="dyn-bools">` + primaryBool.map(f => {
+        const active = st.kufar_params[f.key] === '1';
+        return `<button type="button" class="toggle-pill ${active ? 'active' : ''}" onclick="onDynBoolToggle('${mode}', '${esc(f.key)}', ${Boolean(f.reload_on_change)})">${active ? icon('check', 'ic ic-sm') : ''} ${esc(f.label)}</button>`;
+      }).join('') + `</div>`;
+    }
+  }
+  if (commonHtml) {
+    html += `<div style="margin-top:6px">${commonHtml}</div>`;
+  }
+  if (extra.length) {
+    const activeExtraCnt = extra.filter(f => st.kufar_params[f.key] === '1').length;
+    html += `
+      <details class="dyn-extra">
+        <summary>
+          <span>Доп. опции Kufar${activeExtraCnt ? ' (' + activeExtraCnt + ')' : ''}</span>
+          ${icon('chevronRight', 'ic ic-sm')}
+        </summary>
+        <div class="dyn-bools" style="margin-top:10px">
+          ${extra.map(f => {
+            const active = st.kufar_params[f.key] === '1';
+            return `<button type="button" class="toggle-pill ${active ? 'active' : ''}" onclick="onDynBoolToggle('${mode}', '${esc(f.key)}', false)">${active ? icon('check', 'ic ic-sm') : ''} ${esc(f.label)}</button>`;
+          }).join('')}
+        </div>
+      </details>
+    `;
+  }
+  container.innerHTML = html;
+}
+
+async function onFormCategoryChange(mode, level) {
+  const st = FORM_STATE[mode];
+  if (level === 'prn') {
+    st.prn = document.getElementById(mode + 'PrnSelect').value;
+    st.cat = 'all';
+    st.kufar_params = {};
+  } else if (level === 'cat') {
+    st.cat = document.getElementById(mode + 'CatSelect').value;
+    st.kufar_params = {};
+  } else if (level === 'rgn') {
+    st.rgn = document.getElementById(mode + 'RgnSelect').value;
+    st.ar = '';
+  }
+  await loadFormSchema(mode);
+}
+
+async function onDynFieldChange(mode, key, val, reload) {
+  const st = FORM_STATE[mode];
+  if (val) st.kufar_params[key] = val;
+  else delete st.kufar_params[key];
+  if (reload) {
+    await loadFormSchema(mode);
+  } else {
+    renderDynamicFilters(mode);
+  }
+}
+
+async function onDynBoolToggle(mode, key, reload) {
+  haptic('light');
+  const st = FORM_STATE[mode];
+  if (st.kufar_params[key] === '1') delete st.kufar_params[key];
+  else st.kufar_params[key] = '1';
+  if (reload) await loadFormSchema(mode);
+  else renderDynamicFilters(mode);
+}
+
+function onDynRangeChange(mode, key, newFrom, newTo) {
+  const st = FORM_STATE[mode];
+  const [curFrom, curTo] = parseRangeClient(st.kufar_params[key]);
+  const f = newFrom !== null ? newFrom.trim() : curFrom;
+  const t = newTo !== null ? newTo.trim() : curTo;
+  if (!f && !t) {
+    delete st.kufar_params[key];
+  } else {
+    const schemaField = (st.schema && st.schema.fields || []).find(x => x.key === key);
+    const maxBound = (schemaField && schemaField.range && schemaField.range.upper) || 999999999;
+    st.kufar_params[key] = `r:${f || 0},${t || maxBound}`;
+  }
+}
+
+function openDynPicker(mode, key) {
+  const st = FORM_STATE[mode];
+  const field = (st.schema && st.schema.fields || []).find(x => x.key === key);
+  if (!field) return;
+  haptic('light');
+  PICKER_CTX = {
+    mode,
+    key,
+    isArea: false,
+    title: field.label,
+    options: field.options || [],
+    selected: new Set(parseMultiVal(st.kufar_params[key])),
+    reload: Boolean(field.reload_on_change),
+  };
+  document.getElementById('pickerTitle').textContent = field.label;
+  document.getElementById('pickerSearch').value = '';
+  renderPickerOptions();
+  document.getElementById('pickerModal').classList.add('open');
+}
+
+function openAreaPicker(mode) {
+  const st = FORM_STATE[mode];
+  const areas = (st.schema && st.schema.areas) || [];
+  if (!areas.length) return;
+  haptic('light');
+  PICKER_CTX = {
+    mode,
+    key: 'ar',
+    isArea: true,
+    title: 'Город / Район',
+    options: areas.map(a => ({ value: String(a.id), label: a.name })),
+    selected: new Set(parseMultiVal(st.ar)),
+    reload: false,
+  };
+  document.getElementById('pickerTitle').textContent = 'Город / Район';
+  document.getElementById('pickerSearch').value = '';
+  renderPickerOptions();
+  document.getElementById('pickerModal').classList.add('open');
+}
+
+function renderPickerOptions() {
+  if (!PICKER_CTX) return;
+  const q = (document.getElementById('pickerSearch').value || '').trim().toLowerCase();
+  const opts = q
+    ? PICKER_CTX.options.filter(o => o.label.toLowerCase().includes(q))
+    : PICKER_CTX.options;
+  const listEl = document.getElementById('pickerList');
+  if (!opts.length) {
+    listEl.innerHTML = `<div class="query-meta" style="padding:14px">Ничего не найдено</div>`;
+    return;
+  }
+  listEl.innerHTML = opts.map(o => {
+    const sel = PICKER_CTX.selected.has(String(o.value));
+    return `
+      <div class="picker-row ${sel ? 'selected' : ''}" onclick="togglePickerItem('${esc(o.value)}')">
+        <span>${esc(o.label)}</span>
+        <span>${sel ? icon('check', 'ic ic-sm') : ''}</span>
+      </div>
+    `;
+  }).join('');
+}
+
+function togglePickerItem(val) {
+  if (!PICKER_CTX) return;
+  haptic('light');
+  const s = String(val);
+  if (PICKER_CTX.selected.has(s)) PICKER_CTX.selected.delete(s);
+  else PICKER_CTX.selected.add(s);
+  renderPickerOptions();
+}
+
+function clearPickerSelection() {
+  if (!PICKER_CTX) return;
+  PICKER_CTX.selected.clear();
+  renderPickerOptions();
+}
+
+async function applyPickerSelection() {
+  if (!PICKER_CTX) return;
+  haptic('medium');
+  const { mode, key, isArea, selected, reload } = PICKER_CTX;
+  const encoded = encodeMultiVal(Array.from(selected));
+  const st = FORM_STATE[mode];
+  if (isArea) {
+    st.ar = encoded;
+    updateAreaButtonLabel(mode, (st.schema && st.schema.areas) || []);
+  } else {
+    if (encoded) st.kufar_params[key] = encoded;
+    else delete st.kufar_params[key];
+    if (reload) await loadFormSchema(mode);
+    else renderDynamicFilters(mode);
+  }
+  closeModal('pickerModal');
+}
+
+function collectDynamicFilterLabels(mode) {
+  const st = FORM_STATE[mode];
+  const labels = {};
+  const fields = (st.schema && st.schema.fields) || [];
+  fields.forEach(f => {
+    const v = st.kufar_params[f.key];
+    if (!v) return;
+    if (f.kind === 'bool' && v === '1') {
+      labels[f.key] = `${f.label}: Да`;
+    } else if (f.kind === 'range') {
+      const [a, b] = parseRangeClient(v);
+      if (a || b) labels[f.key] = `${f.label}: ${a || '...'}–${b || '...'}`;
+    } else if (f.kind === 'select' || f.kind === 'chips') {
+      const opt = (f.options || []).find(o => String(o.value) === String(v));
+      if (opt) labels[f.key] = `${f.label}: ${opt.label}`;
+    } else if (f.kind === 'multiselect') {
+      const ids = parseMultiVal(v);
+      const map = Object.fromEntries((f.options || []).map(o => [String(o.value), o.label]));
+      const names = ids.map(id => map[id] || id);
+      if (names.length) {
+        labels[f.key] = names.length <= 2 ? names.join(', ') : `${f.label}: ${names.length} выбр.`;
+      }
+    }
+  });
+  return labels;
+}
+
 function openAddModal() {
   haptic('light');
   document.getElementById('previewBox').style.display = 'none';
   document.getElementById('addUrlInput').value = '';
+  FORM_STATE.add = { prn: 'all', cat: 'all', rgn: 'all', ar: '', kufar_params: {}, schema: null };
+  document.getElementById('addPrnSelect').value = 'all';
+  document.getElementById('addRgnSelect').value = 'all';
+  document.getElementById('addQueryInput').value = '';
+  document.getElementById('addMinInput').value = '';
+  document.getElementById('addMaxInput').value = '';
   document.getElementById('addModal').classList.add('open');
+  if (ADD_MODE === 'form') loadFormSchema('add');
 }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 function setAddMode(mode) {
@@ -1567,18 +2148,24 @@ function setAddMode(mode) {
   document.getElementById('modeLinkBtn').className = 'btn btn-sm' + (mode === 'link' ? '' : ' btn-ghost');
   document.getElementById('modeFormBtn').className = 'btn btn-sm' + (mode === 'form' ? '' : ' btn-ghost');
   document.getElementById('previewBox').style.display = 'none';
+  if (mode === 'form') loadFormSchema('add');
 }
 
 function collectAddPayload() {
   if (ADD_MODE === 'link') {
     return { url: document.getElementById('addUrlInput').value.trim() };
   }
+  const st = FORM_STATE.add;
   return {
-    cat: document.getElementById('addCatSelect').value,
-    rgn: document.getElementById('addRgnSelect').value,
+    prn: st.prn,
+    cat: st.cat,
+    rgn: st.rgn,
+    ar: st.ar,
     query: document.getElementById('addQueryInput').value.trim(),
     min_price: document.getElementById('addMinInput').value.trim(),
     max_price: document.getElementById('addMaxInput').value.trim(),
+    kufar_params: st.kufar_params,
+    filter_labels: collectDynamicFilterLabels('add'),
   };
 }
 
@@ -1592,7 +2179,8 @@ async function previewNewQuery() {
     box.innerHTML = `
       <div style="font-weight:700">${esc(res.name)}</div>
       <div class="chips" style="margin:8px 0">${res.chips.map(renderChip).join('')}</div>
-      <div class="query-meta">Найдено на Kufar: <b>${res.count}</b>${res.median ? ' · Медиана: ' + fmtMoney(res.median) : ''}</div>
+      <div class="query-meta">Под ваш бюджет сейчас на Kufar: <b>${res.count}</b></div>
+      ${renderMarketSummaryHtml(res.market)}
     `;
   } catch(e) { showToast(e.message); }
 }
@@ -1645,13 +2233,10 @@ function openEditModal(qid) {
   const m = q.meta || {};
   document.getElementById('editNameInput').value = q.name || '';
   document.getElementById('editQueryInput').value = p.query || '';
-  document.getElementById('editCatSelect').value = p.cat || 'all';
   document.getElementById('editRgnSelect').value = p.rgn || 'all';
   const [minP, maxP] = parsePrcClient(p.prc);
   document.getElementById('editMinInput').value = minP !== null ? String(minP) : '';
   document.getElementById('editMaxInput').value = maxP !== null ? String(maxP) : '';
-  document.getElementById('editCndSelect').value = p.cnd || '';
-  document.getElementById('editCmpSelect').value = p.cmp || '';
   document.getElementById('editLocalStops').value = (m.stop_words || []).join(', ');
   document.getElementById('editPlusWords').value = (m.plus_words || []).join(', ');
   document.getElementById('editBargainSelect').value = String(m.only_bargain_pct || 0);
@@ -1661,22 +2246,27 @@ function openEditModal(qid) {
   document.getElementById('editUrlInput').value = '';
   document.getElementById('editPreviewBox').style.display = 'none';
 
-  const specials = [];
-  if (p.cbc === '31') specials.push('Sony');
-  else if (p.cbc) specials.push('Бренд #' + p.cbc);
-  if (p.brand) specials.push(p.brand);
-  if (p.cte === '1') specials.push('Приставки');
-  else if (p.cte === '2') specials.push('Игры');
-  else if (p.cte === '3') specials.push('Аксессуары');
-  if (p.pb) specials.push('Производитель #' + p.pb);
+  const keepBase = new Set(['query', 'cat', 'prn', 'rgn', 'ar', 'prc', 'sort', 'size', 'lang', 'brand']);
+  const dynParams = {};
+  Object.entries(p).forEach(([k, v]) => {
+    if (!keepBase.has(k) && v !== null && v !== undefined && String(v) !== '') {
+      dynParams[k] = String(v);
+    }
+  });
+  FORM_STATE.edit = {
+    prn: q.prn || p.prn || 'all',
+    cat: p.cat || 'all',
+    rgn: p.rgn || 'all',
+    ar: p.ar || '',
+    kufar_params: dynParams,
+    schema: null,
+  };
+  document.getElementById('editPrnSelect').value = FORM_STATE.edit.prn;
+
   const infoEl = document.getElementById('editExtraInfo');
-  if (specials.length) {
-    infoEl.style.display = 'flex';
-    infoEl.innerHTML = `${icon('tag', 'ic ic-sm')} Сохранятся спецфильтры: ${esc(specials.join(', '))}`;
-  } else {
-    infoEl.style.display = 'none';
-  }
+  infoEl.style.display = 'none';
   document.getElementById('editModal').classList.add('open');
+  loadFormSchema('edit');
 }
 
 function adjustEditPrice(delta) {
@@ -1708,15 +2298,18 @@ function collectEditPayload() {
     base.url = url;
     return base;
   }
+  const st = FORM_STATE.edit;
   return {
     ...base,
     query: document.getElementById('editQueryInput').value.trim(),
-    cat: document.getElementById('editCatSelect').value,
-    rgn: document.getElementById('editRgnSelect').value,
+    prn: st.prn,
+    cat: st.cat,
+    rgn: st.rgn,
+    ar: st.ar,
     min_price: document.getElementById('editMinInput').value.trim(),
     max_price: document.getElementById('editMaxInput').value.trim(),
-    cnd: document.getElementById('editCndSelect').value,
-    cmp: document.getElementById('editCmpSelect').value,
+    kufar_params: st.kufar_params,
+    filter_labels: collectDynamicFilterLabels('edit'),
   };
 }
 
@@ -1730,7 +2323,8 @@ async function previewEditedQuery() {
     box.innerHTML = `
       <div style="font-weight:700">${esc(res.name)}</div>
       <div class="chips" style="margin:8px 0">${res.chips.map(renderChip).join('')}</div>
-      <div class="query-meta">Найдено на Kufar: <b>${res.count}</b>${res.median ? ' · Медиана: ' + fmtMoney(res.median) : ''}</div>
+      <div class="query-meta">Под ваш бюджет сейчас на Kufar: <b>${res.count}</b></div>
+      ${renderMarketSummaryHtml(res.market)}
     `;
   } catch(e) { showToast(e.message); }
 }
@@ -1911,14 +2505,18 @@ async function openFeed(qid, sortBargains = false) {
     if (res.analytics && res.analytics.count) {
       const a = res.analytics;
       const sparkHtml = renderPriceSparkline(res.price_history || []);
+      const extraMarket = a.above_budget_count > 0
+        ? ` · выше лимита ещё ${a.above_budget_count}`
+        : (a.unbounded ? ' · весь рынок целиком' : '');
       document.getElementById('feedAnalytics').innerHTML = `
         <div class="card" style="background:var(--bg);margin-bottom:12px">
-          <div class="query-meta" style="margin-bottom:8px">${icon('barChart', 'ic ic-sm')} Рыночная аналитика (${a.count} объявл.)</div>
+          <div class="query-meta" style="margin-bottom:8px">${icon('barChart', 'ic ic-sm')} Рыночная аналитика: <b>${a.count}</b> объявл.${extraMarket}</div>
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center">
             <div><div style="font-weight:800">${fmtMoney(a.min)}</div><div class="query-meta" style="justify-content:center">Минимум</div></div>
             <div><div style="font-weight:800;color:var(--accent)">${fmtMoney(a.median)}</div><div class="query-meta" style="justify-content:center">Медиана</div></div>
             <div><div style="font-weight:800">${fmtMoney(a.max)}</div><div class="query-meta" style="justify-content:center">Максимум</div></div>
           </div>
+          ${renderMarketBucketsHtml(a)}
           ${sparkHtml}
         </div>
       `;
@@ -2232,28 +2830,41 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     self._send_json(200, {"ok": True, "monitoring_paused": paused})
                     return
 
+                if path == "/api/kufar/schema":
+                    schema = fetch_kufar_filter_schema(body.get("params") or body)
+                    self._send_json(200, schema)
+                    return
+
                 if path == "/api/queries/preview":
                     params, name = _params_from_body(body, app_ctx)
-                    if not params.get("query") and (not params.get("cat") or params.get("cat") == "all"):
-                        self._send_json(400, {"ok": False, "error": "Укажите категорию или ключевые слова"})
+                    if not params.get("query") and not params.get("cat") and not params.get("prn"):
+                        self._send_json(400, {"ok": False, "error": "Укажите раздел, подкатегорию или ключевые слова"})
                         return
+                    meta = _merge_query_meta({}, body)
                     ads = fetch_ads(params)
-                    prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
-                    med = round(float(statistics.median(prices)), 2) if len(prices) >= 3 else None
+                    sw_list = get_stop_words(chat_id)
+                    market = compute_market_analysis(
+                        params,
+                        user_stop_words=sw_list,
+                        local_stop_words=meta.get("stop_words"),
+                        exclude_company=bool(meta.get("private_only")),
+                        ttl_seconds=120,
+                    )
                     self._send_json(200, {
                         "ok": True,
                         "name": name,
                         "params": params,
-                        "chips": _build_query_chips(params, app_ctx),
+                        "chips": _build_query_chips(params, app_ctx, meta=meta),
                         "count": len(ads),
-                        "median": med,
+                        "median": market.get("median"),
+                        "market": market,
                     })
                     return
 
                 if path == "/api/queries/add":
                     params, name = _params_from_body(body, app_ctx)
-                    if not params.get("query") and (not params.get("cat") or params.get("cat") == "all"):
-                        self._send_json(400, {"ok": False, "error": "Укажите категорию или ключевые слова"})
+                    if not params.get("query") and not params.get("cat") and not params.get("prn"):
+                        self._send_json(400, {"ok": False, "error": "Укажите раздел, подкатегорию или ключевые слова"})
                         return
                     meta = _merge_query_meta({}, body)
                     ads = fetch_ads(params)
@@ -2292,15 +2903,21 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                         self._send_json(404, {"ok": False, "error": "Поиск не найден"})
                         return
                     params, new_name = _merge_edited_params(existing["params"], body, app_ctx)
-                    if not params.get("query") and (not params.get("cat") or params.get("cat") == "all"):
-                        self._send_json(400, {"ok": False, "error": "Укажите категорию или ключевые слова"})
+                    if not params.get("query") and not params.get("cat") and not params.get("prn"):
+                        self._send_json(400, {"ok": False, "error": "Укажите раздел, подкатегорию или ключевые слова"})
                         return
                     meta = _merge_query_meta(existing.get("meta"), body)
                     final_name = new_name or existing["name"]
                     if body.get("preview_only"):
                         ads = fetch_ads(params)
-                        prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
-                        med = round(float(statistics.median(prices)), 2) if len(prices) >= 3 else None
+                        sw_list = get_stop_words(chat_id)
+                        market = compute_market_analysis(
+                            params,
+                            user_stop_words=sw_list,
+                            local_stop_words=meta.get("stop_words"),
+                            exclude_company=bool(meta.get("private_only")),
+                            ttl_seconds=120,
+                        )
                         self._send_json(200, {
                             "ok": True,
                             "name": final_name,
@@ -2308,7 +2925,8 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                             "meta": meta,
                             "chips": _build_query_chips(params, app_ctx, meta=meta),
                             "count": len(ads),
-                            "median": med,
+                            "median": market.get("median"),
+                            "market": market,
                         })
                         return
                     if body.get("as_copy"):
@@ -2372,11 +2990,20 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     min_b, max_b = _parse_prc_bounds(q["params"].get("prc"))
                     bl = get_user_blacklist(chat_id)
                     sw_list = get_stop_words(chat_id)
-                    prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
-                    med = round(float(statistics.median(prices)), 2) if len(prices) >= 3 else None
 
-                    if med is not None and len(prices) >= 3:
-                        record_price_history(qid, med, min(prices), max(prices), len(ads))
+                    # Full market analytics WITHOUT user's prc budget ceiling (evaluates 2300, 2500 BYN etc.)
+                    analytics = compute_market_analysis(
+                        q["params"],
+                        user_stop_words=sw_list,
+                        local_stop_words=q_meta.get("stop_words"),
+                        exclude_company=bool(q_meta.get("private_only")),
+                        ttl_seconds=120,
+                    )
+                    med = analytics.get("median")
+                    if med is not None and analytics.get("count"):
+                        record_price_history(
+                            qid, med, analytics.get("min"), analytics.get("max"), int(analytics["count"])
+                        )
 
                     eval_meta = app_ctx.get("evaluate_query_meta")
                     filtered = []
@@ -2408,12 +3035,6 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                         if len(filtered) >= 30:
                             break
 
-                    analytics = {
-                        "count": len(prices),
-                        "min": min(prices) if prices else None,
-                        "median": med,
-                        "max": max(prices) if prices else None,
-                    }
                     history = get_price_history(qid, days=14)
                     self._send_json(200, {
                         "ok": True,

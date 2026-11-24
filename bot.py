@@ -86,6 +86,7 @@ from kufar_api import (
     fetch_ad_description,
     fetch_ad_photos,
     fetch_ad_live_state,
+    compute_market_analysis,
     extract_phone_from_text,
     fetch_ad_phone_with_token
 )
@@ -930,15 +931,27 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
         return 0
 
     bl = get_user_blacklist(chat_id)
-    market_median = calculate_market_stats(ads)
+    user_stops = get_stop_words(chat_id)
+    market_info = compute_market_analysis(
+        params,
+        user_stop_words=user_stops,
+        local_stop_words=meta.get("stop_words"),
+        exclude_company=bool(meta.get("private_only")),
+        ttl_seconds=300,
+    )
+    market_median = market_info.get("median") or calculate_market_stats(ads)
 
     # Save daily price history snapshot at most once every 10 minutes per query
     now_ts = time.time()
     if market_median is not None and now_ts - LAST_PH_SNAPSHOT.get(qid, 0) >= 600:
-        prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
-        if len(prices) >= 3:
-            record_price_history(qid, market_median, min(prices), max(prices), len(ads))
-            LAST_PH_SNAPSHOT[qid] = now_ts
+        record_price_history(
+            qid,
+            market_median,
+            market_info.get("min"),
+            market_info.get("max"),
+            int(market_info.get("count") or len(ads)),
+        )
+        LAST_PH_SNAPSHOT[qid] = now_ts
 
     sent_count = 0
 
@@ -1445,7 +1458,14 @@ def _run_batch_ad_output(
                 logger.error(f"Error fetching ads for query {qid}: {e}")
                 continue
 
-            q_median = calculate_market_stats(ads)
+            q_market = compute_market_analysis(
+                params,
+                user_stop_words=stop_words,
+                local_stop_words=q_meta.get("stop_words"),
+                exclude_company=bool(q_meta.get("private_only")),
+                ttl_seconds=300,
+            )
+            q_median = q_market.get("median") or calculate_market_stats(ads)
             shown_for_query = 0
 
             for ad in ads:

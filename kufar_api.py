@@ -7,7 +7,9 @@ import urllib.parse
 import json
 import re
 import logging
-from typing import Dict, List, Optional, Any
+import statistics
+import time
+from typing import Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger("kufar_api")
 
@@ -399,16 +401,22 @@ def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
     return params
 
 
-def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]:
-    """
-    Fetches listings matching params from Kufar API.
-    Returns a cleaned list of ads.
-    """
+_MARKET_CACHE: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
+_ACCESSORY_CATS = {"17020", "17030", "16060", "2040", "13300"}
+_NOISE_RE = re.compile(
+    r"(?:аренд[аеуы]|прокат\b|наклейк|чехол|чехл|стекл[оа]|коробк[аеуи]|"
+    r"подставк|кабель|зарядк|скупк|выкуп|ремонт\b|обменяю)"
+)
+
+
+def fetch_ads_with_total(params: Dict[str, Any], timeout: int = 10) -> Tuple[List[Dict[str, Any]], int]:
+    """Fetches listings from Kufar Search API along with total matching count reported by Kufar."""
     query_params = clean_kufar_api_params(params)
     if "sort" not in query_params:
         query_params["sort"] = "lst.d"
     if "size" not in query_params:
         query_params["size"] = "30"
+    query_params.setdefault("lang", "ru")
 
     encoded_query = urllib.parse.urlencode(query_params)
     full_url = f"{API_SEARCH_URL}?{encoded_query}"
@@ -426,16 +434,17 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
         with urllib.request.urlopen(req, timeout=timeout) as response:
             if response.status != 200:
                 logger.error(f"Kufar API error status: {response.status}")
-                return []
+                return [], 0
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         logger.error(f"Error fetching Kufar ads: HTTP Error {e.code}: {e.reason} (URL: {full_url})")
-        return []
+        return [], 0
     except Exception as e:
         logger.error(f"Error fetching Kufar ads: {e} (URL: {full_url})")
-        return []
+        return [], 0
 
     ads_raw = payload.get("ads", [])
+    total_reported = int(payload.get("total") or len(ads_raw))
     results = []
 
     for ad in ads_raw:
@@ -447,10 +456,9 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
         ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
         list_time = ad.get("list_time", "")
 
-        # Price parsing (kopecks to BYN / USD)
         price_byn_raw = ad.get("price_byn")
         price_usd_raw = ad.get("price_usd")
-        
+
         price_byn = None
         price_usd = None
         if price_byn_raw and str(price_byn_raw).isdigit():
@@ -458,7 +466,6 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
         if price_usd_raw and str(price_usd_raw).isdigit():
             price_usd = round(int(price_usd_raw) / 100, 2)
 
-        # Region & Area extraction from ad_parameters
         region_name = ""
         area_name = ""
         for p in ad.get("ad_parameters", []):
@@ -467,13 +474,11 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
             elif p.get("p") == "area":
                 area_name = p.get("vl", "")
 
-        # Seller name from account_parameters
         seller_name = ""
         for p in ad.get("account_parameters", []):
             if p.get("p") == "name":
                 seller_name = p.get("v", "").strip()
 
-        # Image URLs (up to 20 unique images)
         images = ad.get("images", [])
         image_urls = []
         seen_paths = set()
@@ -504,7 +509,174 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
             "account_id": ad.get("account_id")
         })
 
-    return results
+    return results, total_reported
+
+
+def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetches listings matching params from Kufar API.
+    Returns a cleaned list of ads.
+    """
+    ads, _ = fetch_ads_with_total(params, timeout=timeout)
+    return ads
+
+
+def compute_market_analysis(
+    params: Dict[str, Any],
+    user_stop_words: Optional[List[str]] = None,
+    local_stop_words: Optional[List[str]] = None,
+    exclude_company: bool = False,
+    ttl_seconds: int = 300,
+) -> Dict[str, Any]:
+    """
+    Analyzes the FULL market price distribution across Kufar for the same item/category filters
+    WITHOUT the user's min/max price ceiling (prc), so expensive/normal market listings (e.g. 2300/2500 BYN)
+    are properly accounted for when evaluating bargains and computing medians.
+    """
+    market_params = clean_kufar_api_params(params)
+    user_prc = market_params.pop("prc", None)
+    market_params["size"] = "100"
+    market_params["sort"] = "lst.d"
+
+    user_min: Optional[float] = None
+    user_max: Optional[float] = None
+    if user_prc and str(user_prc).startswith("r:"):
+        parts = str(user_prc)[2:].split(",")
+        if len(parts) == 2:
+            try:
+                user_min = float(parts[0]) / 100.0 if parts[0] not in ("", "0") else None
+                user_max = float(parts[1]) / 100.0 if parts[1] not in ("", "0", "999999999") else None
+            except Exception:
+                pass
+
+    all_stops = sorted({
+        str(w).strip().lower()
+        for w in (list(user_stop_words or []) + list(local_stop_words or []))
+        if str(w).strip()
+    })
+    cache_key = (
+        tuple(sorted(market_params.items())),
+        tuple(all_stops),
+        bool(exclude_company),
+    )
+    now = time.time()
+    cached = _MARKET_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < ttl_seconds:
+        res = dict(cached[1])
+        if user_max is not None and res.get("_prices"):
+            res["above_budget_count"] = sum(1 for p in res["_prices"] if p > user_max)
+        else:
+            res["above_budget_count"] = 0
+        res.pop("_prices", None)
+        return res
+
+    ads, total_on_kufar = fetch_ads_with_total(market_params)
+    cat_id = str(market_params.get("cat", ""))
+    cte_id = str(market_params.get("cte", ""))
+    kw_lower = str(market_params.get("query") or "").lower()
+    is_accessory_search = (
+        cat_id in _ACCESSORY_CATS
+        or cte_id in ("2", "3", "6")
+        or bool(_NOISE_RE.search(kw_lower))
+    )
+
+    candidate_prices: List[float] = []
+    for ad in ads:
+        if exclude_company and ad.get("company_ad"):
+            continue
+        p = ad.get("price_byn")
+        if p is None or p <= 0:
+            continue
+        subj = (ad.get("subject") or "").lower()
+        if all_stops and any(sw in subj for sw in all_stops):
+            continue
+        if not is_accessory_search and _NOISE_RE.search(subj):
+            continue
+        candidate_prices.append(float(p))
+
+    # Light outlier filter for tiny accessories/cables if query-based high-ticket search wasn't narrowed by cte/subcat
+    clean_prices = list(candidate_prices)
+    if len(candidate_prices) >= 6 and not is_accessory_search:
+        s = sorted(candidate_prices)
+        q75 = s[int(0.75 * (len(s) - 1))]
+        if q75 >= 250:
+            floor = q75 * 0.22
+            filtered = [p for p in s if p >= floor]
+            if len(filtered) >= 3:
+                clean_prices = filtered
+
+    if not clean_prices:
+        return {
+            "count": 0,
+            "total_on_kufar": total_on_kufar,
+            "min": None,
+            "median": None,
+            "avg": None,
+            "max": None,
+            "p25": None,
+            "p75": None,
+            "above_budget_count": 0,
+            "unbounded": bool(user_prc),
+            "buckets": [],
+        }
+
+    s_prices = sorted(clean_prices)
+    n = len(s_prices)
+    med = round(float(statistics.median(s_prices)), 2)
+    avg = round(float(sum(s_prices) / n), 2)
+    p25 = round(float(s_prices[max(0, int(0.25 * (n - 1)))]), 2)
+    p75 = round(float(s_prices[min(n - 1, int(0.75 * (n - 1)))]), 2)
+    mn = round(float(s_prices[0]), 2)
+    mx = round(float(s_prices[-1]), 2)
+
+    # Build 4 clear price range buckets
+    buckets: List[Dict[str, Any]] = []
+    if n >= 4 and mx > mn:
+        step_raw = (mx - mn) / 4.0
+        # Round step cleanly (to nearest 10/50/100 depending on magnitude)
+        if step_raw >= 100:
+            step = max(50, round(step_raw / 50) * 50)
+        elif step_raw >= 20:
+            step = max(10, round(step_raw / 10) * 10)
+        else:
+            step = max(1, round(step_raw))
+        start = int(mn // step) * step if step >= 10 else int(mn)
+        edges = [start, start + step, start + step * 2, start + step * 3, int(mx) + 1]
+        for idx in range(4):
+            lo, hi = edges[idx], edges[idx + 1]
+            if idx < 3:
+                cnt = sum(1 for p in s_prices if lo <= p < hi)
+                disp_lo = max(int(mn), int(lo)) if idx == 0 else int(lo)
+                lbl = f"{disp_lo:,}–{int(hi):,}".replace(",", " ")
+            else:
+                cnt = sum(1 for p in s_prices if p >= lo)
+                lbl = f"от {int(lo):,}".replace(",", " ")
+            if cnt > 0:
+                buckets.append({"label": lbl + " BYN", "count": cnt, "pct": round((cnt / n) * 100)})
+
+    payload = {
+        "count": n,
+        "total_on_kufar": total_on_kufar,
+        "min": mn,
+        "median": med,
+        "avg": avg,
+        "max": mx,
+        "p25": p25,
+        "p75": p75,
+        "unbounded": bool(user_prc),
+        "buckets": buckets,
+        "_prices": s_prices,
+    }
+    _MARKET_CACHE[cache_key] = (now, dict(payload))
+    if len(_MARKET_CACHE) > 200:
+        oldest = sorted(_MARKET_CACHE.items(), key=lambda kv: kv[1][0])[:50]
+        for k, _ in oldest:
+            _MARKET_CACHE.pop(k, None)
+
+    out = dict(payload)
+    out["above_budget_count"] = sum(1 for p in s_prices if user_max is not None and p > user_max)
+    out.pop("_prices", None)
+    return out
 
 
 def fetch_ad_details(ad_id: int, timeout: int = 6) -> tuple:
