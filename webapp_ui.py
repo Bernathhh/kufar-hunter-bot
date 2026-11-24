@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from database import (
     DEFAULT_CONTACT_TEMPLATE,
+    add_blacklisted_seller,
     add_favorite,
     add_query,
     add_stop_word,
@@ -24,8 +25,10 @@ from database import (
     clear_user_favorites,
     delete_query,
     get_active_queries,
+    get_admin_users_overview,
     get_blacklisted_sellers,
     get_blacklist_count,
+    get_price_history,
     get_query_seen_count,
     get_silent_mode,
     get_stop_words,
@@ -39,6 +42,7 @@ from database import (
     is_seller_blacklisted,
     is_user_monitoring_paused,
     mark_ads_seen,
+    record_price_history,
     register_or_update_user,
     remove_blacklisted_seller,
     remove_favorite,
@@ -48,6 +52,7 @@ from database import (
     set_user_monitoring_paused,
     set_user_template,
     toggle_query_active,
+    update_favorite_crm,
     update_query,
 )
 from kufar_api import fetch_ads, parse_kufar_url_or_query
@@ -128,7 +133,11 @@ def _parse_prc_bounds(prc_param: Optional[str]) -> Tuple[Optional[float], Option
         return None, None
 
 
-def _build_query_chips(p: Dict[str, Any], app_ctx: Dict[str, Any]) -> List[Dict[str, str]]:
+def _build_query_chips(
+    p: Dict[str, Any],
+    app_ctx: Dict[str, Any],
+    meta: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, str]]:
     """Builds structured filter chips with semantic SVG icon keys (no emojis)."""
     chips: List[Dict[str, str]] = []
     cat_map = {k: _plain_label(v) for k, v in app_ctx.get("categories", [])}
@@ -163,7 +172,90 @@ def _build_query_chips(p: Dict[str, Any], app_ctx: Dict[str, Any]) -> List[Dict[
     cmp_map = {"0": "Частные", "1": "Компании"}
     if str(p.get("cmp", "")) in cmp_map:
         chips.append({"icon": "users", "text": cmp_map[str(p["cmp"])]})
+
+    m = meta or {}
+    if m.get("private_only"):
+        chips.append({"icon": "user", "text": "Только частники"})
+    if int(m.get("only_bargain_pct") or 0) > 0:
+        chips.append({"icon": "barChart", "text": f"Ниже рынка -{int(m['only_bargain_pct'])}%"})
+    if m.get("stop_words"):
+        chips.append({"icon": "shield", "text": f"Стоп: {len(m['stop_words'])}"})
+    if m.get("plus_words"):
+        chips.append({"icon": "sparkles", "text": f"Плюс: {len(m['plus_words'])}"})
+    if m.get("silent_query"):
+        chips.append({"icon": "moon", "text": "Без звука"})
     return chips or [{"icon": "grid", "text": "Все объявления"}]
+
+
+def _format_time_ago(iso_str: str) -> str:
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        now = datetime.now(dt.tzinfo)
+        sec = max(0, int((now - dt).total_seconds()))
+        if sec < 60:
+            return "только что"
+        mins = sec // 60
+        if mins < 60:
+            return f"{mins} мин назад"
+        hours = mins // 60
+        if hours < 24:
+            return f"{hours} ч назад"
+        days = hours // 24
+        return f"{days} дн назад"
+    except Exception:
+        return ""
+
+
+def _parse_words_list(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        tokens = [str(x).strip().lower() for x in raw]
+    else:
+        tokens = [t.strip().lower() for t in re.split(r"[,;\n]+", str(raw or ""))]
+    seen = set()
+    res = []
+    for t in tokens:
+        if len(t) >= 2 and t not in seen:
+            seen.add(t)
+            res.append(t)
+    return res[:30]
+
+
+def _merge_query_meta(existing_meta: Optional[Dict[str, Any]], body: Dict[str, Any]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = dict(existing_meta or {})
+    if "local_stop_words" in body:
+        sw = _parse_words_list(body.get("local_stop_words"))
+        if sw:
+            meta["stop_words"] = sw
+        else:
+            meta.pop("stop_words", None)
+    if "plus_words" in body:
+        pw = _parse_words_list(body.get("plus_words"))
+        if pw:
+            meta["plus_words"] = pw
+        else:
+            meta.pop("plus_words", None)
+    if "only_bargain_pct" in body:
+        try:
+            pct = max(0, min(60, int(body.get("only_bargain_pct") or 0)))
+        except Exception:
+            pct = 0
+        if pct > 0:
+            meta["only_bargain_pct"] = pct
+        else:
+            meta.pop("only_bargain_pct", None)
+    if "private_only" in body:
+        if body.get("private_only"):
+            meta["private_only"] = True
+        else:
+            meta.pop("private_only", None)
+    if "silent_query" in body:
+        if body.get("silent_query"):
+            meta["silent_query"] = True
+        else:
+            meta.pop("silent_query", None)
+    return meta
 
 
 def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str, Any]:
@@ -174,11 +266,13 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
     queries_raw = get_user_queries(chat_id)
     queries = []
     for q in queries_raw:
+        meta = q.get("meta") or {}
         queries.append({
             "id": q["id"],
             "name": _plain_label(q["name"]),
             "params": q["params"],
-            "chips": _build_query_chips(q["params"], app_ctx),
+            "meta": meta,
+            "chips": _build_query_chips(q["params"], app_ctx, meta=meta),
             "is_active": bool(q.get("is_active", True)),
             "seen_count": get_query_seen_count(q["id"]),
             "created_at": str(q.get("created_at", "")),
@@ -197,12 +291,15 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
 
     stats: Dict[str, Any] = {"is_admin": is_admin}
     if is_admin:
+        get_events = app_ctx.get("get_api_events")
         stats.update({
             "uptime": uptime,
             "total_checks": total_checks,
             "new_ads_found": new_ads_found,
             "total_users": get_user_count(),
             "total_active_queries": len(get_active_queries()),
+            "users_list": get_admin_users_overview(),
+            "api_events": get_events() if callable(get_events) else [],
         })
 
     return {
@@ -398,28 +495,31 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   svg.ic-xl { width: 26px; height: 26px; stroke-width: 1.65; }
   svg.ic-fill { fill: currentColor; }
 
-  .app { max-width: 640px; margin: 0 auto; padding: 12px 14px 96px; }
+  .app {
+    max-width: 640px; margin: 0 auto;
+    padding: calc(10px + env(safe-area-inset-top)) 12px calc(92px + env(safe-area-inset-bottom));
+  }
   .header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 4px 2px 16px; gap: 10px;
+    padding: 2px 2px 14px; gap: 8px;
   }
-  .brand { display: flex; align-items: center; gap: 11px; }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
   .brand-mark {
-    width: 40px; height: 40px; border-radius: 13px;
+    width: 38px; height: 38px; border-radius: 12px; flex-shrink: 0;
     background: linear-gradient(135deg, var(--accent), #6366f1);
     color: #fff;
     display: flex; align-items: center; justify-content: center;
     box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 32%, transparent);
   }
-  .brand-title { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
-  .brand-sub { font-size: 11.5px; color: var(--hint); margin-top: 1px; }
+  .brand-title { font-size: 16.5px; font-weight: 700; letter-spacing: -0.3px; white-space: nowrap; }
+  .brand-sub { font-size: 11px; color: var(--hint); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   .status-pill {
-    display: inline-flex; align-items: center; gap: 7px;
-    padding: 7px 12px; border-radius: 999px;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 10px; border-radius: 999px;
     font-size: 12px; font-weight: 600; border: 1px solid var(--border);
     background: var(--card); color: var(--text); cursor: pointer;
-    transition: transform .12s ease, border-color .15s;
+    transition: transform .12s ease, border-color .15s; white-space: nowrap;
   }
   .status-pill:active { transform: scale(0.96); }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
@@ -538,10 +638,48 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   .input, select, textarea {
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 12px;
-    padding: 10px 12px; font-size: 13.5px; font-family: inherit; outline: none;
+    padding: 9px 11px; font-size: 16px; font-family: inherit; outline: none;
     transition: border-color .15s;
   }
   .input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  .toggle-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .toggle-pill {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 9px 10px; border-radius: 11px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--hint); font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: all .15s;
+  }
+  .toggle-pill.active {
+    background: var(--accent-soft); color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .crm-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .crm-pill {
+    border: 1px solid var(--border); background: var(--surface); color: var(--hint);
+    border-radius: 7px; padding: 3px 8px; font-size: 11px; font-weight: 600; cursor: pointer;
+  }
+  .crm-pill.active { background: var(--accent-soft); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .note-box {
+    margin-top: 7px; padding: 6px 9px; border-radius: 9px;
+    background: var(--surface); border: 1px solid var(--border);
+    font-size: 12px; color: var(--text); word-break: break-word;
+  }
+  .badge-closed { background: var(--red-soft); color: var(--red); }
+  .badge-plus { background: var(--accent-soft); color: var(--accent); }
+  .spark-wrap { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .spark-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--hint); margin-bottom: 4px; }
+  .admin-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12.5px;
+  }
+  .admin-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .log-item {
+    font-size: 11.5px; padding: 6px 8px; border-radius: 8px; background: var(--surface);
+    margin-bottom: 6px; display: flex; gap: 8px; align-items: baseline;
+  }
+  .log-time { color: var(--hint); font-weight: 700; flex-shrink: 0; }
+  .log-err { color: var(--red); }
+  .log-ok { color: var(--green); }
   .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .field-label { display: block; font-size: 12px; font-weight: 600; color: var(--hint); margin: 10px 0 5px; }
 
@@ -593,19 +731,19 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
     background: color-mix(in srgb, var(--card) 92%, transparent);
     border-top: 1px solid var(--border);
-    display: grid; grid-template-columns: repeat(4, 1fr);
+    display: flex; align-items: stretch;
     padding: 7px 6px calc(7px + env(safe-area-inset-bottom));
     backdrop-filter: saturate(180%) blur(18px);
   }
   .nav-btn {
-    background: none; border: none; color: var(--hint);
+    background: none; border: none; color: var(--hint); flex: 1; min-width: 0;
     display: flex; flex-direction: column; align-items: center; gap: 4px;
     padding: 4px 2px; font-size: 10.5px; font-weight: 600; cursor: pointer;
     position: relative; transition: color .15s;
   }
   .nav-btn.active { color: var(--accent); }
   .nav-badge {
-    position: absolute; top: 1px; right: 22%; min-width: 16px; height: 16px;
+    position: absolute; top: 1px; right: 20%; min-width: 16px; height: 16px;
     border-radius: 999px; background: var(--accent); color: var(--btn-text);
     font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; padding: 0 4px;
   }
@@ -616,11 +754,22 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   }
   .modal-bg.open { display: flex; }
   .modal {
-    width: 100%; max-width: 640px; max-height: 88vh; overflow-y: auto;
+    width: 100%; max-width: 640px; max-height: 88dvh; overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     background: var(--card); border-top-left-radius: 22px; border-top-right-radius: 22px;
     border-top: 1px solid var(--border);
-    padding: 16px 16px calc(22px + env(safe-area-inset-bottom));
+    padding: 15px 14px calc(22px + env(safe-area-inset-bottom));
     animation: slideUp .18s ease;
+  }
+  @media (max-width: 390px) {
+    .card { padding: 12px; }
+    .query-actions { gap: 5px; }
+    .btn-sm { padding: 7px 8px; font-size: 11.5px; min-height: 36px; white-space: nowrap; }
+    .btn-icon { padding: 7px 8px; }
+    .thumb-wrap { width: 76px; height: 76px; }
+    .ad-card { padding: 10px; gap: 10px; }
+    .feed-toolbar { grid-template-columns: 1fr auto; }
+    .feed-toolbar #feedSearchInput { grid-column: 1 / -1; }
   }
   @keyframes slideUp { from { transform: translateY(30px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
   .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
@@ -763,18 +912,27 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- TAB 4: STATUS -->
+  <!-- TAB 4: STATUS (ADMIN ONLY) -->
   <div id="tab-stats" class="tab-panel">
     <div class="stats-grid" id="statsGrid"></div>
     <div class="card">
-      <div class="section-title"><span class="title-ic" id="icAlbumsTitle"></span>Фотоальбомы в чате</div>
-      <div class="query-meta" style="margin-top:8px">
-        Свежие объявления отправляются в чат нативным альбомом со всеми фотографиями, аналитикой цены относительно медианы и быстрым переходом к продавцу.
+      <div class="section-title"><span class="title-ic" id="icAlbumsTitle"></span>Управление сервером</div>
+      <div class="query-meta" style="margin-top:6px">
+        Быстрые действия администратора: внеочередной цикл поиска, облачный бэкап в Telegram и вывод объявлений.
       </div>
-      <div class="row-2" style="margin-top:14px">
+      <div class="row-2" style="margin-top:12px">
         <button class="btn btn-ghost btn-block" onclick="triggerCheckNow()" id="btnStatsCheck"></button>
-        <button class="btn btn-block" onclick="sendAllToChat()" id="btnStatsSend"></button>
+        <button class="btn btn-ghost btn-block" onclick="syncAdminBackup()" id="btnStatsBackup"></button>
       </div>
+      <button class="btn btn-block" style="margin-top:8px" onclick="sendAllToChat()" id="btnStatsSend"></button>
+    </div>
+    <div class="card">
+      <div class="section-title"><span class="title-ic" id="icAdminUsers"></span>Пользователи бота</div>
+      <div id="adminUsersList" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <div class="section-title"><span class="title-ic" id="icAdminLog"></span>Журнал Kufar API</div>
+      <div id="adminApiLog" style="margin-top:10px"></div>
     </div>
   </div>
 </div>
@@ -885,6 +1043,26 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <span class="field-label">Локальные стоп-слова только для этого поиска</span>
+    <input id="editLocalStops" class="input" placeholder="чехол, коробка, обмен..." />
+
+    <span class="field-label">Плюс-слова (приоритет и бейдж)</span>
+    <input id="editPlusWords" class="input" placeholder="срочно, чек, торг, оригинал..." />
+
+    <span class="field-label">Порог выгоды для уведомлений</span>
+    <select id="editBargainSelect" class="input">
+      <option value="0">Все подходящие объявления</option>
+      <option value="10">Только ниже рынка на 10%+</option>
+      <option value="15">Только ниже рынка на 15%+</option>
+      <option value="20">Только ниже рынка на 20%+</option>
+      <option value="25">Только ниже рынка на 25%+</option>
+    </select>
+
+    <div class="toggle-row">
+      <button type="button" id="editPrivateBtn" class="toggle-pill" onclick="toggleEditMetaFlag('private')"></button>
+      <button type="button" id="editSilentBtn" class="toggle-pill" onclick="toggleEditMetaFlag('silent')"></button>
+    </div>
+
     <span class="field-label">Или заменить параметры ссылкой с Kufar.by (опционально)</span>
     <input id="editUrlInput" class="input" placeholder="https://www.kufar.by/l/..." />
 
@@ -988,7 +1166,11 @@ const SVG_PATHS = {
   copy: '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
   chevronLeft: '<path d="m15 18-6-6 6-6"/>',
   chevronRight: '<path d="m9 18 6-6-6-6"/>',
-  sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>'
+  sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>',
+  check: '<polyline points="20 6 9 17 4 12"/>',
+  cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
+  userX: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="17" x2="22" y1="8" y2="13"/><line x1="22" x2="17" y1="8" y2="13"/>',
+  note: '<path d="M16 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8Z"/><path d="M15 3v4a2 2 0 0 0 2 2h4"/>'
 };
 
 function icon(name, cls = 'ic') {
@@ -1007,9 +1189,12 @@ function initStaticIcons() {
   document.getElementById('icSilentTitle').innerHTML = icon('moon', 'ic ic-sm');
   document.getElementById('icTplTitle').innerHTML = icon('message', 'ic ic-sm');
   document.getElementById('icBlTitle').innerHTML = icon('ban', 'ic ic-sm');
-  document.getElementById('icAlbumsTitle').innerHTML = icon('images', 'ic ic-sm');
-  document.getElementById('btnStatsCheck').innerHTML = `${icon('refreshCw', 'ic ic-sm')} Проверить сейчас`;
-  document.getElementById('btnStatsSend').innerHTML = `${icon('send')} В чат`;
+  document.getElementById('icAlbumsTitle').innerHTML = icon('layers', 'ic ic-sm');
+  document.getElementById('icAdminUsers').innerHTML = icon('users', 'ic ic-sm');
+  document.getElementById('icAdminLog').innerHTML = icon('activity', 'ic ic-sm');
+  document.getElementById('btnStatsCheck').innerHTML = `${icon('refreshCw', 'ic ic-sm')} Проверить`;
+  document.getElementById('btnStatsBackup').innerHTML = `${icon('cloud', 'ic ic-sm')} Бэкап Cloud`;
+  document.getElementById('btnStatsSend').innerHTML = `${icon('send')} Вывести все свежие в чат`;
   document.getElementById('addModalTitle').innerHTML = `${icon('plus')} Новый поиск Kufar`;
   document.getElementById('editModalTitle').innerHTML = `${icon('edit')} Редактировать фильтр`;
   document.getElementById('btnCloseAdd').innerHTML = icon('x');
@@ -1150,6 +1335,12 @@ function renderAll() {
   // Render favorites
   const fList = document.getElementById('favsList');
   document.getElementById('clearFavsBtn').style.display = STATE.favorites.length ? 'inline-flex' : 'none';
+  const crmLabels = [
+    ['watching', 'Наблюдаю'],
+    ['messaged', 'Написал'],
+    ['negotiating', 'Торгуюсь'],
+    ['bought', 'Куплено'],
+  ];
   if (!STATE.favorites.length) {
     fList.innerHTML = `<div class="empty"><div class="empty-ic">${icon('star', 'ic ic-xl')}</div>В Избранном пока пусто.<br>Отмечайте объявления прямо в чате или ленте.</div>`;
   } else {
@@ -1163,11 +1354,25 @@ function renderAll() {
           <div class="ad-price-row">
             <span class="ad-price">${fmtMoney(f.price_byn)}</span>
             ${f.price_usd ? `<span class="ad-usd">~$${Math.round(f.price_usd)}</span>` : ''}
+            ${f.is_closed ? `<span class="badge badge-closed">Снято / продано</span>` : ''}
           </div>
           <div class="ad-sub">${icon('user', 'ic ic-sm')} ${esc(f.seller_name || 'Частное лицо')}</div>
+          <div class="crm-row">
+            ${crmLabels.map(([code, lbl]) => `
+              <button type="button" class="crm-pill ${f.status === code ? 'active' : ''}" onclick="setFavStatus(${f.ad_id}, '${f.status === code ? '' : code}')">${lbl}</button>
+            `).join('')}
+          </div>
+          ${f.note ? `<div class="note-box">${esc(f.note)}</div>` : ''}
+          <div id="fav-note-edit-${f.ad_id}" style="display:none;margin-top:8px">
+            <div style="display:flex;gap:6px">
+              <input id="fav-note-inp-${f.ad_id}" class="input" value="${esc(f.note || '')}" placeholder="Заметка по сделке..." />
+              <button class="btn btn-sm" onclick="saveFavNote(${f.ad_id})">ОК</button>
+            </div>
+          </div>
           <div class="ad-btns">
             <a class="btn btn-sm" href="${esc(f.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
             <button class="btn btn-sm btn-ghost" onclick="copyContact(${f.ad_id}, '${esc(f.seller_name||'')}', '${esc(f.title||'')}', '${fmtMoney(f.price_byn)}')">${icon('message', 'ic ic-sm')} Текст</button>
+            <button class="btn btn-sm btn-ghost btn-icon" title="Заметка" onclick="toggleFavNote(${f.ad_id})">${icon('note', 'ic ic-sm')}</button>
             <button class="btn btn-sm btn-danger btn-icon" onclick="removeFav(${f.ad_id})">${icon('x', 'ic ic-sm')}</button>
           </div>
         </div>
@@ -1236,8 +1441,38 @@ function renderAll() {
         <div class="stat-val">${st.total_active_queries || 0}</div>
       </div>
     `;
+    const uList = st.users_list || [];
+    document.getElementById('adminUsersList').innerHTML = uList.length
+      ? uList.map(u => {
+          const uname = u.username ? '@' + esc(u.username) : esc(u.first_name || ('ID ' + u.chat_id));
+          return `
+            <div class="admin-row">
+              <div>
+                <div style="font-weight:700">${uname}</div>
+                <div class="query-meta">ID: ${u.chat_id} · ${u.paused ? 'На паузе' : 'Активен'}</div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-weight:700">${u.queries_active}/${u.queries_total} фильтр.</div>
+                <div class="query-meta" style="justify-content:flex-end">Избр: ${u.favorites_count}</div>
+              </div>
+            </div>
+          `;
+        }).join('')
+      : `<div class="query-meta">Нет зарегистрированных пользователей</div>`;
+
+    const evs = st.api_events || [];
+    document.getElementById('adminApiLog').innerHTML = evs.length
+      ? evs.slice(0, 12).map(ev => `
+          <div class="log-item">
+            <span class="log-time">${esc(ev.time)}</span>
+            <span class="${ev.level === 'error' ? 'log-err' : (ev.level === 'ok' ? 'log-ok' : '')}">${esc(ev.message)}</span>
+          </div>
+        `).join('')
+      : `<div class="query-meta">Событий пока нет (логи появятся после очередного цикла).</div>`;
   } else {
     document.getElementById('statsGrid').innerHTML = '';
+    document.getElementById('adminUsersList').innerHTML = '';
+    document.getElementById('adminApiLog').innerHTML = '';
   }
 
   const catSel = document.getElementById('addCatSelect');
@@ -1382,12 +1617,32 @@ function parsePrcClient(prc) {
   return [Number.isFinite(minP) ? minP : null, Number.isFinite(maxP) ? maxP : null];
 }
 
+let EDIT_PRIVATE_ONLY = false;
+let EDIT_SILENT_QUERY = false;
+
+function syncEditMetaButtons() {
+  const pb = document.getElementById('editPrivateBtn');
+  const sb = document.getElementById('editSilentBtn');
+  pb.className = 'toggle-pill' + (EDIT_PRIVATE_ONLY ? ' active' : '');
+  pb.innerHTML = `${icon('user', 'ic ic-sm')} Только частники`;
+  sb.className = 'toggle-pill' + (EDIT_SILENT_QUERY ? ' active' : '');
+  sb.innerHTML = `${icon('moon', 'ic ic-sm')} Без звука`;
+}
+
+function toggleEditMetaFlag(kind) {
+  haptic('light');
+  if (kind === 'private') EDIT_PRIVATE_ONLY = !EDIT_PRIVATE_ONLY;
+  if (kind === 'silent') EDIT_SILENT_QUERY = !EDIT_SILENT_QUERY;
+  syncEditMetaButtons();
+}
+
 function openEditModal(qid) {
   const q = STATE && STATE.queries.find(x => x.id === qid);
   if (!q) return;
   haptic('light');
   EDITING_QID = qid;
   const p = q.params || {};
+  const m = q.meta || {};
   document.getElementById('editNameInput').value = q.name || '';
   document.getElementById('editQueryInput').value = p.query || '';
   document.getElementById('editCatSelect').value = p.cat || 'all';
@@ -1397,6 +1652,12 @@ function openEditModal(qid) {
   document.getElementById('editMaxInput').value = maxP !== null ? String(maxP) : '';
   document.getElementById('editCndSelect').value = p.cnd || '';
   document.getElementById('editCmpSelect').value = p.cmp || '';
+  document.getElementById('editLocalStops').value = (m.stop_words || []).join(', ');
+  document.getElementById('editPlusWords').value = (m.plus_words || []).join(', ');
+  document.getElementById('editBargainSelect').value = String(m.only_bargain_pct || 0);
+  EDIT_PRIVATE_ONLY = Boolean(m.private_only);
+  EDIT_SILENT_QUERY = Boolean(m.silent_query);
+  syncEditMetaButtons();
   document.getElementById('editUrlInput').value = '';
   document.getElementById('editPreviewBox').style.display = 'none';
 
@@ -1437,6 +1698,11 @@ function collectEditPayload() {
   const base = {
     id: EDITING_QID,
     name: document.getElementById('editNameInput').value.trim(),
+    local_stop_words: document.getElementById('editLocalStops').value,
+    plus_words: document.getElementById('editPlusWords').value,
+    only_bargain_pct: Number(document.getElementById('editBargainSelect').value || 0),
+    private_only: EDIT_PRIVATE_ONLY,
+    silent_query: EDIT_SILENT_QUERY,
   };
   if (url) {
     base.url = url;
@@ -1525,12 +1791,54 @@ function copyContactFromFeed(adId) {
   copyContact(adId, ad.seller || 'продавец', ad.subject || 'товар', fmtMoney(ad.price_byn));
 }
 
+function renderPriceSparkline(history) {
+  if (!history || !history.length) return '';
+  if (history.length === 1) {
+    return `<div class="spark-wrap"><div class="spark-head"><span>История цен (${esc(history[0].day)})</span><span>Медиана: ${fmtMoney(history[0].median_byn)}</span></div></div>`;
+  }
+  const vals = history.map(h => Number(h.median_byn || 0));
+  const mn = Math.min(...vals);
+  const mx = Math.max(...vals);
+  const span = Math.max(1, mx - mn);
+  const w = 260, h = 44, pad = 6;
+  const pts = vals.map((v, i) => {
+    const x = pad + (i * (w - pad * 2)) / Math.max(1, vals.length - 1);
+    const y = h - pad - ((v - mn) * (h - pad * 2)) / span;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const firstDay = history[0].day.slice(5);
+  const lastDay = history[history.length - 1].day.slice(5);
+  return `
+    <div class="spark-wrap">
+      <div class="spark-head">
+        <span>Динамика медианы (${firstDay} — ${lastDay})</span>
+        <span>${fmtMoney(mn)} – ${fmtMoney(mx)}</span>
+      </div>
+      <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:44px;display:block">
+        <polyline fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" points="${pts}" />
+      </svg>
+    </div>
+  `;
+}
+
+async function hideSellerFromFeed(adId) {
+  const ad = FEED_ADS_CACHE[adId];
+  if (!ad || !ad.seller) return showToast('Имя продавца скрыто');
+  if (!confirm(`Скрыть все объявления от «${ad.seller}»?`)) return;
+  haptic('medium');
+  await api('/api/blacklist/hide_seller', 'POST', { seller_name: ad.seller, account_id: ad.account_id || '' });
+  FEED_ADS_LIST = FEED_ADS_LIST.filter(x => x.seller !== ad.seller);
+  filterAndRenderFeed();
+  await loadState();
+  showToast('Продавец добавлен в ЧС');
+}
+
 function filterAndRenderFeed() {
   const searchVal = (document.getElementById('feedSearchInput').value || '').trim().toLowerCase();
   const sortMode = document.getElementById('feedSortSelect').value || 'default';
   let items = FEED_ADS_LIST.slice();
   if (searchVal) {
-    items = items.filter(a => (a.subject || '').toLowerCase().includes(searchVal) || (a.area || '').toLowerCase().includes(searchVal));
+    items = items.filter(a => (a.subject || '').toLowerCase().includes(searchVal) || (a.area || '').toLowerCase().includes(searchVal) || (a.seller || '').toLowerCase().includes(searchVal));
   }
   if (sortMode === 'price_asc') {
     items.sort((a, b) => (a.price_byn || 9e9) - (b.price_byn || 9e9));
@@ -1548,8 +1856,15 @@ function filterAndRenderFeed() {
     let badge = '';
     if (ad.bargain_pct !== null && ad.bargain_pct <= -8) badge = `<span class="badge badge-good">${ad.bargain_pct}%</span>`;
     else if (ad.bargain_pct !== null && ad.bargain_pct >= 12) badge = `<span class="badge badge-high">+${ad.bargain_pct}%</span>`;
+    const plusBadge = (ad.matched_plus && ad.matched_plus.length)
+      ? `<span class="badge badge-plus">${esc(ad.matched_plus[0])}</span>`
+      : '';
     const urls = (ad.image_urls && ad.image_urls.length) ? ad.image_urls : (ad.image_url ? [ad.image_url] : []);
     const imgCount = urls.length;
+    const sellerType = ad.company_ad ? 'Магазин' : 'Частник';
+    const metaParts = [];
+    if (ad.area || ad.region) metaParts.push(esc([ad.region, ad.area].filter(Boolean).join(', ')));
+    if (ad.time_ago) metaParts.push(esc(ad.time_ago));
     return `
       <div class="ad-card" id="feed-ad-${ad.ad_id}">
         <div class="thumb-wrap ${imgCount ? 'clickable' : ''}" ${imgCount ? `onclick="openLightbox(FEED_ADS_CACHE[${ad.ad_id}].image_urls && FEED_ADS_CACHE[${ad.ad_id}].image_urls.length ? FEED_ADS_CACHE[${ad.ad_id}].image_urls : [FEED_ADS_CACHE[${ad.ad_id}].image_url], 0)"` : ''}>
@@ -1561,14 +1876,17 @@ function filterAndRenderFeed() {
           <div class="ad-price-row">
             <span class="ad-price">${fmtMoney(ad.price_byn)}</span>
             ${badge}
+            ${plusBadge}
           </div>
-          <div class="ad-sub">${icon('mapPin', 'ic ic-sm')} ${esc(ad.region || '')}${ad.area ? ', ' + esc(ad.area) : ''}</div>
+          <div class="ad-sub">${icon('mapPin', 'ic ic-sm')} ${metaParts.join(' · ')}</div>
+          <div class="ad-sub">${icon('user', 'ic ic-sm')} ${esc(ad.seller || 'Автор')} (${sellerType})</div>
           <div class="ad-btns">
             <a class="btn btn-sm" href="${esc(ad.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
             <button class="btn btn-sm btn-ghost" onclick="pushAdToChat(${ad.ad_id})">${icon('send', 'ic ic-sm')} В чат</button>
             <button class="btn btn-sm btn-ghost btn-icon" title="Текст продавцу" onclick="copyContactFromFeed(${ad.ad_id})">${icon('message', 'ic ic-sm')}</button>
             <button class="btn btn-sm btn-icon ${ad.is_fav ? 'btn-success' : 'btn-ghost'}" onclick="toggleFavFromFeed(${ad.ad_id}, this)">${icon('star', ad.is_fav ? 'ic ic-sm ic-fill' : 'ic ic-sm')}</button>
-            <button class="btn btn-sm btn-danger btn-icon" onclick="hideAdFromFeed(${ad.ad_id})">${icon('eyeOff', 'ic ic-sm')}</button>
+            ${ad.seller ? `<button class="btn btn-sm btn-danger btn-icon" title="Скрыть продавца" onclick="hideSellerFromFeed(${ad.ad_id})">${icon('userX', 'ic ic-sm')}</button>` : ''}
+            <button class="btn btn-sm btn-danger btn-icon" title="Скрыть объявление" onclick="hideAdFromFeed(${ad.ad_id})">${icon('eyeOff', 'ic ic-sm')}</button>
           </div>
         </div>
       </div>
@@ -1592,6 +1910,7 @@ async function openFeed(qid, sortBargains = false) {
     const res = await api('/api/queries/feed', 'POST', { id: qid });
     if (res.analytics && res.analytics.count) {
       const a = res.analytics;
+      const sparkHtml = renderPriceSparkline(res.price_history || []);
       document.getElementById('feedAnalytics').innerHTML = `
         <div class="card" style="background:var(--bg);margin-bottom:12px">
           <div class="query-meta" style="margin-bottom:8px">${icon('barChart', 'ic ic-sm')} Рыночная аналитика (${a.count} объявл.)</div>
@@ -1600,6 +1919,7 @@ async function openFeed(qid, sortBargains = false) {
             <div><div style="font-weight:800;color:var(--accent)">${fmtMoney(a.median)}</div><div class="query-meta" style="justify-content:center">Медиана</div></div>
             <div><div style="font-weight:800">${fmtMoney(a.max)}</div><div class="query-meta" style="justify-content:center">Максимум</div></div>
           </div>
+          ${sparkHtml}
         </div>
       `;
     }
@@ -1733,6 +2053,39 @@ async function unblockSeller(name) {
   showToast(`Продавец «${name}» разблокирован`);
 }
 
+async function syncAdminBackup() {
+  haptic('medium');
+  await api('/api/admin/backup', 'POST', {});
+  showToast('Бэкап отправлен в Telegram Cloud');
+}
+
+async function setFavStatus(adId, status) {
+  haptic('light');
+  await api('/api/favorites/crm', 'POST', { ad_id: adId, status });
+  await loadState();
+}
+
+function toggleFavNote(adId) {
+  haptic('light');
+  const el = document.getElementById('fav-note-edit-' + adId);
+  if (!el) return;
+  const open = el.style.display === 'none';
+  el.style.display = open ? 'block' : 'none';
+  if (open) {
+    const inp = document.getElementById('fav-note-inp-' + adId);
+    inp && inp.focus();
+  }
+}
+
+async function saveFavNote(adId) {
+  const inp = document.getElementById('fav-note-inp-' + adId);
+  const note = inp ? inp.value.trim() : '';
+  haptic('light');
+  await api('/api/favorites/crm', 'POST', { ad_id: adId, note });
+  await loadState();
+  showToast('Заметка сохранена');
+}
+
 async function clearBlAds() {
   if (!confirm('Очистить список скрытых объявлений?')) return;
   await api('/api/blacklist/clear_ads', 'POST', {});
@@ -1742,13 +2095,22 @@ async function clearBlAds() {
 
 window.addEventListener('DOMContentLoaded', async () => {
   initStaticIcons();
+  const lb = document.getElementById('lightboxModal');
+  let touchX = 0;
+  lb.addEventListener('touchstart', e => { touchX = e.changedTouches[0].clientX; }, { passive: true });
+  lb.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - touchX;
+    if (Math.abs(dx) > 40) stepLightbox(dx < 0 ? 1 : -1);
+  }, { passive: true });
+
   if (tg && tg.initData) {
     tg.ready();
     tg.expand();
+    try { tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch(e) {}
     try { tg.setHeaderColor && tg.setHeaderColor('bg_color'); } catch(e) {}
     try { tg.setBackgroundColor && tg.setBackgroundColor('bg_color'); } catch(e) {}
     document.getElementById('app').style.display = 'block';
-    document.getElementById('bottomNav').style.display = 'grid';
+    document.getElementById('bottomNav').style.display = 'flex';
     try {
       await loadState();
     } catch (e) {
@@ -1893,8 +2255,9 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     if not params.get("query") and (not params.get("cat") or params.get("cat") == "all"):
                         self._send_json(400, {"ok": False, "error": "Укажите категорию или ключевые слова"})
                         return
+                    meta = _merge_query_meta({}, body)
                     ads = fetch_ads(params)
-                    qid = add_query(chat_id, name, params)
+                    qid = add_query(chat_id, name, params, meta=meta)
                     if ads:
                         mark_ads_seen(qid, [a["ad_id"] for a in ads])
                     app_ctx["sync_backup"]()
@@ -1911,6 +2274,16 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     self._send_json(200, {"ok": True})
                     return
 
+                if path == "/api/admin/backup":
+                    admin_chat_id = config.get("admin_chat_id", 0)
+                    if not (admin_chat_id and chat_id == admin_chat_id):
+                        self._send_json(403, {"ok": False, "error": "Доступно только администратору"})
+                        return
+                    fn = app_ctx.get("sync_cloud_backup_now") or app_ctx["sync_backup"]
+                    fn()
+                    self._send_json(200, {"ok": True})
+                    return
+
                 if path == "/api/queries/update":
                     qid = int(body.get("id", 0))
                     user_queries = get_user_queries(chat_id)
@@ -1922,6 +2295,7 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     if not params.get("query") and (not params.get("cat") or params.get("cat") == "all"):
                         self._send_json(400, {"ok": False, "error": "Укажите категорию или ключевые слова"})
                         return
+                    meta = _merge_query_meta(existing.get("meta"), body)
                     final_name = new_name or existing["name"]
                     if body.get("preview_only"):
                         ads = fetch_ads(params)
@@ -1931,21 +2305,22 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                             "ok": True,
                             "name": final_name,
                             "params": params,
-                            "chips": _build_query_chips(params, app_ctx),
+                            "meta": meta,
+                            "chips": _build_query_chips(params, app_ctx, meta=meta),
                             "count": len(ads),
                             "median": med,
                         })
                         return
                     if body.get("as_copy"):
                         ads = fetch_ads(params)
-                        new_qid = add_query(chat_id, final_name, params)
+                        new_qid = add_query(chat_id, final_name, params, meta=meta)
                         if ads:
                             mark_ads_seen(new_qid, [a["ad_id"] for a in ads])
                         app_ctx["sync_backup"]()
                         app_ctx["trigger_force_check"]()
                         self._send_json(200, {"ok": True, "id": new_qid, "name": final_name, "copied": True})
                         return
-                    update_query(qid, chat_id, name=final_name, params=params)
+                    update_query(qid, chat_id, name=final_name, params=params, meta=meta)
                     app_ctx["sync_backup"]()
                     app_ctx["trigger_force_check"]()
                     self._send_json(200, {
@@ -1953,7 +2328,8 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                         "id": qid,
                         "name": final_name,
                         "params": params,
-                        "chips": _build_query_chips(params, app_ctx),
+                        "meta": meta,
+                        "chips": _build_query_chips(params, app_ctx, meta=meta),
                     })
                     return
 
@@ -1989,6 +2365,7 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     if not q:
                         self._send_json(404, {"ok": False, "error": "Поиск не найден"})
                         return
+                    q_meta = q.get("meta") or {}
                     api_params = dict(q["params"])
                     api_params["size"] = "50"
                     ads = fetch_ads(api_params)
@@ -1998,6 +2375,10 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
                     med = round(float(statistics.median(prices)), 2) if len(prices) >= 3 else None
 
+                    if med is not None and len(prices) >= 3:
+                        record_price_history(qid, med, min(prices), max(prices), len(ads))
+
+                    eval_meta = app_ctx.get("evaluate_query_meta")
                     filtered = []
                     for a in ads:
                         if a["ad_id"] in bl:
@@ -2012,10 +2393,17 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                                 continue
                         if sw_list and any(sw in (a.get("subject") or "").lower() for sw in sw_list):
                             continue
+                        matched_plus: List[str] = []
+                        if callable(eval_meta):
+                            allowed, matched_plus = eval_meta(a, q_meta, market_median=med)
+                            if not allowed:
+                                continue
                         b_pct = round(((p - med) / med) * 100) if (p is not None and med) else None
                         item = dict(a)
                         item["is_fav"] = is_favorite(chat_id, a["ad_id"])
                         item["bargain_pct"] = b_pct
+                        item["time_ago"] = _format_time_ago(a.get("list_time", ""))
+                        item["matched_plus"] = matched_plus
                         filtered.append(item)
                         if len(filtered) >= 30:
                             break
@@ -2026,7 +2414,13 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                         "median": med,
                         "max": max(prices) if prices else None,
                     }
-                    self._send_json(200, {"ok": True, "ads": filtered, "analytics": analytics})
+                    history = get_price_history(qid, days=14)
+                    self._send_json(200, {
+                        "ok": True,
+                        "ads": filtered,
+                        "analytics": analytics,
+                        "price_history": history,
+                    })
                     return
 
                 if path == "/api/ads/send_to_chat":
@@ -2070,11 +2464,34 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     self._send_json(200, {"ok": True})
                     return
 
+                if path == "/api/favorites/crm":
+                    ad_id = int(body.get("ad_id", 0))
+                    if not ad_id:
+                        self._send_json(400, {"ok": False, "error": "ad_id required"})
+                        return
+                    status = body.get("status") if "status" in body else None
+                    note = body.get("note") if "note" in body else None
+                    update_favorite_crm(chat_id, ad_id, status=status, note=note)
+                    app_ctx["sync_backup"]()
+                    self._send_json(200, {"ok": True})
+                    return
+
                 if path == "/api/blacklist/hide_ad":
                     ad_id = int(body.get("ad_id", 0))
                     if ad_id:
                         add_to_blacklist(chat_id, ad_id)
                         app_ctx["sync_backup"]()
+                    self._send_json(200, {"ok": True})
+                    return
+
+                if path == "/api/blacklist/hide_seller":
+                    sname = (body.get("seller_name") or "").strip()
+                    acc_id = str(body.get("account_id") or "").strip() or None
+                    if not sname:
+                        self._send_json(400, {"ok": False, "error": "Имя продавца не указано"})
+                        return
+                    add_blacklisted_seller(chat_id, sname, account_id=acc_id)
+                    app_ctx["sync_backup"]()
                     self._send_json(200, {"ok": True})
                     return
 

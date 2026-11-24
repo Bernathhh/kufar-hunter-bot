@@ -141,13 +141,56 @@ def init_db(db_path: Optional[str] = None):
                 ad_link TEXT,
                 seller_name TEXT,
                 image_url TEXT,
+                status TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                is_closed INTEGER DEFAULT 0,
+                last_checked_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(chat_id, ad_id)
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(chat_id, ad_id)")
+
+        # Price history table (daily market snapshots per query)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                median_byn REAL,
+                min_byn REAL,
+                max_byn REAL,
+                ads_count INTEGER DEFAULT 0,
+                UNIQUE(query_id, day)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ph_query_day ON price_history(query_id, day)")
+
+        # Safe column migrations for existing databases
+        migrations = [
+            "ALTER TABLE queries ADD COLUMN meta_json TEXT DEFAULT '{}'",
+            "ALTER TABLE favorites ADD COLUMN status TEXT DEFAULT ''",
+            "ALTER TABLE favorites ADD COLUMN note TEXT DEFAULT ''",
+            "ALTER TABLE favorites ADD COLUMN is_closed INTEGER DEFAULT 0",
+            "ALTER TABLE favorites ADD COLUMN last_checked_at TIMESTAMP",
+        ]
+        for sql in migrations:
+            try:
+                cursor.execute(sql)
+            except Exception:
+                pass
         
         conn.commit()
+
+
+def _parse_json_dict(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, dict) else {}
+    except Exception:
+        return {}
 
 
 def set_setting(key: str, value: str, db_path: Optional[str] = None):
@@ -167,14 +210,20 @@ def get_setting(key: str, default: Optional[str] = None, db_path: Optional[str] 
         return row["value"] if row else default
 
 
-def add_query(chat_id: int, name: str, params: Dict[str, Any], db_path: Optional[str] = None) -> int:
+def add_query(
+    chat_id: int,
+    name: str,
+    params: Dict[str, Any],
+    meta: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None
+) -> int:
     """Adds a new search query to track and unmarks it from deleted_queries if present."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM deleted_queries WHERE chat_id = ? AND name = ?", (chat_id, name))
         cursor.execute(
-            "INSERT INTO queries (chat_id, name, params_json, is_active) VALUES (?, ?, ?, 1)",
-            (chat_id, name, json.dumps(params))
+            "INSERT INTO queries (chat_id, name, params_json, meta_json, is_active) VALUES (?, ?, ?, ?, 1)",
+            (chat_id, name, json.dumps(params), json.dumps(meta or {}))
         )
         conn.commit()
         return cursor.lastrowid
@@ -184,7 +233,7 @@ def get_active_queries(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Returns all active tracking queries across all chats."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, chat_id, name, params_json, created_at FROM queries WHERE is_active = 1")
+        cursor.execute("SELECT id, chat_id, name, params_json, meta_json, created_at FROM queries WHERE is_active = 1")
         rows = cursor.fetchall()
         result = []
         for r in rows:
@@ -193,6 +242,7 @@ def get_active_queries(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
                 "chat_id": r["chat_id"],
                 "name": r["name"],
                 "params": json.loads(r["params_json"]),
+                "meta": _parse_json_dict(r["meta_json"] if "meta_json" in r.keys() else None),
                 "created_at": r["created_at"]
             })
         return result
@@ -202,7 +252,7 @@ def get_user_queries(chat_id: int, db_path: Optional[str] = None) -> List[Dict[s
     """Returns all queries created by a specific user/chat."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, chat_id, name, params_json, is_active, created_at FROM queries WHERE chat_id = ? ORDER BY id DESC", (chat_id,))
+        cursor.execute("SELECT id, chat_id, name, params_json, meta_json, is_active, created_at FROM queries WHERE chat_id = ? ORDER BY id DESC", (chat_id,))
         rows = cursor.fetchall()
         result = []
         for r in rows:
@@ -211,6 +261,7 @@ def get_user_queries(chat_id: int, db_path: Optional[str] = None) -> List[Dict[s
                 "chat_id": r["chat_id"],
                 "name": r["name"],
                 "params": json.loads(r["params_json"]),
+                "meta": _parse_json_dict(r["meta_json"] if "meta_json" in r.keys() else None),
                 "is_active": bool(r["is_active"]),
                 "created_at": r["created_at"]
             })
@@ -246,9 +297,10 @@ def update_query(
     chat_id: int,
     name: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
     db_path: Optional[str] = None
 ) -> bool:
-    """Updates an existing search query's name and/or parameters in-place without losing seen history."""
+    """Updates an existing search query's name, parameters, and/or bot meta without losing seen history."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         fields = []
@@ -259,6 +311,9 @@ def update_query(
         if params is not None:
             fields.append("params_json = ?")
             values.append(json.dumps(params))
+        if meta is not None:
+            fields.append("meta_json = ?")
+            values.append(json.dumps(meta))
         if not fields:
             return False
         values.extend([query_id, chat_id])
@@ -652,13 +707,21 @@ def add_favorite(
     image_url: str = "",
     db_path: Optional[str] = None
 ) -> bool:
-    """Adds an ad to user's favorites."""
+    """Adds an ad to user's favorites while preserving existing CRM note/status if present."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT OR REPLACE INTO favorites 
-               (chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            """INSERT INTO favorites
+               (chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, status, note, is_closed, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, CURRENT_TIMESTAMP)
+               ON CONFLICT(chat_id, ad_id) DO UPDATE SET
+                 title = excluded.title,
+                 price_byn = excluded.price_byn,
+                 price_usd = excluded.price_usd,
+                 ad_link = excluded.ad_link,
+                 seller_name = excluded.seller_name,
+                 image_url = excluded.image_url,
+                 is_closed = 0""",
             (chat_id, int(ad_id), title, price_byn, price_usd, ad_link, seller_name, image_url)
         )
         conn.commit()
@@ -687,11 +750,148 @@ def get_user_favorites(chat_id: int, db_path: Optional[str] = None) -> List[Dict
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at "
+            "SELECT ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, "
+            "COALESCE(status, '') as status, COALESCE(note, '') as note, COALESCE(is_closed, 0) as is_closed, created_at "
             "FROM favorites WHERE chat_id = ? ORDER BY id DESC",
             (chat_id,)
         )
         return [dict(r) for r in cursor.fetchall()]
+
+
+def update_favorite_crm(
+    chat_id: int,
+    ad_id: int,
+    status: Optional[str] = None,
+    note: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> bool:
+    """Updates CRM status tag and/or personal note on a saved favorite."""
+    fields = []
+    values: List[Any] = []
+    if status is not None:
+        fields.append("status = ?")
+        values.append(status.strip()[:32])
+    if note is not None:
+        fields.append("note = ?")
+        values.append(note.strip()[:400])
+    if not fields:
+        return False
+    values.extend([chat_id, int(ad_id)])
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE favorites SET {', '.join(fields)} WHERE chat_id = ? AND ad_id = ?",
+            tuple(values)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def update_favorite_price_state(
+    chat_id: int,
+    ad_id: int,
+    price_byn: Optional[float] = None,
+    price_usd: Optional[float] = None,
+    is_closed: Optional[int] = None,
+    db_path: Optional[str] = None
+) -> bool:
+    """Updates tracked price and closed/sold state for a saved favorite."""
+    fields = ["last_checked_at = CURRENT_TIMESTAMP"]
+    values: List[Any] = []
+    if price_byn is not None:
+        fields.append("price_byn = ?")
+        values.append(price_byn)
+    if price_usd is not None:
+        fields.append("price_usd = ?")
+        values.append(price_usd)
+    if is_closed is not None:
+        fields.append("is_closed = ?")
+        values.append(int(is_closed))
+    values.extend([chat_id, int(ad_id)])
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE favorites SET {', '.join(fields)} WHERE chat_id = ? AND ad_id = ?",
+            tuple(values)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_all_favorites(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns all active/open favorites across all users for background tracking."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, "
+            "COALESCE(is_closed, 0) as is_closed, last_checked_at "
+            "FROM favorites ORDER BY id DESC"
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def record_price_history(
+    query_id: int,
+    median_byn: Optional[float],
+    min_byn: Optional[float],
+    max_byn: Optional[float],
+    ads_count: int,
+    day: Optional[str] = None,
+    db_path: Optional[str] = None
+):
+    """Stores or refreshes today's market price snapshot (median/min/max) for a search query."""
+    if not query_id or median_byn is None:
+        return
+    if not day:
+        minsk_tz = timezone(timedelta(hours=3))
+        day = datetime.now(minsk_tz).strftime("%Y-%m-%d")
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO price_history (query_id, day, median_byn, min_byn, max_byn, ads_count)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (int(query_id), day, float(median_byn), min_byn, max_byn, int(ads_count))
+        )
+        conn.commit()
+
+
+def get_price_history(query_id: int, days: int = 14, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns historical market price snapshots for a query ordered chronologically."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT day, median_byn, min_byn, max_byn, ads_count FROM price_history "
+            "WHERE query_id = ? ORDER BY day DESC LIMIT ?",
+            (int(query_id), int(days))
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        rows.reverse()
+        return rows
+
+
+def get_admin_users_overview(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns per-user summary for the admin dashboard."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT u.chat_id, u.username, u.first_name, u.last_name, u.last_seen,
+                   COUNT(DISTINCT q.id) as queries_total,
+                   SUM(CASE WHEN q.is_active = 1 THEN 1 ELSE 0 END) as queries_active,
+                   (SELECT COUNT(*) FROM favorites f WHERE f.chat_id = u.chat_id) as favorites_count
+            FROM users u
+            LEFT JOIN queries q ON q.chat_id = u.chat_id
+            GROUP BY u.chat_id
+            ORDER BY u.last_seen DESC
+        """)
+        rows = []
+        for r in cursor.fetchall():
+            d = dict(r)
+            d["queries_active"] = int(d.get("queries_active") or 0)
+            d["queries_total"] = int(d.get("queries_total") or 0)
+            d["favorites_count"] = int(d.get("favorites_count") or 0)
+            d["paused"] = is_user_monitoring_paused(d["chat_id"], db_path=db_path)
+            rows.append(d)
+        return rows
 
 
 def get_favorites_count(chat_id: int, db_path: Optional[str] = None) -> int:
@@ -766,7 +966,7 @@ def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
         cursor = conn.cursor()
         
         # Queries
-        cursor.execute("SELECT chat_id, name, params_json, is_active FROM queries")
+        cursor.execute("SELECT chat_id, name, params_json, meta_json, is_active FROM queries")
         queries = []
         for r in cursor.fetchall():
             try:
@@ -777,6 +977,7 @@ def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
                 "chat_id": r["chat_id"],
                 "name": r["name"],
                 "params": params,
+                "meta": _parse_json_dict(r["meta_json"] if "meta_json" in r.keys() else None),
                 "is_active": r["is_active"]
             })
             
@@ -805,7 +1006,11 @@ def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
         blacklisted_sellers = [dict(r) for r in cursor.fetchall()]
 
         # Favorites
-        cursor.execute("SELECT chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at FROM favorites")
+        cursor.execute(
+            "SELECT chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, "
+            "COALESCE(status, '') as status, COALESCE(note, '') as note, COALESCE(is_closed, 0) as is_closed, created_at "
+            "FROM favorites"
+        )
         favorites = [dict(r) for r in cursor.fetchall()]
 
         return {
@@ -863,6 +1068,7 @@ def import_database_state(state: Dict[str, Any], db_path: Optional[str] = None) 
             cid = q.get("chat_id")
             name = q.get("name")
             params = q.get("params", {})
+            meta = q.get("meta") if isinstance(q.get("meta"), dict) else {}
             if name in ("PlayStation 5 Slim", "PlayStation Slim"):
                 continue
             if (cid, name) in deleted_set:
@@ -874,14 +1080,14 @@ def import_database_state(state: Dict[str, Any], db_path: Optional[str] = None) 
                 )
                 if not cursor.fetchone():
                     cursor.execute(
-                        "INSERT INTO queries (chat_id, name, params_json, is_active) VALUES (?, ?, ?, ?)",
-                        (cid, name, json.dumps(params), q.get("is_active", 1))
+                        "INSERT INTO queries (chat_id, name, params_json, meta_json, is_active) VALUES (?, ?, ?, ?, ?)",
+                        (cid, name, json.dumps(params), json.dumps(meta), q.get("is_active", 1))
                     )
                     imported_queries += 1
                 else:
                     cursor.execute(
-                        "UPDATE queries SET is_active = ? WHERE chat_id = ? AND name = ?",
-                        (q.get("is_active", 1), cid, name)
+                        "UPDATE queries SET is_active = ?, meta_json = COALESCE(NULLIF(?, '{}'), meta_json) WHERE chat_id = ? AND name = ?",
+                        (q.get("is_active", 1), json.dumps(meta), cid, name)
                     )
 
         # Import Blacklist
@@ -927,9 +1133,23 @@ def import_database_state(state: Dict[str, Any], db_path: Optional[str] = None) 
             ad_id = f.get("ad_id")
             if cid and ad_id:
                 cursor.execute(
-                    "INSERT OR REPLACE INTO favorites (chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
-                    (cid, int(ad_id), f.get("title", ""), f.get("price_byn"), f.get("price_usd"), f.get("ad_link", ""), f.get("seller_name", ""), f.get("image_url", ""), f.get("created_at"))
+                    "INSERT OR REPLACE INTO favorites "
+                    "(chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, status, note, is_closed, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+                    (
+                        cid,
+                        int(ad_id),
+                        f.get("title", ""),
+                        f.get("price_byn"),
+                        f.get("price_usd"),
+                        f.get("ad_link", ""),
+                        f.get("seller_name", ""),
+                        f.get("image_url", ""),
+                        f.get("status", ""),
+                        f.get("note", ""),
+                        int(f.get("is_closed") or 0),
+                        f.get("created_at"),
+                    )
                 )
                 imported_favs += 1
 

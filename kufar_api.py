@@ -218,6 +218,11 @@ BOT_INTERNAL_KEYS = {
     "min_price",
     "max_price",
     "stop_words",
+    "plus_words",
+    "only_bargain_pct",
+    "private_only",
+    "silent_query",
+    "meta",
     "ad_id",
     "category_name",
     "region_name",
@@ -563,6 +568,58 @@ def fetch_ad_photos(ad_id: int, timeout: int = 5) -> List[str]:
     """Fetches full list of photo URLs from Kufar item page."""
     _, photos = fetch_ad_details(ad_id, timeout=timeout)
     return photos
+
+
+def fetch_ad_live_state(ad_id: int, timeout: int = 6) -> Dict[str, Any]:
+    """
+    Checks live status and current price of an ad on Kufar.
+    Returns dict with keys: checked (bool), closed (bool), price_byn, price_usd.
+    Never marks closed=True on transient network timeouts.
+    """
+    url = f"https://www.kufar.by/item/{ad_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Referer": "https://www.kufar.by/",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            final_url = r.geturl() or ""
+            if "/item/" not in final_url:
+                return {"checked": True, "closed": True, "price_byn": None, "price_usd": None}
+            html_text = r.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            return {"checked": True, "closed": True, "price_byn": None, "price_usd": None}
+        return {"checked": False, "closed": False, "price_byn": None, "price_usd": None}
+    except Exception:
+        return {"checked": False, "closed": False, "price_byn": None, "price_usd": None}
+
+    price_byn: Optional[float] = None
+    price_usd: Optional[float] = None
+    m_next = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, re.S)
+    if m_next:
+        try:
+            nd = json.loads(m_next.group(1))
+            ad_view = nd.get("props", {}).get("initialState", {}).get("adView", {}).get("data", {})
+            if not ad_view or ad_view.get("is_active") is False or ad_view.get("status") in ("removed", "sold", "inactive"):
+                return {"checked": True, "closed": True, "price_byn": None, "price_usd": None}
+            pb = ad_view.get("price_byn")
+            pu = ad_view.get("price_usd")
+            if pb and str(pb).isdigit():
+                price_byn = round(int(pb) / 100, 2)
+            if pu and str(pu).isdigit():
+                price_usd = round(int(pu) / 100, 2)
+        except Exception:
+            pass
+
+    if "Объявление не найдено" in html_text or "Объявление удалено" in html_text:
+        return {"checked": True, "closed": True, "price_byn": None, "price_usd": None}
+
+    return {"checked": True, "closed": False, "price_byn": price_byn, "price_usd": price_usd}
 
 
 def extract_phone_from_text(text: str) -> Optional[str]:

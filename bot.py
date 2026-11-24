@@ -73,7 +73,11 @@ from database import (
     is_in_silent_hours,
     set_user_monitoring_paused,
     is_user_monitoring_paused,
-    toggle_query_active
+    toggle_query_active,
+    update_favorite_price_state,
+    get_all_favorites,
+    record_price_history,
+    get_admin_users_overview,
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -81,6 +85,7 @@ from kufar_api import (
     fetch_ad_details,
     fetch_ad_description,
     fetch_ad_photos,
+    fetch_ad_live_state,
     extract_phone_from_text,
     fetch_ad_phone_with_token
 )
@@ -121,6 +126,55 @@ USER_STATES: Dict[int, Dict[str, Any]] = {}
 PENDING_QUERIES: Dict[str, Dict[str, Any]] = {}
 STOP_OUTPUT_REQUESTED: Set[int] = set()
 ACTIVE_BATCH_CHATS: Set[int] = set()
+
+# Recent API health / cycle events for Admin Status dashboard
+API_HEALTH_EVENTS: List[Dict[str, str]] = []
+LAST_PH_SNAPSHOT: Dict[int, float] = {}
+LAST_FAVS_TRACK_TS: float = 0.0
+
+
+def record_api_event(level: str, message: str):
+    """Records a compact timestamped runtime/API event for admin monitoring."""
+    minsk_tz = timezone(timedelta(hours=3))
+    ts = datetime.now(minsk_tz).strftime("%H:%M:%S")
+    API_HEALTH_EVENTS.append({"time": ts, "level": level, "message": message[:160]})
+    if len(API_HEALTH_EVENTS) > 25:
+        del API_HEALTH_EVENTS[:-25]
+
+
+def evaluate_query_meta_for_ad(
+    ad: Dict[str, Any],
+    meta: Optional[Dict[str, Any]],
+    market_median: Optional[float] = None,
+    description: str = ""
+) -> Tuple[bool, List[str]]:
+    """
+    Applies per-query meta rules (private_only, local stop_words, only_bargain_pct)
+    and returns (allowed, matched_plus_words).
+    """
+    if not meta:
+        return True, []
+
+    if meta.get("private_only") and ad.get("company_ad"):
+        return False, []
+
+    text = f"{ad.get('subject', '')} {description or ad.get('description', '')}".lower()
+    local_stops = [str(w).strip().lower() for w in (meta.get("stop_words") or []) if str(w).strip()]
+    if local_stops and any(sw in text for sw in local_stops):
+        return False, []
+
+    min_bargain = int(meta.get("only_bargain_pct") or 0)
+    price_byn = ad.get("price_byn")
+    if min_bargain > 0:
+        if not market_median or not price_byn or price_byn <= 0:
+            return False, []
+        diff_pct = ((price_byn - market_median) / market_median) * 100.0
+        if diff_pct > -min_bargain:
+            return False, []
+
+    plus_words = [str(w).strip().lower() for w in (meta.get("plus_words") or []) if str(w).strip()]
+    matched_plus = [pw for pw in plus_words if pw in text]
+    return True, matched_plus
 
 CATEGORIES = [
     ("5040", "Приставки и игры"),
@@ -294,6 +348,9 @@ def start_health_server(port: int):
             "send_query_ads_to_chat": lambda cid, qid: output_ads_for_query(GLOBAL_TG, cid, qid, background=True) if GLOBAL_TG else None,
             "send_all_ads_to_chat": lambda cid: output_all_user_ads(GLOBAL_TG, cid, background=True) if GLOBAL_TG else None,
             "send_single_ad_to_chat": lambda cid, ad, qn, med: send_ad_notification(GLOBAL_TG, cid, ad, qn, market_median=med) if GLOBAL_TG else False,
+            "get_api_events": lambda: list(reversed(API_HEALTH_EVENTS)),
+            "sync_cloud_backup_now": lambda: sync_backup_to_telegram(GLOBAL_TG, GLOBAL_CONFIG, force_notify=False) if (GLOBAL_TG and GLOBAL_CONFIG) else None,
+            "evaluate_query_meta": evaluate_query_meta_for_ad,
             "categories": CATEGORIES,
             "regions": REGIONS,
         }
@@ -596,6 +653,8 @@ def format_ad_caption(
         lines.append(f"\n{note_line}")
 
     smart_badges = extract_smart_badges(ad.get("subject", ""), description)
+    if ad.get("_matched_plus"):
+        lines.append("\n<b>Совпадение по словам:</b> " + ", ".join(html.escape(w) for w in ad["_matched_plus"]))
     if smart_badges:
         lines.append("\n<b>Комплект / детали:</b> " + " · ".join(smart_badges))
 
@@ -665,7 +724,8 @@ def send_ad_notification(
     update_type: str = "new",
     old_price_byn: Optional[float] = None,
     new_price_byn: Optional[float] = None,
-    market_median: Optional[float] = None
+    market_median: Optional[float] = None,
+    query_meta: Optional[Dict[str, Any]] = None
 ) -> bool:
     """
     Sends notification with ALL photos immediately (native media group album + compact control card),
@@ -697,7 +757,7 @@ def send_ad_notification(
                     image_urls.append(u)
             ad["image_urls"] = image_urls
 
-    # Check stop-words (negative keywords)
+    # Check global and per-query stop-words + plus-words
     stop_words = get_stop_words(chat_id)
     if stop_words:
         check_text = f"{ad.get('subject', '')} {description or ''}".lower()
@@ -705,6 +765,15 @@ def send_ad_notification(
             if sw in check_text:
                 logger.info(f"Ad {ad_id} matches stop-word '{sw}', skipping")
                 return False
+
+    meta_ok, matched_plus = evaluate_query_meta_for_ad(
+        ad, query_meta, market_median=market_median, description=description or ""
+    )
+    if not meta_ok:
+        logger.info(f"Ad {ad_id} filtered out by query-level rules for '{query_name}'")
+        return False
+    if matched_plus:
+        ad["_matched_plus"] = matched_plus
 
     AD_DATA_CACHE[ad_id] = ad
     if len(AD_DATA_CACHE) > 1000:
@@ -729,7 +798,7 @@ def send_ad_notification(
         for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
             AD_MESSAGES_MAP.pop(old_k, None)
 
-    disable_notif = is_in_silent_hours(chat_id)
+    disable_notif = is_in_silent_hours(chat_id) or (bool((query_meta or {}).get("silent_query")) and not ad.get("_matched_plus"))
 
     # 1. Multiple photos: send ALL photos immediately as native Telegram album(s)
     if len(image_urls) > 1:
@@ -826,6 +895,7 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
         return 0
     name = query["name"]
     params = query["params"]
+    meta = query.get("meta") or {}
 
     # 1. Parse user's desired budget range
     min_budget, max_budget = parse_price_range(params.get("prc"))
@@ -845,6 +915,7 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
         ads = fetch_ads(api_params)
     except Exception as e:
         logger.error(f"Error fetching ads for query '{name}': {e}")
+        record_api_event("error", f"Ошибка Kufar для '{name}': {e}")
         return 0
 
     if not ads:
@@ -860,6 +931,15 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
 
     bl = get_user_blacklist(chat_id)
     market_median = calculate_market_stats(ads)
+
+    # Save daily price history snapshot at most once every 10 minutes per query
+    now_ts = time.time()
+    if market_median is not None and now_ts - LAST_PH_SNAPSHOT.get(qid, 0) >= 600:
+        prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
+        if len(prices) >= 3:
+            record_price_history(qid, market_median, min(prices), max(prices), len(ads))
+            LAST_PH_SNAPSHOT[qid] = now_ts
+
     sent_count = 0
 
     for ad in reversed(ads):
@@ -887,12 +967,20 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
             # Always record current price in DB
             mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
 
-            # Only notify if within user's budget
-            if is_within_budget:
+            meta_allowed, matched_plus = evaluate_query_meta_for_ad(ad, meta, market_median=market_median)
+            if is_within_budget and meta_allowed:
+                if matched_plus:
+                    ad["_matched_plus"] = matched_plus
                 try:
-                    if send_ad_notification(tg, chat_id, ad, name, update_type="new", market_median=market_median):
+                    if send_ad_notification(
+                        tg, chat_id, ad, name,
+                        update_type="new",
+                        market_median=market_median,
+                        query_meta=meta
+                    ):
                         sent_count += 1
                         NEW_ADS_FOUND += 1
+                        record_api_event("ok", f"Отправлено [{name}]: {ad.get('subject', '')[:40]}")
                         time.sleep(1.0)
                 except Exception as e:
                     logger.error(f"Error sending ad notification: {e}")
@@ -907,26 +995,26 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
 
                     should_notify = False
                     if diff > 0:
-                        # Price INCREASED! (e.g. 2100 -> 2500 BYN)
-                        # Notify if it was previously within budget (user received it before)
                         if max_budget is None or last_byn <= max_budget:
                             should_notify = True
                             logger.info(f"Price RAISED for ad {ad_id}: {last_byn} -> {curr_byn} BYN (+{diff})!")
                     else:
-                        # Price DECREASED! (e.g. 2500 -> 1950 BYN or 2100 -> 1900 BYN)
-                        # Notify if new price is within user's budget
                         if max_budget is None or curr_byn <= max_budget:
                             should_notify = True
                             logger.info(f"Price DROPPED for ad {ad_id}: {last_byn} -> {curr_byn} BYN ({diff})!")
 
-                    if should_notify:
+                    meta_allowed, matched_plus = evaluate_query_meta_for_ad(ad, meta, market_median=market_median)
+                    if should_notify and meta_allowed:
+                        if matched_plus:
+                            ad["_matched_plus"] = matched_plus
                         try:
                             if send_ad_notification(
                                 tg, chat_id, ad, name,
                                 update_type="price_change",
                                 old_price_byn=last_byn,
                                 new_price_byn=curr_byn,
-                                market_median=market_median
+                                market_median=market_median,
+                                query_meta=meta
                             ):
                                 sent_count += 1
                                 NEW_ADS_FOUND += 1
@@ -935,16 +1023,64 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
                             logger.error(f"Error sending price update notification: {e}")
 
             elif last_byn is None and curr_byn is not None:
-                # Was previously without price recorded in DB, silently update price
                 mark_ad_seen(qid, ad_id, price_byn=curr_byn, price_usd=curr_usd)
 
     return sent_count
 
 
+def check_favorites_tracker(tg: TelegramClient):
+    """Periodically checks saved favorites for price drops or listing removal/sold status."""
+    favs = [f for f in get_all_favorites() if not f.get("is_closed")]
+    for fav in favs[:15]:
+        if STOP_EVENT.is_set():
+            break
+        chat_id = fav["chat_id"]
+        ad_id = fav["ad_id"]
+        title = html.escape((fav.get("title") or f"Объявление #{ad_id}")[:80])
+        ad_link = fav.get("ad_link") or f"https://www.kufar.by/item/{ad_id}"
+        live = fetch_ad_live_state(ad_id)
+        if not live.get("checked"):
+            time.sleep(0.5)
+            continue
+
+        if live.get("closed"):
+            update_favorite_price_state(chat_id, ad_id, is_closed=1)
+            msg = (
+                f"<b>Избранное — лот снят или продан</b>\n"
+                f"{title}\n"
+                f"<a href=\"{html.escape(ad_link)}\">Проверить на Kufar</a>"
+            )
+            try:
+                tg.send_message(chat_id, msg, disable_notification=is_in_silent_hours(chat_id))
+            except Exception:
+                pass
+        else:
+            old_byn = fav.get("price_byn")
+            new_byn = live.get("price_byn")
+            new_usd = live.get("price_usd")
+            if new_byn is not None and old_byn is not None and (old_byn - new_byn) >= 1.0:
+                update_favorite_price_state(chat_id, ad_id, price_byn=new_byn, price_usd=new_usd, is_closed=0)
+                diff = old_byn - new_byn
+                msg = (
+                    f"<b>Избранное — цена снижена (-{diff:,.0f} BYN)</b>\n"
+                    f"<b>{title}</b>\n"
+                    f"<b>{new_byn:,.0f} BYN</b> <s>{old_byn:,.0f} BYN</s>\n"
+                    f"<a href=\"{html.escape(ad_link)}\">Открыть объявление</a>"
+                ).replace(",", " ")
+                try:
+                    tg.send_message(chat_id, msg, disable_notification=is_in_silent_hours(chat_id))
+                except Exception:
+                    pass
+            else:
+                update_favorite_price_state(chat_id, ad_id, price_byn=new_byn, price_usd=new_usd, is_closed=0)
+        time.sleep(1.0)
+
+
 def hunter_loop(tg: TelegramClient, config: dict):
     """Background monitoring loop."""
-    global TOTAL_CHECKS
+    global TOTAL_CHECKS, LAST_FAVS_TRACK_TS
     logger.info("Kufar Hunter loop started.")
+    record_api_event("info", "Фоновый мониторинг запущен")
 
     while not STOP_EVENT.is_set():
         interval = config.get("check_interval_seconds", 60)
@@ -959,10 +1095,20 @@ def hunter_loop(tg: TelegramClient, config: dict):
                         check_single_query(tg, q)
                     except Exception as e:
                         logger.error(f"Error checking query '{q['name']}': {e}")
+                        record_api_event("error", f"Исключение '{q['name']}': {e}")
                     time.sleep(2.0)
                 TOTAL_CHECKS += 1
+
+            now_ts = time.time()
+            if now_ts - LAST_FAVS_TRACK_TS >= 900:
+                LAST_FAVS_TRACK_TS = now_ts
+                try:
+                    check_favorites_tracker(tg)
+                except Exception as e:
+                    logger.error(f"Error in favorites tracker: {e}")
         except Exception as e:
             logger.error(f"Unexpected error in hunter loop: {e}")
+            record_api_event("error", f"Цикл: {e}")
 
         FORCE_CHECK_EVENT.wait(timeout=interval)
         FORCE_CHECK_EVENT.clear()
@@ -1288,6 +1434,7 @@ def _run_batch_ad_output(
             qid = q["id"]
             q_name = q["name"]
             params = dict(q["params"])
+            q_meta = q.get("meta") or {}
             min_budget, max_budget = parse_price_range(params.get("prc"))
             api_params = dict(params)
             api_params["size"] = "50"
@@ -1312,11 +1459,16 @@ def _run_batch_ad_output(
                     continue
                 if not _passes_budget_and_title_filters(chat_id, ad, min_budget, max_budget, bl, stop_words):
                     continue
+                meta_ok, matched_plus = evaluate_query_meta_for_ad(ad, q_meta, market_median=q_median)
+                if not meta_ok:
+                    continue
+                if matched_plus:
+                    ad["_matched_plus"] = matched_plus
 
                 seen_in_run.add(ad_id)
                 mark_ad_seen(qid, ad_id, price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
                 try:
-                    if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
+                    if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median, query_meta=q_meta):
                         total_shown += 1
                         shown_for_query += 1
                         for _ in range(4):
