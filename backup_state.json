@@ -1,14 +1,15 @@
 {
   "version": 1,
-  "exported_at": "2026-11-24T16:28:08.662464",
+  "exported_at": "2026-11-24T16:46:50.660134",
   "queries": [
     {
       "chat_id": 747868993,
-      "name": "Куфар поиск",
+      "name": "🎮 Приставки и игры",
       "params": {
+        "cat": "5040",
         "prc": "r:150000,220000",
-        "sort": "lst.d",
         "rgn": "7",
+        "sort": "lst.d",
         "size": "30"
       },
       "is_active": 1

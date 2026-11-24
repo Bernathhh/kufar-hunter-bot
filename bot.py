@@ -120,12 +120,15 @@ PENDING_QUERIES: Dict[str, Dict[str, Any]] = {}
 CATEGORIES = [
     ("5040", "🎮 Приставки и игры"),
     ("17010", "📱 Мобильные телефоны"),
-    ("16000", "💻 Компьютеры и электроника"),
+    ("16000", "💻 Компьютерная техника"),
+    ("16040", "💻 Ноутбуки"),
+    ("5000", "🔌 Электроника"),
+    ("15000", "🧺 Бытовая техника"),
     ("2000", "🚗 Авто и запчасти"),
     ("1000", "🏠 Недвижимость"),
-    ("5000", "🔌 Бытовая техника"),
-    ("4000", "🛋 Мебель и интерьер"),
-    ("all", "📦 Любая категория")
+    ("21000", "🛋 Мебель и интерьер"),
+    ("4000", "⚽ Хобби, спорт, туризм"),
+    ("all", "📦 Все категории")
 ]
 
 REGIONS = [
@@ -1483,12 +1486,36 @@ def show_template_menu(tg: TelegramClient, chat_id: int):
 def handle_link_submission(tg: TelegramClient, chat_id: int, url: str):
     """Parses a Kufar URL submitted by the user and asks for confirmation."""
     params = parse_kufar_url_or_query(url)
+
+    # Protection against empty-category and empty-query searches (e.g. searching all of Kufar)
+    cat_id = params.get("cat")
+    query_str = params.get("query")
+
+    if not query_str and (not cat_id or str(cat_id) == "all"):
+        text = (
+            "⚠️ <b>В этой ссылке не указана категория и нет поисковых слов!</b>\n\n"
+            "Задан только регион и/или цена. Если запустить поиск без категории, "
+            "бот будет присылать <b>абсолютно все новые объявления подряд</b> (мебель, квартиры, одежду, запчасти и т.д.)!\n\n"
+            "👉 <b>Выберите нужную категорию кнопкой ниже</b> или отправьте ссылку на конкретную категорию на Куфаре (например: <i>Приставки и игры</i>, <i>Ноутбуки</i>):"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "🎮 Игры и приставки", "callback_data": "cb:cat_fix:5040"}],
+                [{"text": "📱 Телефоны", "callback_data": "cb:cat_fix:17010"}],
+                [{"text": "💻 Ноутбуки и ПК", "callback_data": "cb:cat_fix:16000"}],
+                [{"text": "🔌 Вся электроника", "callback_data": "cb:cat_fix:5000"}],
+                [{"text": "🔙 Отмена", "callback_data": "cb:menu"}]
+            ]
+        }
+        USER_STATES[chat_id] = {"step": "WAIT_CAT_FIX", "params": params}
+        tg.send_message(chat_id, text, reply_markup=markup)
+        return
+
     ads = fetch_ads(params)
     count = len(ads)
 
     query_name = params.get("query")
     if not query_name:
-        cat_id = params.get("cat")
         cat_name = dict(CATEGORIES).get(str(cat_id), "Куфар поиск")
         query_name = cat_name
 
@@ -1734,6 +1761,38 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
 
     elif data == "cb:wiz_skip_price":
         wizard_finish(tg, chat_id)
+
+    elif data.startswith("cb:cat_fix:"):
+        cat_id = data.split(":")[-1]
+        state = USER_STATES.pop(chat_id, {})
+        params = state.get("params", {})
+        params["cat"] = cat_id
+        ads = fetch_ads(params)
+        count = len(ads)
+        cat_name = dict(CATEGORIES).get(str(cat_id), "Поиск товаров")
+        query_name = params.get("query") or cat_name
+
+        pending_id = f"p_{int(time.time())}"
+        PENDING_QUERIES[pending_id] = {
+            "chat_id": chat_id,
+            "name": query_name,
+            "params": params,
+            "initial_ads": [a["ad_id"] for a in ads]
+        }
+        text = (
+            f"🔎 <b>Распознаны фильтры Куфара 1 в 1:</b>\n\n"
+            f"🏷 <b>Название:</b> {html.escape(query_name)}\n\n"
+            f"{format_params_human(params)}\n\n"
+            f"📊 <b>Найдено сейчас на сайте:</b> {count} объявлений\n\n"
+            f"Запустить отслеживание новых объявлений по этим фильтрам?"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "✅ Подтвердить и запустить", "callback_data": f"cb:confirm:{pending_id}"}],
+                [{"text": "❌ Отмена", "callback_data": f"cb:cancel:{pending_id}"}]
+            ]
+        }
+        tg.send_message(chat_id, text, reply_markup=markup)
 
     elif data.startswith("cb:confirm:"):
         pending_id = data.split(":")[-1]

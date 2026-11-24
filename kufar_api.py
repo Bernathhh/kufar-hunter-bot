@@ -22,22 +22,160 @@ USER_AGENT = (
 REGIONS_MAP = {
     "brest": "1",
     "brest-obl": "1",
+    "brestskaya-oblast": "1",
     "gomel": "2",
     "gomel-obl": "2",
+    "gomelskaya-oblast": "2",
     "grodno": "3",
     "grodno-obl": "3",
+    "grodnenskaya-oblast": "3",
     "mogilev": "4",
     "mogilev-obl": "4",
+    "mogilevskaya-oblast": "4",
     "minsk-obl": "5",
+    "minskaya-oblast": "5",
     "vitebsk": "6",
     "vitebsk-obl": "6",
+    "vitebskaya-oblast": "6",
     "minsk": "7",
+}
+
+CATEGORY_SLUGS_MAP = {
+    # Gaming & Consoles (5040)
+    "igry-i-pristavki": "5040",
+    "pristavki-i-igry": "5040",
+    "pristavki": "5040",
+    "igrovye-pristavki": "5040",
+    "igry-dlya-pristavok": "5040",
+    "konsoli": "5040",
+    "gejmpady-i-aksessuary": "5040",
+
+    # Electronics (5000)
+    "elektronika": "5000",
+    "audiotehnika": "5020",
+    "audio-tehnika": "5020",
+    "akustika-i-kolonki": "5020",
+    "tv-i-videotehnika": "5060",
+    "tv-i-video": "5060",
+    "televizory": "5060",
+    "fototehnika-i-optika": "5070",
+    "fotoapparaty": "5070",
+
+    # Computers & Laptops (16000)
+    "kompyuternaya-tehnika": "16000",
+    "noutbuki": "16040",
+    "kompyutery": "16020",
+    "kompyutery-sistemnye-bloki": "16020",
+    "sistemnye-bloki": "16020",
+    "monitory": "16030",
+    "komplektuyushchie": "16010",
+    "videokarty": "16010",
+    "processory": "16010",
+    "materinskie-platy": "16010",
+    "nakopiteli-ssd-hdd": "16010",
+    "periferiya-i-aksessuary": "16060",
+    "klaviatury-i-myshi": "16060",
+    "orgtehnika": "16050",
+    "printery-i-mfo": "16050",
+    "setevoe-oborudovanie": "16070",
+
+    # Phones & Tablets (17000)
+    "telefony-i-planshety": "17000",
+    "mobilnye-telefony": "17010",
+    "smartfony": "17010",
+    "planshety": "17050",
+    "umnye-chasy": "17090",
+    "umnye-chasy-i-fitnes-braslety": "17090",
+    "naushniki": "17100",
+    "aksessuary-dlya-telefonov": "17030",
+    "komplektuyushchie-dlya-telefonov": "17020",
+    "elektronnye-knigi": "17070",
+
+    # Appliances (15000)
+    "bytovaya-tehnika": "15000",
+    "tehnika-dlya-kuhni": "15010",
+    "krupnaya-tehnika-dlya-kuhni": "15020",
+    "holodilniki": "15020",
+    "stiralnye-mashiny": "15040",
+    "pylesosy": "15030",
+    "klimaticheskaya-tehnika": "15050",
+
+    # Auto & Transport (2000)
+    "avto-i-zapchasti": "2000",
+    "avto": "2000",
+    "legkovye-avto": "2010",
+    "avtomobili": "2010",
+    "zapchasti": "2040",
+    "mototehnika": "2030",
+    "motocikly": "2030",
+    "shiny-diski": "2075",
+    "kolesa-i-shiny": "2075",
+
+    # Real Estate (1000)
+    "nedvizhimost": "1000",
+    "kvartiry": "1010",
+    "snjat-kvartiru": "1010",
+    "kupit-kvartiru": "1010",
+    "komnaty": "1040",
+    "doma-dachi-kottedzhi": "1020",
+    "garazhi-i-stoyanki": "1030",
+    "uchastki": "1080",
+    "kommercheskaya-nedvizhimost": "1050",
+
+    # Furniture (21000)
+    "mebel": "21000",
+    "stoly": "21120",
+    "stoly-i-obedennye-gruppy": "21120",
+    "stulya": "21130",
+    "divany": "21070",
+    "myagkaya-mebel": "21070",
+    "shkafy": "21150",
+    "krovati-matrasy": "21040",
+    "kuhni": "21050",
+    "komody": "21030",
+
+    # Clothing & Wardrobe (8000, 19000)
+    "zhenskij-garderob": "8000",
+    "muzhskoj-garderob": "19000",
+    "zhenskaya-odezhda": "8080",
+    "muzhskaya-odezhda": "19010",
+    "zhenskaya-obuv": "8100",
+    "muzhskaya-obuv": "19020",
+
+    # Sports & Hobbies (4000)
+    "hobbi-sport-i-turizm": "4000",
+    "sporttovary": "4020",
+    "velosport": "4050",
+    "velosipedy": "4050",
+    "elektrotransport": "4160",
+    "samokaty": "4160",
+    "antikvariat": "4030",
+    "muzykalnye-instrumenty": "4070",
+
+    # Renovation & Tools (14000)
+    "remont-i-strojka": "14000",
+    "stroitelnyj-instrument": "14010",
+    "elektroinstrument": "14010",
+
+    # Kids (12000)
+    "vse-dlya-detej-i-mam": "12000",
+    "detskie-kolyaski": "12040",
+    "detskaya-odezhda": "12010",
+
+    # Animals (11000)
+    "zhivotnye": "11000",
+    "sobaki": "11010",
+    "koshki": "11010",
+
+    # Services (13000)
+    "uslugi": "13000",
+    "arenda-i-prokat": "13300",
 }
 
 def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
     """
-    Parses either a full Kufar URL (e.g. https://www.kufar.by/l/r~minsk/noutbuki?query=macbook)
-    or a natural search query string with optional price range (e.g. 'iphone 13 800 1500', 'rtx 4070 до 2000').
+    Parses either a full Kufar URL (e.g. https://www.kufar.by/l/r~minsk/pristavki-i-igry?prc=r:150000,220000)
+    or a natural search query string with optional price range (e.g. 'iphone 13 800 1500', 'ps5 1500 2200').
     """
     input_str = input_str.strip()
     
@@ -50,21 +188,47 @@ def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
         query_dict = urllib.parse.parse_qs(parsed.query)
         
         # Flatten query parameters and filter out web-only analytics/tracking params
-        IGNORE_PARAMS = {"r_pagetype", "searchid", "block_name", "page", "rank", "total_rank"}
+        IGNORE_PARAMS = {"r_pagetype", "searchid", "block_name", "page", "rank", "total_rank", "elementtype"}
         params = {}
         for k, v in query_dict.items():
             k_lower = k.lower()
             if k_lower.startswith("utm_") or k_lower.startswith("r_") or k_lower in IGNORE_PARAMS:
                 continue
             params[k] = v[0]
+
+        # Alias query parameters
+        if "q" in params and "query" not in params:
+            params["query"] = params.pop("q")
+        if "ot" in params and "query" not in params:
+            params["query"] = params.pop("ot")
+        if "search" in params and "query" not in params:
+            params["query"] = params.pop("search")
+        if "category" in params and "cat" not in params:
+            params["cat"] = params.pop("category")
         
-        # Parse path for region prefix, e.g. /l/r~minsk/...
+        # Parse path for region and category slugs, e.g. /l/r~minsk/pristavki-i-igry or /l/minsk/noutbuki
         path_parts = [p for p in parsed.path.split("/") if p and p != "l"]
         for part in path_parts:
-            if part.startswith("r~"):
-                region_slug = part[2:].lower()
-                if region_slug in REGIONS_MAP:
-                    params["rgn"] = REGIONS_MAP[region_slug]
+            part_lower = part.lower().strip()
+
+            # 1. Check for region prefix or exact region name (e.g. r~minsk or minsk)
+            region_slug = part_lower[2:] if part_lower.startswith("r~") else part_lower
+            if region_slug in REGIONS_MAP and "rgn" not in params:
+                params["rgn"] = REGIONS_MAP[region_slug]
+                continue
+
+            # 2. Check for category slug in path (e.g. pristavki-i-igry, noutbuki, mebel)
+            if part_lower in CATEGORY_SLUGS_MAP and "cat" not in params:
+                params["cat"] = CATEGORY_SLUGS_MAP[part_lower]
+                continue
+
+            # 3. Check for SEO landing URL, e.g. /l/kupit-playstation-5
+            if part_lower.startswith("kupit-") and "query" not in params:
+                raw_kw = part_lower[len("kupit-"):].replace("-", " ")
+                # Strip out common noise like 'pristavku' if followed by brand
+                cleaned_kw = re.sub(r'^(?:pristavku|noutbuk|telefon|avtomobil)\s+', '', raw_kw, flags=re.IGNORECASE)
+                params["query"] = cleaned_kw.strip() if cleaned_kw.strip() else raw_kw.strip()
+                continue
         
         # Ensure newest first and default page size
         if "sort" not in params:
