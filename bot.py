@@ -16,6 +16,7 @@ import socketserver
 import re
 import statistics
 import signal
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -77,6 +78,7 @@ from database import (
 from kufar_api import (
     parse_kufar_url_or_query,
     fetch_ads,
+    fetch_ad_details,
     fetch_ad_description,
     fetch_ad_photos,
     extract_phone_from_text,
@@ -117,6 +119,7 @@ AD_MESSAGES_MAP: Dict[Tuple[int, int], List[int]] = {}
 USER_STATES: Dict[int, Dict[str, Any]] = {}
 PENDING_QUERIES: Dict[str, Dict[str, Any]] = {}
 STOP_OUTPUT_REQUESTED: Set[int] = set()
+ACTIVE_BATCH_CHATS: Set[int] = set()
 
 CATEGORIES = [
     ("5040", "🎮 Приставки и игры"),
@@ -153,8 +156,8 @@ def get_main_keyboard(chat_id: int = 0) -> Dict[str, Any]:
             [{"text": "📦 Вывести всё"}, {"text": "⭐️ Избранное"}],
             [pause_btn, {"text": "🌙 Ночной режим"}],
             [{"text": "⛔ Стоп-слова"}, {"text": "💬 Мой шаблон"}],
-            [{"text": "⏱ Интервал"}, {"text": "📊 Статистика"}],
-            [{"text": "❓ Помощь"}]
+            [{"text": "🚫 Чёрный список"}, {"text": "⏱ Интервал"}],
+            [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
         ],
         "resize_keyboard": True,
         "one_time_keyboard": True
@@ -375,7 +378,7 @@ def parse_price_range(prc_param: Optional[str]) -> Tuple[Optional[float], Option
 def format_params_human(p: Dict[str, Any]) -> str:
     """Formats Kufar search parameters into clear, human-readable Russian text."""
     lines = []
-    
+
     if p.get("query"):
         lines.append(f"🔍 <b>Ключевые слова:</b> <code>{html.escape(p['query'])}</code>")
     else:
@@ -383,24 +386,43 @@ def format_params_human(p: Dict[str, Any]) -> str:
 
     cat_id = str(p.get("cat", ""))
     cat_name = dict(CATEGORIES).get(cat_id, f"Код {cat_id}" if cat_id else "Все категории")
+    cte_map = {"1": "Приставки", "2": "Игры", "3": "Геймпады и аксессуары"}
+    if str(p.get("cte", "")) in cte_map:
+        cat_name += f" ({cte_map[str(p['cte'])]})"
     lines.append(f"📂 <b>Категория:</b> {cat_name}")
 
-    brand = p.get("brand") or ("Sony" if str(p.get("cbc")) == "31" else "")
+    pb_map = {
+        "5": "Apple", "24": "Samsung", "35": "Xiaomi",
+        "11": "Huawei", "12": "Honor", "9": "Google", "20": "OnePlus", "22": "Realme"
+    }
+    cbc_map = {
+        "31": "Sony", "13": "Microsoft Xbox", "17": "Nintendo",
+        "30": "Steam Deck", "27": "Sega", "36": "Anbernic", "14": "Lenovo", "16": "MSI"
+    }
+    brand = p.get("brand") or cbc_map.get(str(p.get("cbc", ""))) or pb_map.get(str(p.get("pb", ""))) or ""
     if brand:
-        lines.append(f"🏷 <b>Производитель:</b> {html.escape(brand)}")
+        lines.append(f"🏷 <b>Производитель:</b> {html.escape(str(brand))}")
+
+    cnd_map = {"1": "Б/у", "2": "Новое"}
+    if str(p.get("cnd", "")) in cnd_map:
+        lines.append(f"✨ <b>Состояние:</b> {cnd_map[str(p['cnd'])]}")
+
+    cmp_map = {"0": "Только частные лица", "1": "Компании / Магазины"}
+    if str(p.get("cmp", "")) in cmp_map:
+        lines.append(f"👤 <b>Продавец:</b> {cmp_map[str(p['cmp'])]}")
 
     rgn_id = str(p.get("rgn", ""))
     rgn_name = dict(REGIONS).get(rgn_id, f"Регион {rgn_id}" if rgn_id else "Вся Беларусь")
     lines.append(f"🏙 <b>Регион:</b> {rgn_name}")
 
     if p.get("ar"):
-        if "22,23,24,25,26,27,28,29,30" in p["ar"]:
+        if "22,23,24,25,26,27,28,29,30" in str(p["ar"]):
             lines.append("📍 <b>Районы:</b> Все 9 районов Минска")
         else:
-            lines.append(f"📍 <b>Районы:</b> <code>{html.escape(p['ar'])}</code>")
+            lines.append(f"📍 <b>Районы:</b> <code>{html.escape(str(p['ar']))}</code>")
 
     if p.get("prc"):
-        prc_str = p["prc"].replace("r:", "")
+        prc_str = str(p["prc"]).replace("r:", "")
         parts = prc_str.split(",")
         if len(parts) == 2:
             try:
@@ -413,11 +435,18 @@ def format_params_human(p: Dict[str, Any]) -> str:
                 elif min_p:
                     lines.append(f"💰 <b>Цена:</b> от <b>{min_p:,} BYN</b>".replace(",", " "))
             except Exception:
-                lines.append(f"💰 <b>Цена:</b> <code>{html.escape(p['prc'])}</code>")
+                lines.append(f"💰 <b>Цена:</b> <code>{html.escape(str(p['prc']))}</code>")
     else:
         lines.append("💰 <b>Цена:</b> Любая")
 
-    lines.append("⚡ <b>Сортировка:</b> Сначала новые (lst.d)")
+    sort_map = {
+        "lst.d": "Сначала новые (lst.d)",
+        "lst.a": "Сначала старые (lst.a)",
+        "prc.a": "Сначала дешёвые (prc.a)",
+        "prc.d": "Сначала дорогие (prc.d)",
+    }
+    sort_val = str(p.get("sort", "lst.d"))
+    lines.append(f"⚡ <b>Сортировка:</b> {sort_map.get(sort_val, sort_val)}")
     return "\n".join(lines)
 
 
@@ -504,7 +533,8 @@ def format_ad_caption(
     update_type: str = "new",
     old_price_byn: Optional[float] = None,
     new_price_byn: Optional[float] = None,
-    market_median: Optional[float] = None
+    market_median: Optional[float] = None,
+    max_desc_len: int = 280
 ) -> str:
     """Creates a sleek, modern HTML caption for the ad, with structured blocks and elegant badges."""
     subject = html.escape(ad.get("subject", "Объявление"))
@@ -595,13 +625,62 @@ def format_ad_caption(
     if smart_badges:
         lines.append(f"\n✨ <b>Особенности & Комплект:</b>\n" + " • ".join(smart_badges))
 
-    if description:
-        clean_desc = html.escape(description.strip())
-        if len(clean_desc) > 300:
-            clean_desc = clean_desc[:300] + "..."
+    if description and max_desc_len > 0:
+        raw_desc = description.strip()
+        if len(raw_desc) > max_desc_len:
+            raw_desc = raw_desc[:max(0, max_desc_len - 3)].rstrip() + "..."
+        clean_desc = html.escape(raw_desc)
         lines.append(f"\n📝 <b>Описание:</b>\n<blockquote>{clean_desc}</blockquote>")
 
     return "\n".join(lines)
+
+
+def _split_album_chunks(urls: List[str]) -> List[List[str]]:
+    """
+    Splits image URLs into Telegram-valid sendMediaGroup chunks (each chunk has 2..10 items,
+    except when total is 1). Avoids a trailing 1-item chunk by borrowing 1 from previous chunk.
+    """
+    if len(urls) <= 10:
+        return [urls]
+    chunks: List[List[str]] = []
+    idx = 0
+    while idx < len(urls):
+        remaining = len(urls) - idx
+        if remaining == 11:
+            chunks.append(urls[idx:idx + 9])
+            idx += 9
+        else:
+            take = min(10, remaining)
+            chunks.append(urls[idx:idx + take])
+            idx += take
+    return chunks
+
+
+def _build_safe_photo_caption(
+    ad: Dict[str, Any],
+    query_name: str,
+    description: str,
+    update_type: str,
+    old_price_byn: Optional[float],
+    new_price_byn: Optional[float],
+    market_median: Optional[float]
+) -> str:
+    """Builds HTML caption guaranteed <= 1020 chars without ever breaking open HTML tags."""
+    for desc_limit in (280, 140, 60, 0):
+        candidate = format_ad_caption(
+            ad, query_name,
+            description=description,
+            update_type=update_type,
+            old_price_byn=old_price_byn,
+            new_price_byn=new_price_byn,
+            market_median=market_median,
+            max_desc_len=desc_limit
+        )
+        if len(candidate) <= 1020:
+            return candidate
+    # Fallback without HTML formatting if somehow header/title alone exceeded 1020 chars
+    plain = re.sub(r'<[^>]+>', '', candidate)
+    return html.escape(plain[:1000] + "...")
 
 
 def send_ad_notification(
@@ -615,28 +694,34 @@ def send_ad_notification(
     market_median: Optional[float] = None
 ) -> bool:
     """
-    Sends unified notification with photo, caption and action buttons attached directly.
-    Supports both new listings and price change updates.
-    - Single unified message: Photo + Full description + Inline buttons directly under it.
-    - If multiple photos: includes «📸 Фото» button to view the full gallery.
-    - Text fallback if no photos available.
+    Sends notification with ALL photos immediately (native media group album + compact control card),
+    or single photo / text fallback when 0-1 photos are present.
     """
     ad_id = ad["ad_id"]
     if is_ad_blacklisted(chat_id, ad_id):
         logger.info(f"Ad {ad_id} is blacklisted by chat {chat_id}, skipping")
         return False
 
-    # Check seller blacklist
     seller_name = ad.get("seller", "")
     account_id = ad.get("account_id")
     if is_seller_blacklisted(chat_id, seller_name, account_id):
         logger.info(f"Seller '{seller_name}' is blacklisted by chat {chat_id}, skipping ad {ad_id}")
         return False
 
+    image_urls = list(ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else []))
     description = ad.get("description")
-    if description is None:
-        description = fetch_ad_description(ad_id)
-        ad["description"] = description
+    if description is None or len(image_urls) <= 1:
+        fetched_desc, fetched_photos = fetch_ad_details(ad_id)
+        if description is None:
+            description = fetched_desc
+            ad["description"] = description
+        if fetched_photos:
+            seen_u = set(image_urls)
+            for u in fetched_photos:
+                if u not in seen_u:
+                    seen_u.add(u)
+                    image_urls.append(u)
+            ad["image_urls"] = image_urls
 
     # Check stop-words (negative keywords)
     stop_words = get_stop_words(chat_id)
@@ -647,23 +732,12 @@ def send_ad_notification(
                 logger.info(f"Ad {ad_id} matches stop-word '{sw}', skipping")
                 return False
 
-    # Cache ad data for quick interactive callbacks (seller blacklist, contact template, favorites)
     AD_DATA_CACHE[ad_id] = ad
     if len(AD_DATA_CACHE) > 1000:
         for old_k in list(AD_DATA_CACHE.keys())[:200]:
             AD_DATA_CACHE.pop(old_k, None)
 
-    caption = format_ad_caption(
-        ad, query_name,
-        description=description,
-        update_type=update_type,
-        old_price_byn=old_price_byn,
-        new_price_byn=new_price_byn,
-        market_median=market_median
-    )
-    image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
     ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
-
     if image_urls:
         AD_PHOTOS_CACHE[ad_id] = image_urls
 
@@ -677,46 +751,61 @@ def send_ad_notification(
         is_fav=is_fav
     )
 
-    # Prune old cache entries to prevent memory growth
     if len(AD_MESSAGES_MAP) > 1000:
         for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
             AD_MESSAGES_MAP.pop(old_k, None)
 
     disable_notif = is_in_silent_hours(chat_id)
 
-    # Send ad card: All photos immediately as album, or single photo, or text fallback
-    if image_urls:
-        photo_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
-
-        # 1. Multiple photos: output all photos immediately as a native media group album
-        if len(image_urls) > 1:
-            media = [
-                {
-                    "type": "photo",
-                    "media": image_urls[0],
-                    "caption": photo_caption,
-                    "parse_mode": "HTML"
-                }
-            ]
-            for u in image_urls[1:10]:
-                media.append({"type": "photo", "media": u})
+    # 1. Multiple photos: send ALL photos immediately as native Telegram album(s)
+    if len(image_urls) > 1:
+        photo_caption = _build_safe_photo_caption(
+            ad, query_name, description or "", update_type,
+            old_price_byn, new_price_byn, market_median
+        )
+        mids: List[int] = []
+        album_ok = True
+        for chunk_idx, chunk in enumerate(_split_album_chunks(image_urls[:20])):
+            media = []
+            for item_idx, u in enumerate(chunk):
+                entry: Dict[str, Any] = {"type": "photo", "media": u}
+                if chunk_idx == 0 and item_idx == 0:
+                    entry["caption"] = photo_caption
+                    entry["parse_mode"] = "HTML"
+                media.append(entry)
 
             res_album = tg.send_media_group(chat_id, media, disable_notification=disable_notif)
             if res_album and isinstance(res_album, list):
-                mids = [m["message_id"] for m in res_album if isinstance(m, dict) and "message_id" in m]
-                # Send compact action bar attached immediately under album
-                res_btn = tg.send_message(
-                    chat_id,
-                    "⚡ <b>Действия с объявлением:</b>",
-                    reply_markup=markup,
-                    disable_notification=disable_notif
-                )
-                if res_btn and isinstance(res_btn, dict) and "message_id" in res_btn:
-                    mids.append(res_btn["message_id"])
-                AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
-                return True
+                mids.extend(m["message_id"] for m in res_album if isinstance(m, dict) and "message_id" in m)
+            else:
+                if chunk_idx == 0:
+                    album_ok = False
+                break
 
-        # 2. Single photo (or fallback if album failed)
+        if album_ok and mids:
+            subj_short = (ad.get("subject") or "Объявление").strip()
+            if len(subj_short) > 48:
+                subj_short = subj_short[:45].rstrip() + "..."
+            p_byn = ad.get("price_byn")
+            price_short = f" • <b>{p_byn:,.0f} BYN</b>".replace(",", " ") if p_byn is not None else ""
+            action_text = f"🎯 <b>{html.escape(subj_short)}</b>{price_short}  <i>(📸 {len(image_urls)} фото)</i>"
+            res_btn = tg.send_message(
+                chat_id,
+                action_text,
+                reply_markup=markup,
+                disable_notification=disable_notif
+            )
+            if res_btn and isinstance(res_btn, dict) and "message_id" in res_btn:
+                mids.append(res_btn["message_id"])
+            AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
+            return True
+
+    # 2. Single photo (or fallback if album upload was rejected)
+    if image_urls:
+        photo_caption = _build_safe_photo_caption(
+            ad, query_name, description or "", update_type,
+            old_price_byn, new_price_byn, market_median
+        )
         res_photo = tg.send_photo(
             chat_id,
             image_urls[0],
@@ -728,7 +817,15 @@ def send_ad_notification(
             AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
             return True
 
-    # 3. Fallback: Text only with buttons attached directly
+    # 3. Text-only fallback
+    caption = format_ad_caption(
+        ad, query_name,
+        description=description or "",
+        update_type=update_type,
+        old_price_byn=old_price_byn,
+        new_price_byn=new_price_byn,
+        market_median=market_median
+    )
     res_msg = tg.send_message(
         chat_id,
         caption,
@@ -1149,11 +1246,146 @@ def notify_admin_new_filter(
             logger.error(f"Error notifying admin of new filter: {e}")
 
 
-def output_all_user_ads(tg: TelegramClient, chat_id: int):
-    """Outputs current listings for all active user searches, respecting blacklisted items."""
+def _passes_budget_and_title_filters(
+    chat_id: int,
+    ad: Dict[str, Any],
+    min_budget: Optional[float],
+    max_budget: Optional[float],
+    bl: Set[int],
+    stop_words: List[str]
+) -> bool:
+    """Quick pre-filter before sending: blacklist, seller blacklist, budget bounds, and title stop-words."""
+    ad_id = ad["ad_id"]
+    if ad_id in bl:
+        return False
+    if is_seller_blacklisted(chat_id, ad.get("seller", ""), ad.get("account_id")):
+        return False
+    curr_byn = ad.get("price_byn")
+    if curr_byn is not None:
+        if max_budget is not None and curr_byn > max_budget:
+            return False
+        if min_budget is not None and curr_byn < min_budget:
+            return False
+    if stop_words:
+        subj_lower = (ad.get("subject") or "").lower()
+        if any(sw in subj_lower for sw in stop_words):
+            return False
+    return True
+
+
+def _run_batch_ad_output(
+    tg: TelegramClient,
+    chat_id: int,
+    queries: List[Dict[str, Any]],
+    header_text: str,
+    empty_text: str,
+    done_text_fn
+):
+    """Shared worker for streaming current ads for one or more queries with instant stop support."""
+    if chat_id in ACTIVE_BATCH_CHATS:
+        tg.send_message(chat_id, "⏳ <b>Вывод объявлений уже выполняется.</b> Нажмите «🛑 Остановить вывод объявлений», чтобы прервать его.")
+        return
+
+    ACTIVE_BATCH_CHATS.add(chat_id)
     STOP_OUTPUT_REQUESTED.discard(chat_id)
-    queries = get_user_queries(chat_id)
-    if not queries:
+    status_msg_id = None
+
+    try:
+        stop_markup = {
+            "inline_keyboard": [
+                [{"text": "🛑 Остановить вывод объявлений", "callback_data": "cb:stop_output"}]
+            ]
+        }
+        status_msg = tg.send_message(chat_id, header_text, reply_markup=stop_markup)
+        if isinstance(status_msg, dict):
+            status_msg_id = status_msg.get("message_id")
+
+        bl = get_user_blacklist(chat_id)
+        stop_words = get_stop_words(chat_id)
+        seen_in_run: Set[int] = set()
+        total_shown = 0
+        stopped_early = False
+
+        for q in queries:
+            if chat_id in STOP_OUTPUT_REQUESTED:
+                stopped_early = True
+                break
+
+            qid = q["id"]
+            q_name = q["name"]
+            params = dict(q["params"])
+            min_budget, max_budget = parse_price_range(params.get("prc"))
+            api_params = dict(params)
+            api_params["size"] = "50"
+
+            try:
+                ads = fetch_ads(api_params)
+            except Exception as e:
+                logger.error(f"Error fetching ads for query {qid}: {e}")
+                continue
+
+            q_median = calculate_market_stats(ads)
+            shown_for_query = 0
+
+            for ad in ads:
+                if chat_id in STOP_OUTPUT_REQUESTED:
+                    stopped_early = True
+                    break
+                if shown_for_query >= 10:
+                    break
+                ad_id = ad["ad_id"]
+                if ad_id in seen_in_run:
+                    continue
+                if not _passes_budget_and_title_filters(chat_id, ad, min_budget, max_budget, bl, stop_words):
+                    continue
+
+                seen_in_run.add(ad_id)
+                mark_ad_seen(qid, ad_id, price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
+                try:
+                    if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
+                        total_shown += 1
+                        shown_for_query += 1
+                        for _ in range(4):
+                            if chat_id in STOP_OUTPUT_REQUESTED:
+                                stopped_early = True
+                                break
+                            time.sleep(0.2)
+                        if stopped_early:
+                            break
+                except Exception as e:
+                    logger.error(f"Error displaying ad {ad_id}: {e}")
+
+            if stopped_early:
+                break
+
+        if status_msg_id:
+            try:
+                tg.delete_message(chat_id, status_msg_id)
+            except Exception:
+                pass
+
+        if stopped_early:
+            STOP_OUTPUT_REQUESTED.discard(chat_id)
+            tg.send_message(
+                chat_id,
+                f"🛑 <b>Вывод объявлений остановлен!</b>\nВсего показано: <b>{total_shown}</b> объявлений.",
+                reply_markup=get_main_keyboard(chat_id)
+            )
+            return
+
+        if total_shown == 0:
+            tg.send_message(chat_id, empty_text, reply_markup=get_main_keyboard(chat_id))
+        else:
+            tg.send_message(chat_id, done_text_fn(total_shown), reply_markup=get_main_keyboard(chat_id))
+    finally:
+        ACTIVE_BATCH_CHATS.discard(chat_id)
+        STOP_OUTPUT_REQUESTED.discard(chat_id)
+
+
+def output_all_user_ads(tg: TelegramClient, chat_id: int, background: bool = True):
+    """Outputs current listings for all active user searches, respecting blacklisted items & stop-words."""
+    all_queries = get_user_queries(chat_id)
+    if not all_queries:
         text = (
             "📭 <b>У вас пока нет активных поисков.</b>\n\n"
             "Нажмите кнопку <b>«➕ Добавить поиск»</b>, чтобы создать первый фильтр!"
@@ -1161,93 +1393,38 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
         tg.send_message(chat_id, text, reply_markup=get_main_keyboard(chat_id))
         return
 
-    stop_markup = {
-        "inline_keyboard": [
-            [{"text": "🛑 Остановить вывод объявлений", "callback_data": "cb:stop_output"}]
-        ]
-    }
-
-    tg.send_message(
-        chat_id,
-        f"🔍 <b>Загружаю актуальные объявления по вашим фильтрам...</b>\n"
-        f"<i>Фильтров: {len(queries)}. Пожалуйста, подождите...</i>",
-        reply_markup=stop_markup
-    )
-
-    bl = get_user_blacklist(chat_id)
-    seen_in_run = set()
-    total_shown = 0
-    stopped_early = False
-
-    for q in queries:
-        if chat_id in STOP_OUTPUT_REQUESTED:
-            stopped_early = True
-            break
-
-        q_name = q["name"]
-        params = q["params"]
-        try:
-            ads = fetch_ads(params)
-        except Exception as e:
-            logger.error(f"Error fetching ads for query {q.get('id')}: {e}")
-            continue
-
-        q_median = calculate_market_stats(ads)
-        valid_ads = [
-            a for a in ads
-            if a["ad_id"] not in bl
-            and a["ad_id"] not in seen_in_run
-            and not is_seller_blacklisted(chat_id, a.get("seller", ""), a.get("account_id"))
-        ]
-        # Show top 10 most recent listings per query
-        for ad in valid_ads[:10]:
-            if chat_id in STOP_OUTPUT_REQUESTED:
-                stopped_early = True
-                break
-            seen_in_run.add(ad["ad_id"])
-            mark_ad_seen(q["id"], ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
-            try:
-                if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
-                    total_shown += 1
-                    for _ in range(4):
-                        if chat_id in STOP_OUTPUT_REQUESTED:
-                            stopped_early = True
-                            break
-                        time.sleep(0.2)
-                    if stopped_early:
-                        break
-            except Exception as e:
-                logger.error(f"Error displaying ad {ad.get('ad_id')}: {e}")
-        if stopped_early:
-            break
-
-    if stopped_early:
-        STOP_OUTPUT_REQUESTED.discard(chat_id)
+    active_queries = [q for q in all_queries if q.get("is_active", True)]
+    if not active_queries:
         tg.send_message(
             chat_id,
-            f"🛑 <b>Вывод объявлений остановлен!</b>\nВсего показано: {total_shown} объявлений.",
+            "⏸ <b>Все ваши поиски сейчас поставлены на паузу.</b>\n\n"
+            "Включите нужный фильтр в разделе <b>«📋 Мои поиски»</b> или нажмите <b>«Показать объявления»</b> у конкретного поиска.",
             reply_markup=get_main_keyboard(chat_id)
         )
         return
 
-    if total_shown == 0:
-        tg.send_message(
-            chat_id,
-            "📭 <b>На Куфаре пока нет подходящих объявлений</b> (или все имеющиеся добавлены вами в чёрный список).",
-            reply_markup=get_main_keyboard(chat_id)
-        )
+    header = (
+        f"🔍 <b>Загружаю актуальные объявления по вашим фильтрам...</b>\n"
+        f"<i>Активных фильтров: {len(active_queries)}. Пожалуйста, подождите...</i>"
+    )
+    empty = "📭 <b>На Куфаре пока нет подходящих объявлений</b> (или все имеющиеся отфильтрованы стоп-словами / ЧС)."
+    done_fn = lambda cnt: (
+        f"✅ <b>Вывод завершён! Всего показано: {cnt} объявлений.</b>\n\n"
+        f"💡 <i>Если объявление не подходит, нажмите «🚫 В ЧС», чтобы оно больше никогда не показывалось.</i>"
+    )
+
+    if background:
+        threading.Thread(
+            target=_run_batch_ad_output,
+            args=(tg, chat_id, active_queries, header, empty, done_fn),
+            daemon=True
+        ).start()
     else:
-        tg.send_message(
-            chat_id,
-            f"✅ <b>Вывод завершён! Всего показано: {total_shown} объявлений.</b>\n\n"
-            f"💡 <i>Если объявление вам не подходит, нажмите кнопку «🚫 В ЧС (скрыть)», чтобы оно больше никогда не показывалось.</i>",
-            reply_markup=get_main_keyboard(chat_id)
-        )
+        _run_batch_ad_output(tg, chat_id, active_queries, header, empty, done_fn)
 
 
-def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
+def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int, background: bool = True):
     """Outputs current listings for a specific search query."""
-    STOP_OUTPUT_REQUESTED.discard(chat_id)
     queries = get_user_queries(chat_id)
     target = next((q for q in queries if q["id"] == qid), None)
     if not target:
@@ -1255,76 +1432,18 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
         return
 
     q_name = target["name"]
-    params = target["params"]
+    header = f"🔍 <b>Загружаю актуальные объявления для «{html.escape(q_name)}»...</b>"
+    empty = f"📭 По поиску «{html.escape(q_name)}» нет подходящих объявлений (или все отфильтрованы стоп-словами / ЧС)."
+    done_fn = lambda cnt: f"✅ <b>Показано {cnt} объявлений по поиску «{html.escape(q_name)}».</b>"
 
-    stop_markup = {
-        "inline_keyboard": [
-            [{"text": "🛑 Остановить вывод объявлений", "callback_data": "cb:stop_output"}]
-        ]
-    }
-
-    tg.send_message(
-        chat_id,
-        f"🔍 <b>Загружаю актуальные объявления для «{html.escape(q_name)}»...</b>",
-        reply_markup=stop_markup
-    )
-
-    bl = get_user_blacklist(chat_id)
-    try:
-        ads = fetch_ads(params)
-    except Exception as e:
-        logger.error(f"Error fetching ads for query {qid}: {e}")
-        tg.send_message(chat_id, f"⚠️ Ошибка загрузки объявлений: {e}", reply_markup=get_main_keyboard(chat_id))
-        return
-
-    q_median = calculate_market_stats(ads)
-    valid_ads = [
-        a for a in ads
-        if a["ad_id"] not in bl
-        and not is_seller_blacklisted(chat_id, a.get("seller", ""), a.get("account_id"))
-    ]
-    total_shown = 0
-    stopped_early = False
-
-    for ad in valid_ads[:10]:
-        if chat_id in STOP_OUTPUT_REQUESTED:
-            stopped_early = True
-            break
-        mark_ad_seen(qid, ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
-        try:
-            if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
-                total_shown += 1
-                for _ in range(4):
-                    if chat_id in STOP_OUTPUT_REQUESTED:
-                        stopped_early = True
-                        break
-                    time.sleep(0.2)
-                if stopped_early:
-                    break
-        except Exception as e:
-            logger.error(f"Error displaying ad {ad.get('ad_id')}: {e}")
-
-    if stopped_early:
-        STOP_OUTPUT_REQUESTED.discard(chat_id)
-        tg.send_message(
-            chat_id,
-            f"🛑 <b>Вывод объявлений остановлен!</b>\nВсего показано: {total_shown} объявлений.",
-            reply_markup=get_main_keyboard(chat_id)
-        )
-        return
-
-    if total_shown == 0:
-        tg.send_message(
-            chat_id,
-            f"📭 По поиску «{html.escape(q_name)}» нет подходящих объявлений (или все добавлены в ЧС).",
-            reply_markup=get_main_keyboard(chat_id)
-        )
+    if background:
+        threading.Thread(
+            target=_run_batch_ad_output,
+            args=(tg, chat_id, [target], header, empty, done_fn),
+            daemon=True
+        ).start()
     else:
-        tg.send_message(
-            chat_id,
-            f"✅ <b>Показано {total_shown} объявлений по поиску «{html.escape(q_name)}».</b>",
-            reply_markup=get_main_keyboard(chat_id)
-        )
+        _run_batch_ad_output(tg, chat_id, [target], header, empty, done_fn)
 
 
 def show_main_menu(tg: TelegramClient, chat_id: int):
@@ -1464,7 +1583,11 @@ def show_favorites_menu(tg: TelegramClient, chat_id: int):
                 ]
             ]
         }
-        tg.send_message(chat_id, item_text, reply_markup=markup, disable_web_page_preview=True)
+        img_url = f.get("image_url")
+        if img_url:
+            tg.send_photo(chat_id, img_url, caption=item_text, reply_markup=markup)
+        else:
+            tg.send_message(chat_id, item_text, reply_markup=markup, disable_web_page_preview=True)
 
     if len(favs) > 10:
         tg.send_message(chat_id, f"<i>...и ещё {len(favs) - 10} объявлений в Избранном.</i>")
@@ -1476,6 +1599,31 @@ def show_favorites_menu(tg: TelegramClient, chat_id: int):
         ]
     }
     tg.send_message(chat_id, "⚙️ <b>Управление Избранным:</b>", reply_markup=clear_markup)
+
+
+def show_blacklist_menu(tg: TelegramClient, chat_id: int):
+    """Displays blacklisted ads count and blocked sellers with one-click unblocking."""
+    bl_ads_count = get_blacklist_count(chat_id)
+    bl_sellers = sorted(get_blacklisted_sellers(chat_id))
+
+    sellers_str = (
+        "\n".join(f"• <code>{html.escape(s)}</code>" for s in bl_sellers)
+        if bl_sellers else "<i>нет заблокированных продавцов</i>"
+    )
+    text = (
+        f"🚫 <b>Управление Чёрным списком</b>\n\n"
+        f"📦 <b>Скрытых объявлений:</b> {bl_ads_count} шт.\n"
+        f"👤 <b>Заблокированных продавцов ({len(bl_sellers)}):</b>\n{sellers_str}\n\n"
+        f"<i>Скрытые объявления и товары продавцов из ЧС никогда не приходят в поиске и уведомлениях.</i>"
+    )
+    buttons = []
+    for idx, sname in enumerate(bl_sellers[:10]):
+        short_s = sname[:22] + "…" if len(sname) > 23 else sname
+        buttons.append([{"text": f"↩️ Разблокировать: {short_s}", "callback_data": f"cb:unbl_seller:{idx}"}])
+    if bl_ads_count > 0:
+        buttons.append([{"text": f"🧹 Очистить ЧС объявлений ({bl_ads_count})", "callback_data": "cb:bl_clear_ads"}])
+    buttons.append([{"text": "🔙 В главное меню", "callback_data": "cb:menu"}])
+    tg.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
 
 
 def show_silent_mode_menu(tg: TelegramClient, chat_id: int):
@@ -1628,7 +1776,10 @@ def handle_link_submission(tg: TelegramClient, chat_id: int, url: str):
         else:
             query_name = cat_name
 
-    pending_id = f"p_{int(time.time())}"
+    if len(PENDING_QUERIES) > 200:
+        for old_k in list(PENDING_QUERIES.keys())[:100]:
+            PENDING_QUERIES.pop(old_k, None)
+    pending_id = f"p_{chat_id}_{int(time.time() * 1000)}"
     PENDING_QUERIES[pending_id] = {
         "chat_id": chat_id,
         "name": query_name,
@@ -1751,7 +1902,10 @@ def wizard_finish(tg: TelegramClient, chat_id: int):
 
     name = data.get("query") or dict(CATEGORIES).get(data.get("cat", ""), "Поиск")
 
-    pending_id = f"p_{int(time.time())}"
+    if len(PENDING_QUERIES) > 200:
+        for old_k in list(PENDING_QUERIES.keys())[:100]:
+            PENDING_QUERIES.pop(old_k, None)
+    pending_id = f"p_{chat_id}_{int(time.time() * 1000)}"
     PENDING_QUERIES[pending_id] = {
         "chat_id": chat_id,
         "name": name,
@@ -1789,21 +1943,48 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     # Register user and notify admin if new
     check_and_notify_new_user(tg, from_user, config)
 
-    tg.answer_callback_query(cb_id)
+    answered = False
 
+    def ack(text: Optional[str] = None, show_alert: bool = False):
+        nonlocal answered
+        if not answered:
+            answered = True
+            tg.answer_callback_query(cb_id, text=text, show_alert=show_alert)
+
+    try:
+        _dispatch_callback_query(tg, chat_id, data, msg, msg_id, from_user, config, ack)
+    finally:
+        if not answered:
+            tg.answer_callback_query(cb_id)
+
+
+def _dispatch_callback_query(
+    tg: TelegramClient,
+    chat_id: int,
+    data: str,
+    msg: Dict[str, Any],
+    msg_id: Optional[int],
+    from_user: Dict[str, Any],
+    config: dict,
+    ack
+):
+    """Routes inline callback queries and answers each callback once with proper toast/alert feedback."""
     if data == "cb:menu":
+        ack()
         USER_STATES.pop(chat_id, None)
         show_main_menu(tg, chat_id)
 
     elif data == "cb:stop_output":
         STOP_OUTPUT_REQUESTED.add(chat_id)
-        tg.answer_callback_query(cb_id, text="🛑 Остановка вывода объявлений...", show_alert=False)
+        ack(text="🛑 Останавливаю вывод объявлений...")
 
     elif data in ("cb:my_searches", "cb:list"):
+        ack()
         USER_STATES.pop(chat_id, None)
         show_my_searches(tg, chat_id)
 
     elif data == "cb:all_ads":
+        ack(text="📦 Загружаю актуальные объявления...")
         USER_STATES.pop(chat_id, None)
         output_all_user_ads(tg, chat_id)
 
@@ -1811,28 +1992,29 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         set_user_monitoring_paused(chat_id, True)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
+        ack(text="⏸ Мониторинг поставлен на паузу")
         reply_kb = get_main_keyboard(chat_id)
-        msg = (
+        text = (
             "⏸ <b>Мониторинг Kufar временно приостановлен!</b>\n\n"
             "• Проверка новых объявлений и отправка уведомлений остановлены.\n"
             "• Все ваши поисковые фильтры, стоп-слова и чёрный список сохранены в безопасности.\n\n"
-            "Чтобы возобновить мониторинг в любое время, нажмите кнопку ниже 👇"
+            "Чтобы возобновить мониторинг в любое время, нажмите кнопку <b>«▶️ Возобновить»</b> в меню или отправьте /resume."
         )
-        markup = {"inline_keyboard": [[{"text": "▶️ Возобновить мониторинг", "callback_data": "cb:resume"}]]}
-        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        tg.send_message(chat_id, text, reply_markup=reply_kb)
 
     elif data == "cb:resume":
         set_user_monitoring_paused(chat_id, False)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
+        ack(text="▶️ Мониторинг возобновлен!")
+        FORCE_CHECK_EVENT.set()
         reply_kb = get_main_keyboard(chat_id)
-        msg = (
+        text = (
             "▶️ <b>Мониторинг Kufar возобновлен!</b>\n\n"
             "• Бот снова активно отслеживает появление новых товаров по вашим фильтрам.\n"
             "• При обнаружении свежих предложений вы сразу получите уведомление!"
         )
-        markup = {"inline_keyboard": [[{"text": "⏸ Приостановить мониторинг", "callback_data": "cb:pause"}]]}
-        tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        tg.send_message(chat_id, text, reply_markup=reply_kb)
 
     elif data.startswith("cb:toggle_q:"):
         parts = data.split(":")
@@ -1842,7 +2024,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
         status_txt = "возобновлен (активен)" if make_active else "поставлен на паузу"
-        tg.answer_callback_query(cb_id, text=f"Поиск [ID: {qid}] {status_txt}")
+        ack(text=f"Поиск [ID: {qid}] {status_txt}")
         show_my_searches(tg, chat_id)
 
     elif data == "cb:add_link":
@@ -1889,7 +2071,10 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         else:
             query_name = params.get("query") or cat_name
 
-        pending_id = f"p_{int(time.time())}"
+        if len(PENDING_QUERIES) > 200:
+            for old_k in list(PENDING_QUERIES.keys())[:100]:
+                PENDING_QUERIES.pop(old_k, None)
+        pending_id = f"p_{chat_id}_{int(time.time() * 1000)}"
         PENDING_QUERIES[pending_id] = {
             "chat_id": chat_id,
             "name": query_name,
@@ -1956,10 +2141,11 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
 
     elif data.startswith("cb:show_ads:") or data.startswith("cb:check:"):
         qid = int(data.split(":")[-1])
+        ack(text="📦 Загружаю объявления...")
         output_ads_for_query(tg, chat_id, qid)
 
     elif data.startswith("cb:photos:"):
-        tg.answer_callback_query(cb_id, text="📸 Все фотографии к объявлению уже отображены в чате")
+        ack(text="📸 Все фотографии к объявлению уже отображены в чате")
 
     elif data.startswith("cb:contact:"):
         ad_id = int(data.split(":")[-1])
@@ -2008,7 +2194,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
 
         add_favorite(chat_id, ad_id, title=title, price_byn=price_byn, price_usd=price_usd, ad_link=ad_link, seller_name=sname, image_url=img_url)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="⭐️ Добавлено в Избранное!", show_alert=False)
+        ack(text="⭐️ Добавлено в Избранное!", show_alert=False)
 
         is_bl = is_ad_blacklisted(chat_id, ad_id)
         photos = AD_PHOTOS_CACHE.get(ad_id, [])
@@ -2028,7 +2214,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         ad_id = int(data.split(":")[-1])
         remove_favorite(chat_id, ad_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="Удалено из Избранного", show_alert=False)
+        ack(text="Удалено из Избранного", show_alert=False)
 
         ad = AD_DATA_CACHE.get(ad_id, {})
         ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
@@ -2051,7 +2237,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         ad_id = int(data.split(":")[-1])
         remove_favorite(chat_id, ad_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="Удалено из Избранного", show_alert=False)
+        ack(text="Удалено из Избранного", show_alert=False)
         try:
             tg.delete_message(chat_id, msg_id)
         except Exception:
@@ -2060,10 +2246,11 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data == "cb:fav_clear":
         cnt = clear_user_favorites(chat_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text=f"Удалено {cnt} объявлений из Избранного", show_alert=True)
+        ack(text=f"Удалено {cnt} объявлений из Избранного", show_alert=True)
         show_favorites_menu(tg, chat_id)
 
     elif data == "cb:fav_menu":
+        ack()
         USER_STATES.pop(chat_id, None)
         show_favorites_menu(tg, chat_id)
 
@@ -2072,10 +2259,10 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         queries = get_user_queries(chat_id)
         q = next((item for item in queries if item["id"] == qid), None)
         if not q:
-            tg.answer_callback_query(cb_id, text="Поиск не найден", show_alert=True)
+            ack(text="Поиск не найден", show_alert=True)
             return
 
-        tg.answer_callback_query(cb_id, text="📊 Анализирую рынок на Kufar...", show_alert=False)
+        ack(text="📊 Анализирую рынок на Kufar...", show_alert=False)
         params = dict(q["params"])
         params["size"] = "50"
         ads = fetch_ads(params)
@@ -2129,10 +2316,11 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         val = data.split(":", 2)[-1]
         set_silent_mode(chat_id, val)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="Настройки сохранены!", show_alert=False)
+        ack(text="Настройки сохранены!", show_alert=False)
         show_silent_mode_menu(tg, chat_id)
 
     elif data == "cb:silent_custom":
+        ack()
         USER_STATES[chat_id] = {"step": "WAIT_SILENT_HOURS"}
         text = (
             "🌙 <b>Настройка часов тишины</b>\n\n"
@@ -2142,11 +2330,34 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:silent_menu"}]]}
         tg.send_message(chat_id, text, reply_markup=markup)
 
+    elif data == "cb:bl_menu":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        show_blacklist_menu(tg, chat_id)
+
+    elif data.startswith("cb:unbl_seller:"):
+        idx = int(data.split(":")[-1])
+        bl_sellers = sorted(get_blacklisted_sellers(chat_id))
+        if 0 <= idx < len(bl_sellers):
+            sname = bl_sellers[idx]
+            remove_blacklisted_seller(chat_id, sname)
+            save_local_backup()
+            ack(text=f"✅ Продавец «{sname}» разблокирован!", show_alert=False)
+        else:
+            ack(text="Продавец уже удалён из ЧС", show_alert=False)
+        show_blacklist_menu(tg, chat_id)
+
+    elif data == "cb:bl_clear_ads":
+        cnt = clear_user_blacklist(chat_id)
+        save_local_backup()
+        ack(text=f"🧹 ЧС объявлений очищен! Удалено: {cnt}", show_alert=True)
+        show_blacklist_menu(tg, chat_id)
+
     elif data.startswith("cb:bl:"):
         ad_id = int(data.split(":")[-1])
         add_to_blacklist(chat_id, ad_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="🚫 Объявление добавлено в ЧС и удалено!", show_alert=False)
+        ack(text="🚫 Объявление добавлено в ЧС и удалено!", show_alert=False)
 
         # Delete all messages related to this ad (album photos + description card)
         mids = AD_MESSAGES_MAP.pop((chat_id, ad_id), [])
@@ -2168,8 +2379,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         add_to_blacklist(chat_id, ad_id)
         save_local_backup()
         disp_name = f"«{sname}»" if sname else "данного продавца"
-        tg.answer_callback_query(
-            cb_id,
+        ack(
             text=f"👤 Продавец {disp_name} добавлен в ЧС! Все его объявления скрыты.",
             show_alert=True
         )
@@ -2188,10 +2398,15 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         ad_id = int(data.split(":")[-1])
         remove_from_blacklist(chat_id, ad_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="✅ Объявление убрано из ЧС", show_alert=False)
+        ack(text="✅ Объявление убрано из ЧС", show_alert=False)
         ad_link = f"https://www.kufar.by/item/{ad_id}"
         ad = AD_DATA_CACHE.get(ad_id, {})
-        new_markup = make_ad_keyboard(ad_link, ad_id, seller_name=ad.get("seller"), is_blacklisted=False)
+        new_markup = make_ad_keyboard(
+            ad_link, ad_id,
+            seller_name=ad.get("seller"),
+            is_blacklisted=False,
+            is_fav=is_favorite(chat_id, ad_id)
+        )
         if msg.get("text"):
             tg.edit_message_text(
                 chat_id,
@@ -2203,10 +2418,12 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
             tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
 
     elif data == "cb:sw_menu":
+        ack()
         USER_STATES.pop(chat_id, None)
         show_stop_words_menu(tg, chat_id)
 
     elif data == "cb:sw_add":
+        ack()
         USER_STATES[chat_id] = {"step": "WAIT_STOP_WORDS"}
         text = (
             "⛔ <b>Добавление стоп-слов</b>\n\n"
@@ -2217,6 +2434,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         tg.send_message(chat_id, text, reply_markup=markup)
 
     elif data == "cb:sw_del_menu":
+        ack()
         sw_list = get_stop_words(chat_id)
         if not sw_list:
             tg.send_message(chat_id, "ℹ️ Список стоп-слов пуст.", reply_markup=get_main_keyboard(chat_id))
@@ -2231,20 +2449,22 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         word = data[len("cb:sw_del:"):]
         remove_stop_word(chat_id, word)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text=f"Удалено: {word}")
+        ack(text=f"Удалено: {word}")
         show_stop_words_menu(tg, chat_id)
 
     elif data == "cb:sw_clear":
         cnt = clear_stop_words(chat_id)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text=f"🧹 Удалено {cnt} стоп-слов!", show_alert=True)
+        ack(text=f"🧹 Удалено {cnt} стоп-слов!", show_alert=True)
         show_stop_words_menu(tg, chat_id)
 
     elif data == "cb:tpl_menu":
+        ack()
         USER_STATES.pop(chat_id, None)
         show_template_menu(tg, chat_id)
 
     elif data == "cb:tpl_edit":
+        ack()
         USER_STATES[chat_id] = {"step": "WAIT_TEMPLATE"}
         text = (
             "✏️ <b>Редактирование шаблона</b>\n\n"
@@ -2256,7 +2476,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
     elif data == "cb:tpl_reset":
         set_user_template(chat_id, DEFAULT_CONTACT_TEMPLATE)
         save_local_backup()
-        tg.answer_callback_query(cb_id, text="🔄 Шаблон сброшен к исходному!", show_alert=True)
+        ack(text="🔄 Шаблон сброшен к исходному!", show_alert=True)
         show_template_menu(tg, chat_id)
 
     elif data.startswith("cb:interval:"):
@@ -2264,6 +2484,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         config["check_interval_seconds"] = sec
         set_setting("check_interval_seconds", str(sec))
         save_local_backup()
+        ack(text=f"⏱ Интервал: {sec} сек.")
         FORCE_CHECK_EVENT.set()
         try:
             config_path = os.path.join(BASE_DIR, "config.json")
@@ -2358,13 +2579,8 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
             "⏸ <b>Мониторинг Kufar временно приостановлен!</b>\n\n"
             "• Проверка новых объявлений и отправка уведомлений остановлены.\n"
             "• Все ваши поисковые фильтры, стоп-слова и чёрный список сохранены в безопасности.\n\n"
-            "Чтобы возобновить мониторинг в любое время, нажмите кнопку <b>«▶️ Возобновить»</b> ниже или введите /resume."
+            "Чтобы возобновить мониторинг в любое время, нажмите кнопку <b>«▶️ Возобновить»</b> в меню или отправьте /resume."
         )
-        markup = {
-            "inline_keyboard": [
-                [{"text": "▶️ Возобновить мониторинг", "callback_data": "cb:resume"}]
-            ]
-        }
         tg.send_message(chat_id, msg, reply_markup=reply_kb)
         return
 
@@ -2383,18 +2599,19 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         set_user_monitoring_paused(chat_id, False)
         save_local_backup()
         sync_backup_to_telegram(tg, config, force_notify=False)
+        FORCE_CHECK_EVENT.set()
         reply_kb = get_main_keyboard(chat_id)
         msg = (
             "▶️ <b>Мониторинг Kufar возобновлен!</b>\n\n"
             "• Бот снова активно отслеживает появление новых товаров по вашим фильтрам.\n"
             "• При обнаружении свежих предложений вы сразу получите уведомление!"
         )
-        markup = {
-            "inline_keyboard": [
-                [{"text": "⏸ Приостановить мониторинг", "callback_data": "cb:pause"}]
-            ]
-        }
         tg.send_message(chat_id, msg, reply_markup=reply_kb)
+        return
+
+    if text in ["🚫 Чёрный список", "🚫 Черный список", "/blacklist", "/bl"]:
+        USER_STATES.pop(chat_id, None)
+        show_blacklist_menu(tg, chat_id)
         return
 
     if text in ["⏱ Интервал", "/interval"]:
@@ -2487,10 +2704,10 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
             "3. Перейдите на <b>kufar.by</b>, выставьте нужные параметры (категорию, город, районы, цену, бренд и т.д.) и скопируйте ссылку.\n"
             "4. Отправьте ссылку сюда сообщением — бот перенесет все фильтры 1 в 1!\n\n"
             "⏸ <b>«Стоп (пауза)» / «Возобновить»</b> — приостановить или продолжить проверку объявлений.\n"
-            "📦 <b>«Вывести всё»</b> — выводит актуальные объявления по вашим сохранённым фильтрам.\n"
-            "⭐️ <b>«⭐️ Избранное»</b> — список отложенных вами объявлений.\n"
-            "🌙 <b>«🌙 Ночной режим»</b> — тихие часы (без звука/вибрации) ночью.\n"
-            "🚫 <b>«В ЧС (скрыть)»</b> — скрывает ненужное объявление, чтобы оно больше никогда не показывалось."
+            "📦 <b>«Вывести всё»</b> — выводит актуальные объявления (со всеми фото сразу) по вашим активным фильтрам.\n"
+            "⭐️ <b>«Избранное»</b> — список отложенных вами объявлений.\n"
+            "🌙 <b>«Ночной режим»</b> — тихие часы (без звука/вибрации) ночью.\n"
+            "🚫 <b>«В ЧС» / «Чёрный список»</b> — скрытие ненужных объявлений и продавцов с возможностью разблокировки."
         )
         tg.send_message(chat_id, help_text, reply_markup=get_main_keyboard(chat_id))
         return
@@ -2688,6 +2905,22 @@ def main():
 
     bot_username = bot_info.get("username", "Unknown")
     print(f"\n🚀 Бот @{bot_username} успешно авторизован!")
+
+    # Register sleek slash commands menu in Telegram
+    tg.set_my_commands([
+        {"command": "start", "description": "🏠 Главное меню"},
+        {"command": "add", "description": "➕ Добавить поиск"},
+        {"command": "list", "description": "📋 Мои поиски"},
+        {"command": "all", "description": "📦 Вывести актуальные объявления"},
+        {"command": "favs", "description": "⭐️ Избранное"},
+        {"command": "blacklist", "description": "🚫 Чёрный список"},
+        {"command": "stopwords", "description": "⛔ Стоп-слова"},
+        {"command": "silent", "description": "🌙 Ночной режим"},
+        {"command": "pause", "description": "⏸ Поставить на паузу"},
+        {"command": "resume", "description": "▶️ Возобновить мониторинг"},
+        {"command": "status", "description": "📊 Статистика и статус"},
+        {"command": "help", "description": "❓ Помощь"}
+    ])
     admin_id = config.get("admin_chat_id")
     if admin_id:
         print(f"👑 Администратор для оповещений: chat_id={admin_id}")

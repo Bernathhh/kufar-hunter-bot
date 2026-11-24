@@ -17,40 +17,60 @@ class TelegramClient:
         self.token = token.strip()
         self.base_url = f"https://api.telegram.org/bot{self.token}"
 
-    def _api_call(self, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 35) -> Optional[Dict[str, Any]]:
+    def _api_call(self, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 35, retries: int = 2) -> Optional[Any]:
         url = f"{self.base_url}/{method}"
         data = None
         headers = {}
-        
+
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        req = urllib.request.Request(url, data=data, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                res_bytes = response.read()
-                res_json = json.loads(res_bytes.decode("utf-8"))
-                if res_json.get("ok"):
-                    return res_json.get("result")
-                else:
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(url, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    res_bytes = response.read()
+                    res_json = json.loads(res_bytes.decode("utf-8"))
+                    if res_json.get("ok"):
+                        return res_json.get("result")
                     logger.error(f"Telegram API error ({method}): {res_json.get('description')}")
                     return None
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="ignore")
-            if e.code == 409:
-                logger.warning("Telegram conflict (HTTP 409): another bot instance is polling getUpdates. Backing off for 5s...")
-                time.sleep(5)
-            else:
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="ignore")
+                if e.code == 409:
+                    logger.warning("Telegram conflict (HTTP 409): another bot instance is polling getUpdates. Backing off for 5s...")
+                    time.sleep(5)
+                    return None
+                if e.code == 429 and attempt < retries:
+                    retry_after = 3
+                    try:
+                        err_json = json.loads(err_body)
+                        retry_after = int(err_json.get("parameters", {}).get("retry_after", 3))
+                    except Exception:
+                        pass
+                    wait_sec = min(max(retry_after, 1), 30) + 0.5
+                    logger.warning(f"Telegram rate limit (429) on {method}, sleeping {wait_sec:.1f}s before retry...")
+                    time.sleep(wait_sec)
+                    continue
                 logger.error(f"HTTPError on {method}: {e.code} - {err_body}")
-            return None
-        except Exception as e:
-            logger.error(f"Exception on {method}: {e}")
-            return None
+                return None
+            except Exception as e:
+                if attempt < retries and method != "getUpdates":
+                    time.sleep(1.0)
+                    continue
+                logger.error(f"Exception on {method}: {e}")
+                return None
+        return None
 
     def get_me(self) -> Optional[Dict[str, Any]]:
         """Verifies bot token and returns bot info."""
         return self._api_call("getMe")
+
+    def set_my_commands(self, commands: List[Dict[str, str]]) -> bool:
+        """Registers slash commands in Telegram's bot command menu."""
+        res = self._api_call("setMyCommands", payload={"commands": commands})
+        return res is not None
 
     def get_updates(self, offset: Optional[int] = None, timeout: int = 25) -> List[Dict[str, Any]]:
         """Long polls for incoming updates."""

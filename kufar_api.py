@@ -235,9 +235,12 @@ def clean_kufar_api_params(params: Dict[str, Any]) -> Dict[str, str]:
             continue
         if v is None:
             continue
-        if isinstance(v, str) and not v.strip() and k != "query":
+        val_str = str(v)
+        if not val_str.strip() and k != "query":
             continue
-        clean[str(k)] = str(v)
+        if k in ("cat", "rgn") and val_str.strip().lower() == "all":
+            continue
+        clean[str(k)] = val_str
     return clean
 
 def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
@@ -465,13 +468,15 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
             if p.get("p") == "name":
                 seller_name = p.get("v", "").strip()
 
-        # Image URLs (up to 10 images)
+        # Image URLs (up to 20 unique images)
         images = ad.get("images", [])
         image_urls = []
+        seen_paths = set()
         if images and isinstance(images, list):
-            for img in images[:10]:
+            for img in images[:20]:
                 path = img.get("path")
-                if path:
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
                     image_urls.append(f"{IMAGE_BASE_URL}/{path}")
 
         image_url = image_urls[0] if image_urls else None
@@ -497,8 +502,11 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
     return results
 
 
-def fetch_ad_description(ad_id: int, timeout: int = 5) -> str:
-    """Fetches the full item description from Kufar item page."""
+def fetch_ad_details(ad_id: int, timeout: int = 6) -> tuple:
+    """
+    Fetches full (description, gallery_image_urls) from a Kufar item page in one request
+    using Next.js __NEXT_DATA__ payload, with safe escaped-string fallback.
+    """
     url = f"https://www.kufar.by/item/{ad_id}"
     req = urllib.request.Request(
         url,
@@ -508,47 +516,53 @@ def fetch_ad_description(ad_id: int, timeout: int = 5) -> str:
             "Referer": "https://www.kufar.by/"
         }
     )
+    description = ""
+    gallery_urls: List[str] = []
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             html_text = r.read().decode("utf-8", errors="ignore")
 
-        # Extract description from Next.js payload
-        m = re.search(r'\"id\":\"?' + str(ad_id) + r'\"?.*?\"description\":(\"[^\"]*\")', html_text)
-        if not m:
-            m = re.search(r'\"description\":(\"[^\"]*\")', html_text)
-        if m:
-            return json.loads(m.group(1)).strip()
+        m_next = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, re.S)
+        if m_next:
+            try:
+                nd = json.loads(m_next.group(1))
+                ad_view = nd.get("props", {}).get("initialState", {}).get("adView", {}).get("data", {})
+                if isinstance(ad_view, dict):
+                    raw_desc = ad_view.get("description")
+                    if isinstance(raw_desc, str):
+                        description = raw_desc.strip()
+                    imgs = ad_view.get("images", {})
+                    raw_list = imgs.get("gallery", []) if isinstance(imgs, dict) else (imgs if isinstance(imgs, list) else [])
+                    seen = set()
+                    for item in raw_list[:20]:
+                        u = item if isinstance(item, str) else (item.get("url") or (f"{IMAGE_BASE_URL}/{item['path']}" if isinstance(item, dict) and item.get("path") else None))
+                        if u and u not in seen:
+                            seen.add(u)
+                            gallery_urls.append(u)
+            except Exception as e:
+                logger.debug(f"__NEXT_DATA__ parse error for {ad_id}: {e}")
+
+        if not description:
+            m = re.search(r'\"id\":\"?' + str(ad_id) + r'\"?.*?\"description\":(\"(?:\\.|[^\"\\])*\")', html_text)
+            if not m:
+                m = re.search(r'\"description\":(\"(?:\\.|[^\"\\])*\")', html_text)
+            if m:
+                description = json.loads(m.group(1)).strip()
     except Exception as e:
-        logger.debug(f"Could not fetch description for {ad_id}: {e}")
-    return ""
+        logger.debug(f"Could not fetch details for {ad_id}: {e}")
+    return description, gallery_urls
+
+
+def fetch_ad_description(ad_id: int, timeout: int = 5) -> str:
+    """Fetches the full item description from Kufar item page."""
+    desc, _ = fetch_ad_details(ad_id, timeout=timeout)
+    return desc
 
 
 def fetch_ad_photos(ad_id: int, timeout: int = 5) -> List[str]:
     """Fetches full list of photo URLs from Kufar item page."""
-    url = f"https://www.kufar.by/item/{ad_id}"
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml",
-            "Referer": "https://www.kufar.by/"
-        }
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            html_text = r.read().decode("utf-8", errors="ignore")
-        paths = re.findall(r'\"path\":\"([^\"]+?\.(?:jpe?g|png|webp))\"', html_text)
-        if paths:
-            seen = set()
-            urls = []
-            for p in paths:
-                if p not in seen:
-                    seen.add(p)
-                    urls.append(f"{IMAGE_BASE_URL}/{p}")
-            return urls[:10]
-    except Exception as e:
-        logger.debug(f"Could not fetch photos for {ad_id}: {e}")
-    return []
+    _, photos = fetch_ad_details(ad_id, timeout=timeout)
+    return photos
 
 
 def extract_phone_from_text(text: str) -> Optional[str]:
