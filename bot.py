@@ -136,7 +136,7 @@ REGIONS = [
     ("all", "🇧🇾 Вся Беларусь")
 ]
 
-# Persistent Reply Keyboard Menu
+# Persistent Reply Keyboard Menu (with auto-collapse on tap)
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
@@ -145,7 +145,8 @@ MAIN_KEYBOARD = {
         [{"text": "⏱ Интервал"}, {"text": "🌙 Ночной режим"}],
         [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
     ],
-    "resize_keyboard": True
+    "resize_keyboard": True,
+    "one_time_keyboard": True
 }
 
 
@@ -2075,9 +2076,13 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
     text = text.strip()
 
     # Commands / Menu Buttons
-    if text in ["/start", "🔙 В главное меню"]:
+    if text in ["/start", "/menu", "🔙 В главное меню"]:
         USER_STATES.pop(chat_id, None)
         show_main_menu(tg, chat_id)
+        return
+
+    if text in ["/hide", "/close", "🔽 Скрыть", "Скрыть клавиатуру"]:
+        tg.send_message(chat_id, "⌨️ Клавиатура скрыта. Чтобы открыть меню снова, отправьте /menu или /start.", reply_markup={"remove_keyboard": True})
         return
 
     if text in ["➕ Добавить поиск", "/add"]:
