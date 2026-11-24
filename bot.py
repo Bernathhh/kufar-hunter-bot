@@ -375,6 +375,10 @@ def format_params_human(p: Dict[str, Any]) -> str:
     cat_name = dict(CATEGORIES).get(cat_id, f"Код {cat_id}" if cat_id else "Все категории")
     lines.append(f"📂 <b>Категория:</b> {cat_name}")
 
+    brand = p.get("brand") or ("Sony" if str(p.get("cbc")) == "31" else "")
+    if brand:
+        lines.append(f"🏷 <b>Производитель:</b> {html.escape(brand)}")
+
     rgn_id = str(p.get("rgn", ""))
     rgn_name = dict(REGIONS).get(rgn_id, f"Регион {rgn_id}" if rgn_id else "Вся Беларусь")
     lines.append(f"🏙 <b>Регион:</b> {rgn_name}")
@@ -1578,7 +1582,11 @@ def handle_link_submission(tg: TelegramClient, chat_id: int, url: str):
     query_name = params.get("query")
     if not query_name:
         cat_name = dict(CATEGORIES).get(str(cat_id), "Куфар поиск")
-        query_name = cat_name
+        brand = params.get("brand") or ("Sony" if str(params.get("cbc")) == "31" else "")
+        if brand:
+            query_name = f"{cat_name} ({brand})"
+        else:
+            query_name = cat_name
 
     pending_id = f"p_{int(time.time())}"
     PENDING_QUERIES[pending_id] = {
@@ -1835,7 +1843,11 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         ads = fetch_ads(params)
         count = len(ads)
         cat_name = dict(CATEGORIES).get(str(cat_id), "Поиск товаров")
-        query_name = params.get("query") or cat_name
+        brand = params.get("brand") or ("Sony" if str(params.get("cbc")) == "31" else "")
+        if brand and not params.get("query"):
+            query_name = f"{cat_name} ({brand})"
+        else:
+            query_name = params.get("query") or cat_name
 
         pending_id = f"p_{int(time.time())}"
         PENDING_QUERIES[pending_id] = {

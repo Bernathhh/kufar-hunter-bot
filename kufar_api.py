@@ -172,6 +172,20 @@ CATEGORY_SLUGS_MAP = {
     "arenda-i-prokat": "13300",
 }
 
+CONSOLES_BRAND_MAP = {
+    "sony": "31",
+    "microsoft": "13",
+    "xbox": "13",
+    "nintendo": "17",
+    "steam-deck": "30",
+    "steamdeck": "30",
+    "sega": "27",
+    "anbernic": "36",
+    "lenovo": "14",
+    "msi": "16",
+    "defender": "1",
+}
+
 def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
     """
     Parses either a full Kufar URL (e.g. https://www.kufar.by/l/r~minsk/pristavki-i-igry?prc=r:150000,220000)
@@ -205,8 +219,19 @@ def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
             params["query"] = params.pop("search")
         if "category" in params and "cat" not in params:
             params["cat"] = params.pop("category")
+        if "pr" in params and "brand" not in params:
+            b_val = params.pop("pr").lower()
+            params["brand"] = b_val.capitalize()
+            if b_val in CONSOLES_BRAND_MAP:
+                params["cbc"] = CONSOLES_BRAND_MAP[b_val]
+        if "brand" in params:
+            b_val = params["brand"].lower()
+            params["brand"] = b_val.capitalize()
+            if b_val in CONSOLES_BRAND_MAP:
+                params["cbc"] = CONSOLES_BRAND_MAP[b_val]
         
-        # Parse path for region and category slugs, e.g. /l/r~minsk/pristavki-i-igry or /l/minsk/noutbuki
+        # Parse path for region, category, and brand slugs
+        # e.g. /l/r~minsk/pristavki/pr~sony or /l/minsk/noutbuki
         path_parts = [p for p in parsed.path.split("/") if p and p != "l"]
         for part in path_parts:
             part_lower = part.lower().strip()
@@ -217,12 +242,25 @@ def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
                 params["rgn"] = REGIONS_MAP[region_slug]
                 continue
 
-            # 2. Check for category slug in path (e.g. pristavki-i-igry, noutbuki, mebel)
+            # 2. Check for brand / manufacturer in path (e.g. pr~sony, mt~apple, cm~asus)
+            if part_lower.startswith("pr~") or part_lower.startswith("mt~") or part_lower.startswith("cm~"):
+                brand_slug = part_lower[3:].strip()
+                brand_name = brand_slug.title()
+                if brand_slug in ("sony", "xbox", "msi", "hp", "bmw"):
+                    brand_name = brand_slug.upper() if brand_slug in ("msi", "hp", "bmw") else brand_slug.capitalize()
+                params["brand"] = brand_name
+                
+                # If this is consoles category or slug has consoles brands:
+                if brand_slug in CONSOLES_BRAND_MAP:
+                    params["cbc"] = CONSOLES_BRAND_MAP[brand_slug]
+                continue
+
+            # 3. Check for category slug in path (e.g. pristavki-i-igry, pristavki, noutbuki, mebel)
             if part_lower in CATEGORY_SLUGS_MAP and "cat" not in params:
                 params["cat"] = CATEGORY_SLUGS_MAP[part_lower]
                 continue
 
-            # 3. Check for SEO landing URL, e.g. /l/kupit-playstation-5
+            # 4. Check for SEO landing URL, e.g. /l/kupit-playstation-5
             if part_lower.startswith("kupit-") and "query" not in params:
                 raw_kw = part_lower[len("kupit-"):].replace("-", " ")
                 # Strip out common noise like 'pristavku' if followed by brand
