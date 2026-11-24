@@ -6,6 +6,7 @@ import urllib.request
 import urllib.parse
 import json
 import logging
+import time
 from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger("telegram_api")
