@@ -58,7 +58,8 @@ from database import (
     is_seller_blacklisted,
     get_user_template,
     set_user_template,
-    DEFAULT_CONTACT_TEMPLATE
+    DEFAULT_CONTACT_TEMPLATE,
+    cleanup_legacy_queries
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -1984,14 +1985,12 @@ def main():
         restored = restore_state_from_telegram(tg, config)
         if restored:
             print("✅ Все сохраненные поиски успешно восстановлены!")
-        elif config.get("initial_queries") and admin_id:
-            for init_q in config["initial_queries"]:
-                add_query(admin_id, init_q.get("name", "Поиск"), init_q.get("params", {}))
-            print(f"✅ Добавлено начальных поисков из конфигурации: {len(config['initial_queries'])}")
-            save_local_backup()
     else:
         print(f"📦 Загружено активных поисков: {len(active)}")
-        save_local_backup()
+
+    # Always purge any legacy starter test queries (e.g. PlayStation 5 Slim)
+    cleanup_legacy_queries()
+    save_local_backup()
 
     # Unpin any remaining pinned messages in admin chat to keep chat clean
     if admin_id:

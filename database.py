@@ -665,6 +665,8 @@ def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict
             cid = q.get("chat_id")
             name = q.get("name")
             params = q.get("params", {})
+            if name in ("PlayStation 5 Slim", "PlayStation Slim"):
+                continue
             if (cid, name) in deleted_set:
                 continue
             if cid and name and params:
@@ -722,4 +724,14 @@ def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict
         "users": imported_users,
         "blacklisted": imported_bl
     }
+
+
+def cleanup_legacy_queries(db_path: str = DB_FILE):
+    """Purges any legacy starter queries (e.g. PlayStation 5 Slim) from the database."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM queries WHERE name IN ('PlayStation 5 Slim', 'PlayStation Slim')")
+        cursor.execute("INSERT OR REPLACE INTO deleted_queries (chat_id, name) VALUES (747868993, 'PlayStation 5 Slim')")
+        conn.commit()
+
 
