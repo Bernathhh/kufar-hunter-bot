@@ -1,34 +1,31 @@
 """
 Telegram Mini App (WebApp) UI and JSON REST API handler for Kufar Hunter Bot.
-Zero external dependencies — built purely with Python standard library + native Telegram WebApp JS SDK.
+Zero external dependencies — built purely with Python standard library + native Telegram WebApp JS SDK + inline SVG icons.
 """
 import hashlib
 import hmac
 import http.server
 import json
 import logging
-import os
+import re
 import statistics
 import time
 import urllib.parse
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from database import (
     DEFAULT_CONTACT_TEMPLATE,
-    add_blacklisted_seller,
     add_favorite,
     add_query,
     add_stop_word,
     add_to_blacklist,
-    clear_stop_words,
     clear_user_blacklist,
     clear_user_favorites,
     delete_query,
     get_active_queries,
     get_blacklisted_sellers,
     get_blacklist_count,
-    get_favorites_count,
     get_query_seen_count,
     get_silent_mode,
     get_stop_words,
@@ -55,6 +52,12 @@ from database import (
 from kufar_api import fetch_ads, parse_kufar_url_or_query
 
 logger = logging.getLogger("kufar_webapp")
+
+
+def _plain_label(label: str) -> str:
+    """Strips decorative emoji prefixes from category/region labels for clean UI rendering."""
+    cleaned = re.sub(r'^[^\wА-Яа-яЁёA-Za-z0-9]+', '', str(label or "")).strip()
+    return cleaned or str(label or "")
 
 
 def verify_telegram_init_data(
@@ -124,35 +127,36 @@ def _parse_prc_bounds(prc_param: Optional[str]) -> Tuple[Optional[float], Option
         return None, None
 
 
-def _build_query_chips(p: Dict[str, Any], app_ctx: Dict[str, Any]) -> List[str]:
-    chips: List[str] = []
-    cat_map = dict(app_ctx.get("categories", []))
-    rgn_map = dict(app_ctx.get("regions", []))
+def _build_query_chips(p: Dict[str, Any], app_ctx: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Builds structured filter chips with semantic SVG icon keys (no emojis)."""
+    chips: List[Dict[str, str]] = []
+    cat_map = {k: _plain_label(v) for k, v in app_ctx.get("categories", [])}
+    rgn_map = {k: _plain_label(v) for k, v in app_ctx.get("regions", [])}
 
     if p.get("query"):
-        chips.append(f"🔍 {p['query']}")
+        chips.append({"icon": "search", "text": str(p["query"])})
     cat_id = str(p.get("cat", ""))
     if cat_id and cat_id != "all":
-        chips.append(cat_map.get(cat_id, f"Кат. {cat_id}"))
+        chips.append({"icon": "grid", "text": cat_map.get(cat_id, f"Категория {cat_id}")})
     cte_map = {"1": "Приставки", "2": "Игры", "3": "Аксессуары"}
     if str(p.get("cte", "")) in cte_map:
-        chips.append(cte_map[str(p["cte"])])
+        chips.append({"icon": "layers", "text": cte_map[str(p["cte"])]})
     pb_map = {"5": "Apple", "24": "Samsung", "35": "Xiaomi", "11": "Huawei", "12": "Honor"}
     cbc_map = {"31": "Sony", "13": "Xbox", "17": "Nintendo", "30": "Steam Deck"}
     brand = p.get("brand") or cbc_map.get(str(p.get("cbc", ""))) or pb_map.get(str(p.get("pb", "")))
     if brand:
-        chips.append(f"🏷 {brand}")
+        chips.append({"icon": "tag", "text": str(brand)})
     rgn_id = str(p.get("rgn", ""))
     if rgn_id and rgn_id != "all":
-        chips.append(rgn_map.get(rgn_id, f"Рег. {rgn_id}"))
+        chips.append({"icon": "mapPin", "text": rgn_map.get(rgn_id, f"Регион {rgn_id}")})
     min_p, max_p = _parse_prc_bounds(p.get("prc"))
     if min_p and max_p:
-        chips.append(f"💰 {int(min_p):,}–{int(max_p):,} BYN".replace(",", " "))
+        chips.append({"icon": "wallet", "text": f"{int(min_p):,} – {int(max_p):,} BYN".replace(",", " ")})
     elif min_p:
-        chips.append(f"💰 от {int(min_p):,} BYN".replace(",", " "))
+        chips.append({"icon": "wallet", "text": f"от {int(min_p):,} BYN".replace(",", " ")})
     elif max_p:
-        chips.append(f"💰 до {int(max_p):,} BYN".replace(",", " "))
-    return chips or ["📦 Все объявления"]
+        chips.append({"icon": "wallet", "text": f"до {int(max_p):,} BYN".replace(",", " ")})
+    return chips or [{"icon": "grid", "text": "Все объявления"}]
 
 
 def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,7 +169,7 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
     for q in queries_raw:
         queries.append({
             "id": q["id"],
-            "name": q["name"],
+            "name": _plain_label(q["name"]),
             "params": q["params"],
             "chips": _build_query_chips(q["params"], app_ctx),
             "is_active": bool(q.get("is_active", True)),
@@ -209,16 +213,16 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
         "blacklisted_sellers": bl_sellers,
         "blacklisted_ads_count": bl_ads_count,
         "stats": stats,
-        "categories": [{"id": c[0], "name": c[1]} for c in app_ctx.get("categories", [])],
-        "regions": [{"id": r[0], "name": r[1]} for r in app_ctx.get("regions", [])],
+        "categories": [{"id": c[0], "name": _plain_label(c[1])} for c in app_ctx.get("categories", [])],
+        "regions": [{"id": r[0], "name": _plain_label(r[1])} for r in app_ctx.get("regions", [])],
     }
 
 
 def _params_from_body(body: Dict[str, Any], app_ctx: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    cat_map = {k: _plain_label(v) for k, v in app_ctx.get("categories", [])}
     url_raw = (body.get("url") or "").strip()
     if url_raw:
         params = parse_kufar_url_or_query(url_raw)
-        cat_map = dict(app_ctx.get("categories", []))
         cat_name = cat_map.get(str(params.get("cat", "")), "Куфар поиск")
         brand = params.get("brand") or ("Sony" if str(params.get("cbc")) == "31" else "")
         name = params.get("query") or (f"{cat_name} ({brand})" if brand else cat_name)
@@ -248,7 +252,6 @@ def _params_from_body(body: Dict[str, Any], app_ctx: Dict[str, Any]) -> Tuple[Di
     elif max_p is not None:
         params["prc"] = f"r:0,{max_p * 100}"
 
-    cat_map = dict(app_ctx.get("categories", []))
     name = kw or cat_map.get(cat_id, "Куфар поиск")
     return params, name
 
@@ -262,50 +265,70 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root {
-    --bg: var(--tg-theme-bg-color, #0f1117);
-    --card: var(--tg-theme-secondary-bg-color, #191d27);
-    --card-elev: rgba(255,255,255,0.045);
-    --border: rgba(128,140,160,0.16);
-    --text: var(--tg-theme-text-color, #f3f5f9);
-    --hint: var(--tg-theme-hint-color, #8e97aa);
-    --accent: var(--tg-theme-button-color, #2ea6ff);
+    --bg: var(--tg-theme-bg-color, #0b0d12);
+    --card: var(--tg-theme-secondary-bg-color, #141821);
+    --text: var(--tg-theme-text-color, #f1f5f9);
+    --hint: var(--tg-theme-hint-color, #8492a6);
+    --accent: var(--tg-theme-button-color, #3b82f6);
     --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --surface: color-mix(in srgb, var(--text) 5%, transparent);
+    --surface-hover: color-mix(in srgb, var(--text) 9%, transparent);
+    --border: color-mix(in srgb, var(--text) 10%, transparent);
+    --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
     --green: #22c55e;
+    --green-soft: rgba(34, 197, 94, 0.14);
     --red: #ef4444;
+    --red-soft: rgba(239, 68, 68, 0.13);
     --amber: #f59e0b;
+    --amber-soft: rgba(245, 158, 11, 0.14);
     --radius: 16px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
     margin: 0; padding: 0;
     background: var(--bg); color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
     font-size: 14px; line-height: 1.45;
+    font-variant-numeric: tabular-nums;
     overscroll-behavior-y: contain;
+    -webkit-font-smoothing: antialiased;
   }
-  .app { max-width: 640px; margin: 0 auto; padding: 12px 14px 90px; }
+  svg.ic {
+    width: 16px; height: 16px;
+    stroke: currentColor; stroke-width: 1.85;
+    stroke-linecap: round; stroke-linejoin: round;
+    fill: none; flex-shrink: 0; display: inline-block;
+  }
+  svg.ic-sm { width: 13px; height: 13px; stroke-width: 2; }
+  svg.ic-lg { width: 20px; height: 20px; stroke-width: 1.8; }
+  svg.ic-xl { width: 26px; height: 26px; stroke-width: 1.65; }
+  svg.ic-fill { fill: currentColor; }
+
+  .app { max-width: 640px; margin: 0 auto; padding: 12px 14px 96px; }
   .header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 6px 2px 14px; gap: 10px;
+    padding: 4px 2px 16px; gap: 10px;
   }
-  .brand { display: flex; align-items: center; gap: 10px; }
-  .brand-icon {
-    width: 38px; height: 38px; border-radius: 12px;
+  .brand { display: flex; align-items: center; gap: 11px; }
+  .brand-mark {
+    width: 40px; height: 40px; border-radius: 13px;
     background: linear-gradient(135deg, var(--accent), #6366f1);
+    color: #fff;
     display: flex; align-items: center; justify-content: center;
-    font-size: 20px; box-shadow: 0 4px 14px rgba(46,166,255,0.28);
+    box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 32%, transparent);
   }
-  .brand-title { font-size: 17px; font-weight: 700; letter-spacing: -0.2px; }
-  .brand-sub { font-size: 11px; color: var(--hint); }
+  .brand-title { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; }
+  .brand-sub { font-size: 11.5px; color: var(--hint); margin-top: 1px; }
+
   .status-pill {
-    display: inline-flex; align-items: center; gap: 6px;
+    display: inline-flex; align-items: center; gap: 7px;
     padding: 7px 12px; border-radius: 999px;
     font-size: 12px; font-weight: 600; border: 1px solid var(--border);
     background: var(--card); color: var(--text); cursor: pointer;
-    transition: transform .12s ease, opacity .15s;
+    transition: transform .12s ease, border-color .15s;
   }
   .status-pill:active { transform: scale(0.96); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
   .dot.paused { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 
   .tab-panel { display: none; animation: fadeIn .16s ease; }
@@ -314,55 +337,76 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 
   .section-head {
     display: flex; align-items: center; justify-content: space-between;
-    margin: 6px 2px 10px;
+    margin: 4px 2px 12px; gap: 8px;
   }
-  .section-title { font-size: 15px; font-weight: 700; }
+  .section-title { font-size: 15px; font-weight: 700; letter-spacing: -0.2px; display: flex; align-items: center; gap: 7px; }
+  .title-ic {
+    width: 26px; height: 26px; border-radius: 8px;
+    background: var(--accent-soft); color: var(--accent);
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+
   .btn {
     border: none; border-radius: 12px; padding: 10px 14px;
     font-size: 13px; font-weight: 600; cursor: pointer;
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     background: var(--accent); color: var(--btn-text);
-    transition: opacity .15s, transform .1s;
+    transition: opacity .15s, transform .1s, background .15s;
+    text-decoration: none;
   }
   .btn:active { transform: scale(0.97); opacity: 0.9; }
   .btn-sm { padding: 7px 11px; font-size: 12px; border-radius: 10px; }
-  .btn-ghost { background: var(--card-elev); color: var(--text); border: 1px solid var(--border); }
-  .btn-danger { background: rgba(239,68,68,0.14); color: #f87171; border: 1px solid rgba(239,68,68,0.24); }
-  .btn-success { background: rgba(34,197,94,0.14); color: #4ade80; border: 1px solid rgba(34,197,94,0.25); }
+  .btn-icon { padding: 7px 9px; }
+  .btn-ghost { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+  .btn-danger { background: var(--red-soft); color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 25%, transparent); }
+  .btn-success { background: var(--green-soft); color: var(--green); border: 1px solid color-mix(in srgb, var(--green) 28%, transparent); }
   .btn-block { width: 100%; }
 
   .card {
     background: var(--card); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 14px; margin-bottom: 12px;
   }
-  .query-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-  .query-name { font-size: 15px; font-weight: 700; word-break: break-word; }
-  .query-meta { font-size: 11.5px; color: var(--hint); margin-top: 2px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 12px; }
-  .chip {
-    background: var(--card-elev); border: 1px solid var(--border);
-    padding: 4px 9px; border-radius: 8px; font-size: 11.5px; color: var(--text);
-    display: inline-flex; align-items: center; gap: 5px;
+  .query-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .query-name { font-size: 15px; font-weight: 700; letter-spacing: -0.2px; word-break: break-word; }
+  .query-meta {
+    font-size: 11.5px; color: var(--hint); margin-top: 3px;
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   }
-  .chip .x { opacity: 0.65; cursor: pointer; font-weight: 700; padding-left: 2px; }
-  .chip .x:hover { opacity: 1; color: var(--red); }
+  .state-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 11px 0 13px; }
+  .chip {
+    background: var(--surface); border: 1px solid var(--border);
+    padding: 4px 9px; border-radius: 8px; font-size: 11.5px; font-weight: 500;
+    color: var(--text); display: inline-flex; align-items: center; gap: 5px;
+  }
+  .chip svg.ic { color: var(--hint); }
+  .chip .x {
+    opacity: 0.65; cursor: pointer; display: inline-flex; align-items: center;
+    padding: 2px; border-radius: 4px; margin-left: 2px;
+  }
+  .chip .x:hover { opacity: 1; color: var(--red); background: var(--red-soft); }
+
   .query-actions { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 6px; }
 
   .switch {
-    position: relative; width: 42px; height: 24px; flex-shrink: 0;
-    background: rgba(128,140,160,0.3); border-radius: 999px; cursor: pointer; transition: background .2s;
+    position: relative; width: 44px; height: 26px; flex-shrink: 0;
+    background: var(--surface-hover); border: 1px solid var(--border);
+    border-radius: 999px; cursor: pointer; transition: background .2s, border-color .2s;
   }
-  .switch.on { background: var(--green); }
+  .switch.on { background: var(--green); border-color: var(--green); }
   .switch::after {
     content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px;
-    border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+    border-radius: 50%; background: #fff; transition: transform .2s cubic-bezier(.3,1.3,.5,1);
+    box-shadow: 0 2px 5px rgba(0,0,0,0.28);
   }
   .switch.on::after { transform: translateX(18px); }
 
-  .seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
+  .seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
   .seg-btn {
-    padding: 8px 4px; border-radius: 10px; border: 1px solid var(--border);
-    background: var(--card-elev); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
+    padding: 9px 4px; border-radius: 11px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer;
+    transition: all .15s;
   }
   .seg-btn.active { background: var(--accent); color: var(--btn-text); border-color: transparent; }
 
@@ -370,6 +414,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     width: 100%; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 12px;
     padding: 10px 12px; font-size: 13.5px; font-family: inherit; outline: none;
+    transition: border-color .15s;
   }
   .input:focus, select:focus, textarea:focus { border-color: var(--accent); }
   .row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -380,91 +425,114 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     background: var(--card); border: 1px solid var(--border);
     border-radius: var(--radius); margin-bottom: 10px;
   }
-  .ad-thumb {
-    width: 82px; height: 82px; border-radius: 12px; object-fit: cover; flex-shrink: 0;
-    background: var(--card-elev); display: flex; align-items: center; justify-content: center; font-size: 24px;
+  .thumb-wrap {
+    position: relative; width: 84px; height: 84px; border-radius: 12px;
+    overflow: hidden; flex-shrink: 0; background: var(--surface);
+    display: flex; align-items: center; justify-content: center; color: var(--hint);
+  }
+  .ad-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .photo-pill {
+    position: absolute; bottom: 5px; right: 5px;
+    background: rgba(11,13,18,0.78); backdrop-filter: blur(6px); color: #fff;
+    padding: 2px 6px; border-radius: 6px; font-size: 10px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 3px;
   }
   .ad-body { flex: 1; min-width: 0; }
-  .ad-title { font-size: 13.5px; font-weight: 600; line-height: 1.3; margin-bottom: 4px; }
-  .ad-price { font-size: 14.5px; font-weight: 800; color: var(--accent); }
-  .ad-sub { font-size: 11.5px; color: var(--hint); margin-top: 3px; }
-  .ad-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-  .badge {
-    display: inline-block; font-size: 10.5px; font-weight: 700;
-    padding: 2px 7px; border-radius: 6px; margin-left: 4px;
+  .ad-title {
+    font-size: 13.5px; font-weight: 600; line-height: 1.3; margin-bottom: 4px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
-  .badge-good { background: rgba(34,197,94,0.16); color: #4ade80; }
-  .badge-high { background: rgba(245,158,11,0.16); color: #fbbf24; }
+  .ad-price-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .ad-price { font-size: 15px; font-weight: 800; color: var(--text); letter-spacing: -0.2px; }
+  .ad-usd { font-size: 11.5px; color: var(--hint); font-weight: 500; }
+  .ad-sub { font-size: 11.5px; color: var(--hint); margin-top: 3px; display: flex; align-items: center; gap: 4px; }
+  .ad-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: 10.5px; font-weight: 700; padding: 2px 7px; border-radius: 6px;
+  }
+  .badge-good { background: var(--green-soft); color: var(--green); }
+  .badge-high { background: var(--amber-soft); color: var(--amber); }
 
   .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
-  .stat-box { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
-  .stat-val { font-size: 20px; font-weight: 800; letter-spacing: -0.3px; }
+  .stat-box {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 13px;
+    display: flex; flex-direction: column; justify-content: space-between;
+  }
+  .stat-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; color: var(--hint); }
+  .stat-val { font-size: 21px; font-weight: 800; letter-spacing: -0.4px; }
   .stat-lbl { font-size: 11.5px; color: var(--hint); margin-top: 2px; }
 
   .nav {
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
-    background: var(--card); border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--card) 92%, transparent);
+    border-top: 1px solid var(--border);
     display: grid; grid-template-columns: repeat(4, 1fr);
-    padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
-    backdrop-filter: blur(12px);
+    padding: 7px 6px calc(7px + env(safe-area-inset-bottom));
+    backdrop-filter: saturate(180%) blur(18px);
   }
   .nav-btn {
     background: none; border: none; color: var(--hint);
-    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
     padding: 4px 2px; font-size: 10.5px; font-weight: 600; cursor: pointer;
-    position: relative;
+    position: relative; transition: color .15s;
   }
-  .nav-btn .ico { font-size: 19px; line-height: 1.1; }
   .nav-btn.active { color: var(--accent); }
   .nav-badge {
-    position: absolute; top: 1px; right: 20%; min-width: 16px; height: 16px;
+    position: absolute; top: 1px; right: 22%; min-width: 16px; height: 16px;
     border-radius: 999px; background: var(--accent); color: var(--btn-text);
     font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; padding: 0 4px;
   }
 
   .modal-bg {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.62); z-index: 100;
+    position: fixed; inset: 0; background: rgba(0,0,0,0.62); backdrop-filter: blur(4px); z-index: 100;
     display: none; align-items: flex-end; justify-content: center;
   }
   .modal-bg.open { display: flex; }
   .modal {
     width: 100%; max-width: 640px; max-height: 88vh; overflow-y: auto;
-    background: var(--card); border-top-left-radius: 20px; border-top-right-radius: 20px;
+    background: var(--card); border-top-left-radius: 22px; border-top-right-radius: 22px;
     border-top: 1px solid var(--border);
     padding: 16px 16px calc(22px + env(safe-area-inset-bottom));
     animation: slideUp .18s ease;
   }
   @keyframes slideUp { from { transform: translateY(30px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-  .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-  .modal-title { font-size: 16px; font-weight: 700; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .modal-title { font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
 
   .toast {
     position: fixed; top: 14px; left: 50%; transform: translateX(-50%) translateY(-80px);
-    background: #1f2937; color: #fff; padding: 9px 16px; border-radius: 999px;
+    background: #181c24; color: #f8fafc; border: 1px solid rgba(255,255,255,0.12);
+    padding: 9px 16px; border-radius: 999px;
     font-size: 12.5px; font-weight: 600; z-index: 200;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.35); transition: transform .22s ease;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.38); transition: transform .22s ease;
     max-width: 90%; text-align: center;
   }
   .toast.show { transform: translateX(-50%) translateY(0); }
 
-  .empty { text-align: center; padding: 34px 16px; color: var(--hint); }
-  .empty .e-ico { font-size: 40px; margin-bottom: 8px; }
-  .outside-box { max-width: 420px; margin: 60px auto; padding: 24px; text-align: center; }
+  .empty { text-align: center; padding: 38px 18px; color: var(--hint); }
+  .empty-ic {
+    width: 52px; height: 52px; border-radius: 16px; margin: 0 auto 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center; color: var(--hint);
+  }
+  .outside-box { max-width: 400px; margin: 72px auto; padding: 24px; text-align: center; }
 </style>
 </head>
 <body>
 <div id="toast" class="toast"></div>
 
 <div id="outsideNotice" class="outside-box" style="display:none">
-  <div style="font-size:48px;margin-bottom:10px">🏹</div>
-  <h2 style="margin:0 0 8px">Kufar Hunter Mini App</h2>
-  <p style="color:var(--hint)">Откройте это приложение прямо внутри Telegram-бота, чтобы управлять поисками, фильтрами и избранным.</p>
+  <div class="brand-mark" style="width:56px;height:56px;margin:0 auto 16px;border-radius:18px" id="outsideLogo"></div>
+  <h2 style="margin:0 0 8px;letter-spacing:-0.3px">Kufar Hunter</h2>
+  <p style="color:var(--hint);margin:0">Откройте приложение через кнопку меню внутри Telegram-бота, чтобы управлять поисками, лентой и фильтрами.</p>
 </div>
 
 <div id="app" class="app" style="display:none">
   <div class="header">
     <div class="brand">
-      <div class="brand-icon">🏹</div>
+      <div class="brand-mark" id="brandLogo"></div>
       <div>
         <div class="brand-title">Kufar Hunter</div>
         <div class="brand-sub" id="subHeader">Загрузка...</div>
@@ -481,8 +549,8 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     <div class="section-head">
       <div class="section-title">Мои поиски</div>
       <div style="display:flex;gap:6px">
-        <button class="btn btn-sm btn-ghost" onclick="sendAllToChat()">📦 В чат</button>
-        <button class="btn btn-sm" onclick="openAddModal()">➕ Добавить</button>
+        <button class="btn btn-sm btn-ghost" onclick="sendAllToChat()" id="btnAllToChat"></button>
+        <button class="btn btn-sm" onclick="openAddModal()" id="btnOpenAdd"></button>
       </div>
     </div>
     <div id="queriesList"></div>
@@ -492,7 +560,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   <div id="tab-favs" class="tab-panel">
     <div class="section-head">
       <div class="section-title">Избранное</div>
-      <button id="clearFavsBtn" class="btn btn-sm btn-danger" onclick="clearFavorites()" style="display:none">🧹 Очистить</button>
+      <button id="clearFavsBtn" class="btn btn-sm btn-danger" onclick="clearFavorites()" style="display:none"></button>
     </div>
     <div id="favsList"></div>
   </div>
@@ -500,17 +568,17 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   <!-- TAB 3: SETTINGS & FILTERS -->
   <div id="tab-settings" class="tab-panel">
     <div class="card">
-      <div class="section-title">⛔ Стоп-слова (минус-слова)</div>
-      <div class="query-meta">Объявления с этими словами автоматически скрываются.</div>
+      <div class="section-title"><span class="title-ic" id="icSwTitle"></span>Стоп-слова</div>
+      <div class="query-meta">Объявления с этими словами в заголовке или описании скрываются автоматически.</div>
       <div id="stopWordsChips" class="chips"></div>
       <div style="display:flex;gap:8px">
-        <input id="newStopWords" class="input" placeholder="напр. аренда, чехол, ps4..." />
+        <input id="newStopWords" class="input" placeholder="аренда, чехол, ps4..." />
         <button class="btn btn-sm" onclick="addStopWords()">Добавить</button>
       </div>
     </div>
 
     <div class="card">
-      <div class="section-title">⏱ Интервал проверки Kufar</div>
+      <div class="section-title"><span class="title-ic" id="icIntTitle"></span>Интервал проверки</div>
       <div class="seg" id="intervalSeg">
         <button class="seg-btn" data-sec="15" onclick="setIntervalSec(15)">15 сек</button>
         <button class="seg-btn" data-sec="30" onclick="setIntervalSec(30)">30 сек</button>
@@ -522,7 +590,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     <div class="card">
       <div class="query-top">
         <div>
-          <div class="section-title">🌙 Тихий (ночной) режим</div>
+          <div class="section-title"><span class="title-ic" id="icSilentTitle"></span>Ночной режим</div>
           <div class="query-meta" id="silentStatusText">Уведомления без звука в заданные часы</div>
         </div>
         <div id="silentSwitch" class="switch" onclick="toggleSilentPreset()"></div>
@@ -544,7 +612,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <div class="section-title">💬 Шаблон сообщения продавцу</div>
+      <div class="section-title"><span class="title-ic" id="icTplTitle"></span>Шаблон ответа продавцу</div>
       <div class="chips" style="margin-bottom:8px">
         <span class="chip" style="cursor:pointer" onclick="insertTplVar('{name}')">+ {name}</span>
         <span class="chip" style="cursor:pointer" onclick="insertTplVar('{item}')">+ {item}</span>
@@ -552,15 +620,15 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       </div>
       <textarea id="templateInput" rows="3" class="input"></textarea>
       <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="btn btn-sm btn-block" onclick="saveTemplate()">Сохранить шаблон</button>
+        <button class="btn btn-sm btn-block" onclick="saveTemplate()">Сохранить</button>
         <button class="btn btn-sm btn-ghost" onclick="resetTemplate()">Сброс</button>
       </div>
     </div>
 
     <div class="card">
       <div class="section-head" style="margin:0 0 8px">
-        <div class="section-title">🚫 Чёрный список</div>
-        <button id="clearBlAdsBtn" class="btn btn-sm btn-danger" onclick="clearBlAds()">Очистить объявл.</button>
+        <div class="section-title"><span class="title-ic" id="icBlTitle"></span>Чёрный список</div>
+        <button id="clearBlAdsBtn" class="btn btn-sm btn-danger" onclick="clearBlAds()">Очистить</button>
       </div>
       <div class="query-meta" id="blSummary">Загрузка...</div>
       <div id="blSellersList" class="chips" style="margin-bottom:0"></div>
@@ -571,11 +639,11 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   <div id="tab-stats" class="tab-panel">
     <div class="stats-grid" id="statsGrid"></div>
     <div class="card">
-      <div class="section-title">📸 Фотоальбомы в чате</div>
-      <div class="query-meta" style="margin-top:6px">
-        Все найденные объявления мгновенно приходят в Telegram-чат <b>полным альбомом со всеми фотографиями</b>, оценкой цены относительно рынка и кнопками быстрого ответа.
+      <div class="section-title"><span class="title-ic" id="icAlbumsTitle"></span>Фотоальбомы в чате</div>
+      <div class="query-meta" style="margin-top:8px">
+        Свежие объявления отправляются в чат нативным альбомом со всеми фотографиями, аналитикой цены относительно медианы и быстрым переходом к продавцу.
       </div>
-      <button class="btn btn-block" style="margin-top:12px" onclick="sendAllToChat()">📦 Вывести свежие объявления в чат</button>
+      <button class="btn btn-block" style="margin-top:14px" onclick="sendAllToChat()" id="btnStatsSend"></button>
     </div>
   </div>
 </div>
@@ -584,16 +652,16 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 <div id="addModal" class="modal-bg" onclick="if(event.target===this)closeModal('addModal')">
   <div class="modal">
     <div class="modal-head">
-      <div class="modal-title">➕ Новый поиск Kufar</div>
-      <button class="btn btn-sm btn-ghost" onclick="closeModal('addModal')">✕</button>
+      <div class="modal-title" id="addModalTitle">Новый поиск</div>
+      <button class="btn btn-sm btn-ghost btn-icon" onclick="closeModal('addModal')" id="btnCloseAdd"></button>
     </div>
     <div class="row-2" style="margin-bottom:10px">
-      <button id="modeLinkBtn" class="btn btn-sm" onclick="setAddMode('link')">🔗 По ссылке</button>
-      <button id="modeFormBtn" class="btn btn-sm btn-ghost" onclick="setAddMode('form')">🛠 Конструктор</button>
+      <button id="modeLinkBtn" class="btn btn-sm" onclick="setAddMode('link')"></button>
+      <button id="modeFormBtn" class="btn btn-sm btn-ghost" onclick="setAddMode('form')"></button>
     </div>
 
     <div id="addLinkPane">
-      <span class="field-label">Ссылка с Kufar.by (все фильтры 1 в 1)</span>
+      <span class="field-label">Ссылка с Kufar.by (перенос фильтров 1 в 1)</span>
       <input id="addUrlInput" class="input" placeholder="https://www.kufar.by/l/r~minsk/..." />
     </div>
 
@@ -603,7 +671,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       <span class="field-label">Регион</span>
       <select id="addRgnSelect" class="input"></select>
       <span class="field-label">Ключевые слова (необязательно)</span>
-      <input id="addQueryInput" class="input" placeholder="напр. playstation 5, iphone 15..." />
+      <input id="addQueryInput" class="input" placeholder="playstation 5, iphone 15..." />
       <div class="row-2">
         <div>
           <span class="field-label">Цена от (BYN)</span>
@@ -619,8 +687,8 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     <div id="previewBox" class="card" style="display:none;margin-top:12px;background:var(--bg)"></div>
 
     <div style="display:flex;gap:8px;margin-top:14px">
-      <button class="btn btn-ghost btn-block" onclick="previewNewQuery()">🔎 Проверить</button>
-      <button class="btn btn-block" onclick="createNewQuery()">🚀 Запустить</button>
+      <button class="btn btn-ghost btn-block" onclick="previewNewQuery()" id="btnPreviewQuery"></button>
+      <button class="btn btn-block" onclick="createNewQuery()" id="btnCreateQuery"></button>
     </div>
   </div>
 </div>
@@ -630,7 +698,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   <div class="modal">
     <div class="modal-head">
       <div class="modal-title" id="feedTitle">Лента объявлений</div>
-      <button class="btn btn-sm btn-ghost" onclick="closeModal('feedModal')">✕</button>
+      <button class="btn btn-sm btn-ghost btn-icon" onclick="closeModal('feedModal')" id="btnCloseFeed"></button>
     </div>
     <div id="feedAnalytics"></div>
     <div id="feedItems"></div>
@@ -639,22 +707,85 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 
 <div id="bottomNav" class="nav" style="display:none">
   <button class="nav-btn active" data-tab="searches" onclick="switchTab('searches')">
-    <span class="ico">🎯</span><span>Поиски</span>
+    <span id="navIcSearches"></span><span>Поиски</span>
     <span id="badgeQueries" class="nav-badge" style="display:none">0</span>
   </button>
   <button class="nav-btn" data-tab="favs" onclick="switchTab('favs')">
-    <span class="ico">⭐️</span><span>Избранное</span>
+    <span id="navIcFavs"></span><span>Избранное</span>
     <span id="badgeFavs" class="nav-badge" style="display:none">0</span>
   </button>
   <button class="nav-btn" data-tab="settings" onclick="switchTab('settings')">
-    <span class="ico">🛡</span><span>Фильтры</span>
+    <span id="navIcSettings"></span><span>Фильтры</span>
   </button>
   <button class="nav-btn" data-tab="stats" onclick="switchTab('stats')">
-    <span class="ico">📊</span><span>Статус</span>
+    <span id="navIcStats"></span><span>Статус</span>
   </button>
 </div>
 
 <script>
+const SVG_PATHS = {
+  radar: '<path d="M12 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48 -.01a6 6 0 0 1 0 -8.49m11.31 -2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0 -14.14"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+  eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/>',
+  barChart: '<path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>',
+  trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+  sliders: '<line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/>',
+  shield: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  message: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+  ban: '<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>',
+  images: '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" x2="21" y1="14" y2="3"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/>',
+  mapPin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+  tag: '<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r=".5"/>',
+  wallet: '<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>',
+  grid: '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>',
+  layers: '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
+  rocket: '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/>',
+  inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>'
+};
+
+function icon(name, cls = 'ic') {
+  return `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true">${SVG_PATHS[name] || SVG_PATHS.tag}</svg>`;
+}
+
+function initStaticIcons() {
+  document.getElementById('brandLogo').innerHTML = icon('radar', 'ic ic-lg');
+  document.getElementById('outsideLogo').innerHTML = icon('radar', 'ic ic-xl');
+  document.getElementById('btnAllToChat').innerHTML = `${icon('send', 'ic ic-sm')} В чат`;
+  document.getElementById('btnOpenAdd').innerHTML = `${icon('plus', 'ic ic-sm')} Добавить`;
+  document.getElementById('clearFavsBtn').innerHTML = `${icon('trash', 'ic ic-sm')} Очистить`;
+  document.getElementById('icSwTitle').innerHTML = icon('shield', 'ic ic-sm');
+  document.getElementById('icIntTitle').innerHTML = icon('clock', 'ic ic-sm');
+  document.getElementById('icSilentTitle').innerHTML = icon('moon', 'ic ic-sm');
+  document.getElementById('icTplTitle').innerHTML = icon('message', 'ic ic-sm');
+  document.getElementById('icBlTitle').innerHTML = icon('ban', 'ic ic-sm');
+  document.getElementById('icAlbumsTitle').innerHTML = icon('images', 'ic ic-sm');
+  document.getElementById('btnStatsSend').innerHTML = `${icon('send')} Вывести свежие объявления в чат`;
+  document.getElementById('addModalTitle').innerHTML = `${icon('plus')} Новый поиск Kufar`;
+  document.getElementById('btnCloseAdd').innerHTML = icon('x');
+  document.getElementById('btnCloseFeed').innerHTML = icon('x');
+  document.getElementById('modeLinkBtn').innerHTML = `${icon('link', 'ic ic-sm')} По ссылке`;
+  document.getElementById('modeFormBtn').innerHTML = `${icon('sliders', 'ic ic-sm')} Конструктор`;
+  document.getElementById('btnPreviewQuery').innerHTML = `${icon('search', 'ic ic-sm')} Проверить`;
+  document.getElementById('btnCreateQuery').innerHTML = `${icon('rocket', 'ic ic-sm')} Запустить`;
+  document.getElementById('navIcSearches').innerHTML = icon('radar', 'ic ic-lg');
+  document.getElementById('navIcFavs').innerHTML = icon('star', 'ic ic-lg');
+  document.getElementById('navIcSettings').innerHTML = icon('sliders', 'ic ic-lg');
+  document.getElementById('navIcStats').innerHTML = icon('barChart', 'ic ic-lg');
+}
+
 const tg = window.Telegram && window.Telegram.WebApp;
 let STATE = null;
 let ADD_MODE = 'link';
@@ -670,7 +801,7 @@ function showToast(msg) {
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+  window.__toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
 }
 
 async function api(path, method = 'GET', body = null) {
@@ -705,12 +836,17 @@ function switchTab(tab) {
   document.querySelector(`.nav-btn[data-tab="${tab}"]`).classList.add('active');
 }
 
+function renderChip(c) {
+  if (typeof c === 'string') return `<span class="chip">${esc(c)}</span>`;
+  return `<span class="chip">${icon(c.icon || 'tag', 'ic ic-sm')}${esc(c.text)}</span>`;
+}
+
 function renderAll() {
   if (!STATE) return;
   const paused = STATE.monitoring_paused;
   document.getElementById('monitorDot').className = 'dot' + (paused ? ' paused' : '');
   document.getElementById('monitorLabel').textContent = paused ? 'На паузе' : 'Активен';
-  document.getElementById('subHeader').textContent = `${paused ? '⏸ Пауза' : '🟢 Проверка каждые ' + STATE.interval_seconds + 'с'} • Поисков: ${STATE.queries.length}`;
+  document.getElementById('subHeader').textContent = `${paused ? 'Пауза' : 'Опрос каждые ' + STATE.interval_seconds + 'с'} · Поисков: ${STATE.queries.length}`;
 
   const bq = document.getElementById('badgeQueries');
   bq.textContent = STATE.queries.length;
@@ -722,23 +858,26 @@ function renderAll() {
   // Render queries
   const qList = document.getElementById('queriesList');
   if (!STATE.queries.length) {
-    qList.innerHTML = `<div class="empty"><div class="e-ico">🎯</div>Пока нет поисков.<br>Нажмите <b>«➕ Добавить»</b>, чтобы начать отслеживание!</div>`;
+    qList.innerHTML = `<div class="empty"><div class="empty-ic">${icon('radar', 'ic ic-xl')}</div>Пока нет поисков.<br>Нажмите <b>«Добавить»</b>, чтобы начать отслеживание.</div>`;
   } else {
     qList.innerHTML = STATE.queries.map(q => `
       <div class="card">
         <div class="query-top">
           <div>
             <div class="query-name">${esc(q.name)}</div>
-            <div class="query-meta">${q.is_active ? '🟢 Активен' : '⏸ Пауза'} • Просмотрено: ${q.seen_count}</div>
+            <div class="query-meta">
+              <span class="state-dot" style="background:${q.is_active ? 'var(--green)' : 'var(--amber)'}"></span>
+              <span>${q.is_active ? 'Активен' : 'Пауза'}</span> · <span>Просмотрено: ${q.seen_count}</span>
+            </div>
           </div>
           <div class="switch ${q.is_active ? 'on' : ''}" onclick="toggleQuery(${q.id}, ${!q.is_active})"></div>
         </div>
-        <div class="chips">${(q.chips || []).map(c => `<span class="chip">${esc(c)}</span>`).join('')}</div>
+        <div class="chips">${(q.chips || []).map(renderChip).join('')}</div>
         <div class="query-actions">
-          <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id})">👀 Лента</button>
-          <button class="btn btn-sm btn-ghost" onclick="sendQueryToChat(${q.id})">📸 В чат</button>
-          <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id}, true)">📊 Цены</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteQuery(${q.id}, '${esc(q.name)}')">🗑</button>
+          <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id})">${icon('eye', 'ic ic-sm')} Лента</button>
+          <button class="btn btn-sm btn-ghost" onclick="sendQueryToChat(${q.id})">${icon('send', 'ic ic-sm')} В чат</button>
+          <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id}, true)">${icon('barChart', 'ic ic-sm')} Цены</button>
+          <button class="btn btn-sm btn-danger btn-icon" onclick="deleteQuery(${q.id}, '${esc(q.name)}')">${icon('trash', 'ic ic-sm')}</button>
         </div>
       </div>
     `).join('');
@@ -748,19 +887,24 @@ function renderAll() {
   const fList = document.getElementById('favsList');
   document.getElementById('clearFavsBtn').style.display = STATE.favorites.length ? 'inline-flex' : 'none';
   if (!STATE.favorites.length) {
-    fList.innerHTML = `<div class="empty"><div class="e-ico">⭐️</div>В Избранном пока пусто.<br>Отмечайте понравившиеся объявления прямо в чате или ленте!</div>`;
+    fList.innerHTML = `<div class="empty"><div class="empty-ic">${icon('star', 'ic ic-xl')}</div>В Избранном пока пусто.<br>Отмечайте объявления прямо в чате или ленте.</div>`;
   } else {
     fList.innerHTML = STATE.favorites.map(f => `
       <div class="ad-card">
-        ${f.image_url ? `<img class="ad-thumb" src="${esc(f.image_url)}" />` : `<div class="ad-thumb">📦</div>`}
+        <div class="thumb-wrap">
+          ${f.image_url ? `<img class="ad-thumb" src="${esc(f.image_url)}" />` : icon('images', 'ic ic-lg')}
+        </div>
         <div class="ad-body">
           <div class="ad-title">${esc(f.title || 'Объявление #' + f.ad_id)}</div>
-          <div class="ad-price">${fmtMoney(f.price_byn)}${f.price_usd ? ` <span style="font-size:11px;color:var(--hint);font-weight:500">~$${Math.round(f.price_usd)}</span>` : ''}</div>
-          <div class="ad-sub">👤 ${esc(f.seller_name || 'Частное лицо')}</div>
+          <div class="ad-price-row">
+            <span class="ad-price">${fmtMoney(f.price_byn)}</span>
+            ${f.price_usd ? `<span class="ad-usd">~$${Math.round(f.price_usd)}</span>` : ''}
+          </div>
+          <div class="ad-sub">${icon('user', 'ic ic-sm')} ${esc(f.seller_name || 'Частное лицо')}</div>
           <div class="ad-btns">
-            <a class="btn btn-sm" style="text-decoration:none" href="${esc(f.ad_link)}" target="_blank">Kufar ↗</a>
-            <button class="btn btn-sm btn-ghost" onclick="copyContact(${f.ad_id}, '${esc(f.seller_name||'')}', '${esc(f.title||'')}', '${fmtMoney(f.price_byn)}')">💬 Написать</button>
-            <button class="btn btn-sm btn-danger" onclick="removeFav(${f.ad_id})">✕</button>
+            <a class="btn btn-sm" href="${esc(f.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
+            <button class="btn btn-sm btn-ghost" onclick="copyContact(${f.ad_id}, '${esc(f.seller_name||'')}', '${esc(f.title||'')}', '${fmtMoney(f.price_byn)}')">${icon('message', 'ic ic-sm')} Текст</button>
+            <button class="btn btn-sm btn-danger btn-icon" onclick="removeFav(${f.ad_id})">${icon('x', 'ic ic-sm')}</button>
           </div>
         </div>
       </div>
@@ -770,7 +914,7 @@ function renderAll() {
   // Stop words
   const swEl = document.getElementById('stopWordsChips');
   swEl.innerHTML = STATE.stop_words.length
-    ? STATE.stop_words.map(w => `<span class="chip">${esc(w)} <span class="x" onclick="removeStopWord('${esc(w)}')">✕</span></span>`).join('')
+    ? STATE.stop_words.map(w => `<span class="chip">${esc(w)}<span class="x" onclick="removeStopWord('${esc(w)}')">${icon('x', 'ic ic-sm')}</span></span>`).join('')
     : `<span class="query-meta">Стоп-слов пока нет</span>`;
 
   // Interval
@@ -782,7 +926,7 @@ function renderAll() {
   const isSilentOn = STATE.silent_mode && STATE.silent_mode !== 'off';
   document.getElementById('silentSwitch').className = 'switch' + (isSilentOn ? ' on' : '');
   document.getElementById('silentStatusText').textContent = isSilentOn
-    ? `Включен: ${STATE.silent_mode}${STATE.in_silent_now ? ' (сейчас тихо 🌙)' : ''}`
+    ? `Включен: ${STATE.silent_mode}${STATE.in_silent_now ? ' (сейчас активно)' : ''}`
     : 'Выключен (звук круглосуточно)';
   if (isSilentOn && STATE.silent_mode.includes('-')) {
     const [a, b] = STATE.silent_mode.split('-');
@@ -795,28 +939,45 @@ function renderAll() {
 
   // Blacklist
   document.getElementById('clearBlAdsBtn').style.display = STATE.blacklisted_ads_count ? 'inline-flex' : 'none';
-  document.getElementById('blSummary').textContent = `Скрытых объявлений: ${STATE.blacklisted_ads_count} • Продавцов в ЧС: ${STATE.blacklisted_sellers.length}`;
+  document.getElementById('blSummary').textContent = `Скрытых объявлений: ${STATE.blacklisted_ads_count} · Продавцов в ЧС: ${STATE.blacklisted_sellers.length}`;
   document.getElementById('blSellersList').innerHTML = STATE.blacklisted_sellers.length
-    ? STATE.blacklisted_sellers.map(s => `<span class="chip">👤 ${esc(s)} <span class="x" onclick="unblockSeller('${esc(s)}')">↩️</span></span>`).join('')
+    ? STATE.blacklisted_sellers.map(s => `<span class="chip">${icon('user', 'ic ic-sm')}${esc(s)}<span class="x" onclick="unblockSeller('${esc(s)}')">${icon('undo', 'ic ic-sm')}</span></span>`).join('')
     : '';
 
   // Stats
   const st = STATE.stats || {};
   let statsHtml = `
-    <div class="stat-box"><div class="stat-val">${esc(st.uptime || '0:00')}</div><div class="stat-lbl">⏱ Аптайм сервера</div></div>
-    <div class="stat-box"><div class="stat-val">${st.total_checks || 0}</div><div class="stat-lbl">🔄 Выполнено проверок</div></div>
-    <div class="stat-box"><div class="stat-val">${st.new_ads_found || 0}</div><div class="stat-lbl">📨 Отправлено объявлений</div></div>
-    <div class="stat-box"><div class="stat-val">${STATE.queries.length}</div><div class="stat-lbl">🎯 Ваших фильтров</div></div>
+    <div class="stat-box">
+      <div class="stat-top"><span class="stat-lbl">Аптайм сервера</span>${icon('clock')}</div>
+      <div class="stat-val">${esc(st.uptime || '0:00')}</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-top"><span class="stat-lbl">Проверок</span>${icon('activity')}</div>
+      <div class="stat-val">${st.total_checks || 0}</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-top"><span class="stat-lbl">Отправлено</span>${icon('send')}</div>
+      <div class="stat-val">${st.new_ads_found || 0}</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-top"><span class="stat-lbl">Поисков</span>${icon('radar')}</div>
+      <div class="stat-val">${STATE.queries.length}</div>
+    </div>
   `;
   if (st.is_admin) {
     statsHtml += `
-      <div class="stat-box"><div class="stat-val">${st.total_users || 1}</div><div class="stat-lbl">👑 Всего пользователей</div></div>
-      <div class="stat-box"><div class="stat-val">${st.total_active_queries || 0}</div><div class="stat-lbl">📡 Активных фильтров</div></div>
+      <div class="stat-box">
+        <div class="stat-top"><span class="stat-lbl">Пользователей</span>${icon('users')}</div>
+        <div class="stat-val">${st.total_users || 1}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-top"><span class="stat-lbl">Активных фильтров</span>${icon('layers')}</div>
+        <div class="stat-val">${st.total_active_queries || 0}</div>
+      </div>
     `;
   }
   document.getElementById('statsGrid').innerHTML = statsHtml;
 
-  // Populate selects in Add modal
   const catSel = document.getElementById('addCatSelect');
   if (!catSel.options.length) {
     STATE.categories.forEach(c => catSel.add(new Option(c.name, c.id)));
@@ -838,14 +999,14 @@ async function toggleGlobalMonitoring() {
   const next = !STATE.monitoring_paused;
   await api('/api/monitoring', 'POST', { paused: next });
   await loadState();
-  showToast(next ? '⏸ Мониторинг на паузе' : '🟢 Мониторинг запущен');
+  showToast(next ? 'Мониторинг поставлен на паузу' : 'Мониторинг запущен');
 }
 
 async function toggleQuery(id, active) {
   haptic('light');
   await api('/api/queries/toggle', 'POST', { id, is_active: active });
   await loadState();
-  showToast(active ? '🟢 Поиск включён' : '⏸ Поиск на паузе');
+  showToast(active ? 'Поиск включён' : 'Поиск на паузе');
 }
 
 async function deleteQuery(id, name) {
@@ -853,19 +1014,19 @@ async function deleteQuery(id, name) {
   haptic('medium');
   await api('/api/queries/delete', 'POST', { id });
   await loadState();
-  showToast('🗑 Поиск удалён');
+  showToast('Поиск удалён');
 }
 
 async function sendQueryToChat(id) {
   haptic('light');
   await api('/api/queries/send_to_chat', 'POST', { id });
-  showToast('📸 Объявления со всеми фото отправляются в чат!');
+  showToast('Объявления с полными фотоальбомами отправляются в чат');
 }
 
 async function sendAllToChat() {
   haptic('light');
   await api('/api/queries/send_to_chat', 'POST', { id: 'all' });
-  showToast('📸 Вывод всех фотоальбомов запущен в чате!');
+  showToast('Вывод объявлений запущен в чате');
 }
 
 function openAddModal() {
@@ -906,10 +1067,10 @@ async function previewNewQuery() {
     box.style.display = 'block';
     box.innerHTML = `
       <div style="font-weight:700">${esc(res.name)}</div>
-      <div class="chips" style="margin:6px 0">${res.chips.map(c=>`<span class="chip">${esc(c)}</span>`).join('')}</div>
-      <div class="query-meta">Найдено сейчас на Kufar: <b>${res.count}</b> объявл.${res.median ? ' • Медиана: ' + fmtMoney(res.median) : ''}</div>
+      <div class="chips" style="margin:8px 0">${res.chips.map(renderChip).join('')}</div>
+      <div class="query-meta">Найдено на Kufar: <b>${res.count}</b>${res.median ? ' · Медиана: ' + fmtMoney(res.median) : ''}</div>
     `;
-  } catch(e) { showToast('⚠️ ' + e.message); }
+  } catch(e) { showToast(e.message); }
 }
 
 async function createNewQuery() {
@@ -919,17 +1080,17 @@ async function createNewQuery() {
     await api('/api/queries/add', 'POST', payload);
     closeModal('addModal');
     await loadState();
-    showToast('🚀 Поиск добавлен и запущен!');
-  } catch(e) { showToast('⚠️ ' + e.message); }
+    showToast('Поиск добавлен и запущен');
+  } catch(e) { showToast(e.message); }
 }
 
-async function openFeed(qid, focusStats = false) {
+async function openFeed(qid) {
   haptic('light');
   const q = STATE.queries.find(x => x.id === qid);
   ACTIVE_FEED_Q = q;
-  document.getElementById('feedTitle').textContent = q ? q.name : 'Лента';
+  document.getElementById('feedTitle').innerHTML = `${icon('radar')} ${esc(q ? q.name : 'Лента')}`;
   document.getElementById('feedAnalytics').innerHTML = '';
-  document.getElementById('feedItems').innerHTML = `<div class="empty">🔍 Загружаю объявления с Куфара...</div>`;
+  document.getElementById('feedItems').innerHTML = `<div class="empty">Загружаю объявления...</div>`;
   document.getElementById('feedModal').classList.add('open');
 
   try {
@@ -938,18 +1099,18 @@ async function openFeed(qid, focusStats = false) {
       const a = res.analytics;
       document.getElementById('feedAnalytics').innerHTML = `
         <div class="card" style="background:var(--bg);margin-bottom:12px">
-          <div class="query-meta" style="margin-bottom:6px">📊 Аналитика цен (${a.count} объявл.):</div>
+          <div class="query-meta" style="margin-bottom:8px">${icon('barChart', 'ic ic-sm')} Рыночная аналитика (${a.count} объявл.)</div>
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center">
-            <div><div style="font-weight:800">${fmtMoney(a.min)}</div><div class="query-meta">Минимум</div></div>
-            <div><div style="font-weight:800;color:var(--accent)">${fmtMoney(a.median)}</div><div class="query-meta">Медиана</div></div>
-            <div><div style="font-weight:800">${fmtMoney(a.max)}</div><div class="query-meta">Максимум</div></div>
+            <div><div style="font-weight:800">${fmtMoney(a.min)}</div><div class="query-meta" style="justify-content:center">Минимум</div></div>
+            <div><div style="font-weight:800;color:var(--accent)">${fmtMoney(a.median)}</div><div class="query-meta" style="justify-content:center">Медиана</div></div>
+            <div><div style="font-weight:800">${fmtMoney(a.max)}</div><div class="query-meta" style="justify-content:center">Максимум</div></div>
           </div>
         </div>
       `;
     }
     FEED_ADS_CACHE = {};
     if (!res.ads.length) {
-      document.getElementById('feedItems').innerHTML = `<div class="empty"><div class="e-ico">📭</div>Подходящих объявлений сейчас нет.</div>`;
+      document.getElementById('feedItems').innerHTML = `<div class="empty"><div class="empty-ic">${icon('inbox', 'ic ic-xl')}</div>Подходящих объявлений сейчас нет.</div>`;
       return;
     }
     res.ads.forEach(ad => { FEED_ADS_CACHE[ad.ad_id] = ad; });
@@ -960,23 +1121,29 @@ async function openFeed(qid, focusStats = false) {
       const imgCount = (ad.image_urls || []).length;
       return `
         <div class="ad-card" id="feed-ad-${ad.ad_id}">
-          ${ad.image_url ? `<img class="ad-thumb" src="${esc(ad.image_url)}" />` : `<div class="ad-thumb">📦</div>`}
+          <div class="thumb-wrap">
+            ${ad.image_url ? `<img class="ad-thumb" src="${esc(ad.image_url)}" />` : icon('images', 'ic ic-lg')}
+            ${imgCount > 1 ? `<span class="photo-pill">${icon('images', 'ic ic-sm')}${imgCount}</span>` : ''}
+          </div>
           <div class="ad-body">
             <div class="ad-title">${esc(ad.subject)}</div>
-            <div class="ad-price">${fmtMoney(ad.price_byn)}${badge}</div>
-            <div class="ad-sub">📍 ${esc(ad.region || '')}${ad.area ? ', ' + esc(ad.area) : ''} • 📸 ${imgCount} фото</div>
+            <div class="ad-price-row">
+              <span class="ad-price">${fmtMoney(ad.price_byn)}</span>
+              ${badge}
+            </div>
+            <div class="ad-sub">${icon('mapPin', 'ic ic-sm')} ${esc(ad.region || '')}${ad.area ? ', ' + esc(ad.area) : ''}</div>
             <div class="ad-btns">
-              <a class="btn btn-sm" style="text-decoration:none" href="${esc(ad.ad_link)}" target="_blank">Kufar ↗</a>
-              <button class="btn btn-sm btn-ghost" onclick="pushAdToChat(${ad.ad_id})">📸 В чат</button>
-              <button class="btn btn-sm ${ad.is_fav ? 'btn-success' : 'btn-ghost'}" onclick="toggleFavFromFeed(${ad.ad_id}, this)">${ad.is_fav ? '⭐️' : '☆'}</button>
-              <button class="btn btn-sm btn-danger" onclick="hideAdFromFeed(${ad.ad_id})">🚫</button>
+              <a class="btn btn-sm" href="${esc(ad.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
+              <button class="btn btn-sm btn-ghost" onclick="pushAdToChat(${ad.ad_id})">${icon('send', 'ic ic-sm')} В чат</button>
+              <button class="btn btn-sm btn-icon ${ad.is_fav ? 'btn-success' : 'btn-ghost'}" onclick="toggleFavFromFeed(${ad.ad_id}, this)">${icon('star', ad.is_fav ? 'ic ic-sm ic-fill' : 'ic ic-sm')}</button>
+              <button class="btn btn-sm btn-danger btn-icon" onclick="hideAdFromFeed(${ad.ad_id})">${icon('eyeOff', 'ic ic-sm')}</button>
             </div>
           </div>
         </div>
       `;
     }).join('');
   } catch(e) {
-    document.getElementById('feedItems').innerHTML = `<div class="empty">⚠️ ${esc(e.message)}</div>`;
+    document.getElementById('feedItems').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
 }
 
@@ -985,7 +1152,7 @@ async function pushAdToChat(adId) {
   if (!ad) return;
   haptic('light');
   await api('/api/ads/send_to_chat', 'POST', { ad, query_name: ACTIVE_FEED_Q ? ACTIVE_FEED_Q.name : 'Поиск' });
-  showToast('📸 Все фото и описание отправлены в чат!');
+  showToast('Фотоальбом и описание отправлены в чат');
 }
 
 async function toggleFavFromFeed(adId, btn) {
@@ -994,10 +1161,10 @@ async function toggleFavFromFeed(adId, btn) {
   haptic('light');
   const res = await api('/api/favorites/toggle', 'POST', { ad });
   ad.is_fav = res.is_fav;
-  btn.textContent = res.is_fav ? '⭐️' : '☆';
-  btn.className = 'btn btn-sm ' + (res.is_fav ? 'btn-success' : 'btn-ghost');
+  btn.innerHTML = icon('star', res.is_fav ? 'ic ic-sm ic-fill' : 'ic ic-sm');
+  btn.className = 'btn btn-sm btn-icon ' + (res.is_fav ? 'btn-success' : 'btn-ghost');
   await loadState();
-  showToast(res.is_fav ? '⭐️ Добавлено в Избранное' : 'Удалено из Избранного');
+  showToast(res.is_fav ? 'Добавлено в Избранное' : 'Удалено из Избранного');
 }
 
 async function hideAdFromFeed(adId) {
@@ -1006,7 +1173,7 @@ async function hideAdFromFeed(adId) {
   const el = document.getElementById('feed-ad-' + adId);
   if (el) el.remove();
   await loadState();
-  showToast('🚫 Объявление скрыто в ЧС');
+  showToast('Объявление скрыто в ЧС');
 }
 
 async function removeFav(adId) {
@@ -1019,14 +1186,14 @@ async function clearFavorites() {
   if (!confirm('Очистить всё Избранное?')) return;
   await api('/api/favorites/clear', 'POST', {});
   await loadState();
-  showToast('🧹 Избранное очищено');
+  showToast('Избранное очищено');
 }
 
 function copyContact(adId, seller, item, price) {
   let msg = STATE.template || '';
   msg = msg.replaceAll('{name}', seller || 'продавец').replaceAll('{item}', item || 'товар').replaceAll('{price}', price || '');
   navigator.clipboard && navigator.clipboard.writeText(msg);
-  showToast('💬 Текст скопирован в буфер!');
+  showToast('Текст скопирован в буфер');
 }
 
 async function addStopWords() {
@@ -1036,7 +1203,7 @@ async function addStopWords() {
   await api('/api/stopwords/add', 'POST', { words });
   inp.value = '';
   await loadState();
-  showToast('⛔ Стоп-слова добавлены');
+  showToast('Стоп-слова добавлены');
 }
 
 async function removeStopWord(word) {
@@ -1048,7 +1215,7 @@ async function setIntervalSec(sec) {
   haptic('light');
   await api('/api/settings', 'POST', { interval_seconds: sec });
   await loadState();
-  showToast(`⏱ Интервал: ${sec} сек`);
+  showToast(`Интервал: ${sec} сек`);
 }
 
 async function toggleSilentPreset() {
@@ -1067,7 +1234,7 @@ async function saveSilentVal(val) {
   haptic('light');
   await api('/api/settings', 'POST', { silent_mode: val });
   await loadState();
-  showToast(val === 'off' ? '☀️ Тихий режим выключен' : `🌙 Тихий режим: ${val}`);
+  showToast(val === 'off' ? 'Тихий режим выключен' : `Тихий режим: ${val}`);
 }
 
 function insertTplVar(v) {
@@ -1078,41 +1245,44 @@ function insertTplVar(v) {
 
 async function saveTemplate() {
   const val = document.getElementById('templateInput').value.trim();
-  if (val.length < 3) return showToast('⚠️ Минимум 3 символа');
+  if (val.length < 3) return showToast('Минимум 3 символа');
   await api('/api/settings', 'POST', { template: val });
   await loadState();
-  showToast('💬 Шаблон сохранён');
+  showToast('Шаблон сохранён');
 }
 
 async function resetTemplate() {
   await api('/api/settings', 'POST', { reset_template: true });
   await loadState();
-  showToast('🔄 Шаблон сброшен');
+  showToast('Шаблон сброшен');
 }
 
 async function unblockSeller(name) {
   await api('/api/blacklist/unblock_seller', 'POST', { seller_name: name });
   await loadState();
-  showToast(`↩️ Продавец «${name}» разблокирован`);
+  showToast(`Продавец «${name}» разблокирован`);
 }
 
 async function clearBlAds() {
   if (!confirm('Очистить список скрытых объявлений?')) return;
   await api('/api/blacklist/clear_ads', 'POST', {});
   await loadState();
-  showToast('🧹 ЧС объявлений очищен');
+  showToast('ЧС объявлений очищен');
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
+  initStaticIcons();
   if (tg && tg.initData) {
     tg.ready();
     tg.expand();
+    try { tg.setHeaderColor && tg.setHeaderColor('bg_color'); } catch(e) {}
+    try { tg.setBackgroundColor && tg.setBackgroundColor('bg_color'); } catch(e) {}
     document.getElementById('app').style.display = 'block';
     document.getElementById('bottomNav').style.display = 'grid';
     try {
       await loadState();
     } catch (e) {
-      showToast('⚠️ ' + e.message);
+      showToast(e.message);
     }
   } else {
     document.getElementById('outsideNotice').style.display = 'block';
@@ -1398,7 +1568,6 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     return
 
                 if path == "/api/stopwords/add":
-                    import re
                     raw_words = body.get("words") or ""
                     for token in re.split(r"[,;\n]+", raw_words):
                         clean = token.strip().lower()
