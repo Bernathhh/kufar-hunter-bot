@@ -666,7 +666,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   }
   .chip .x:hover { opacity: 1; color: var(--red); background: var(--red-soft); }
 
-  .query-actions { display: grid; grid-template-columns: 1fr 1fr 1fr auto auto; gap: 6px; }
+  .query-actions { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 6px; }
   .pill-mini-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .pill-mini {
     border: 1px solid var(--border); background: var(--surface); color: var(--text);
@@ -800,6 +800,19 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--hint);
     list-style: none; display: flex; align-items: center; justify-content: space-between;
   }
+  details.dyn-extra summary::-webkit-details-marker { display: none; }
+  details.card-acc {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 13px 14px; margin-bottom: 10px;
+  }
+  details.card-acc summary {
+    cursor: pointer; list-style: none; display: flex; align-items: center;
+    justify-content: space-between; gap: 10px; font-weight: 700; font-size: 14.5px;
+  }
+  details.card-acc summary::-webkit-details-marker { display: none; }
+  .acc-left { display: flex; align-items: center; gap: 8px; }
+  .acc-badge { font-size: 11.5px; font-weight: 600; color: var(--hint); }
+  .acc-body { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
   .market-bars { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
   .bar-row { display: grid; grid-template-columns: 112px 1fr 44px; align-items: center; gap: 8px; font-size: 11px; }
   .bar-track { height: 7px; border-radius: 999px; background: var(--surface-hover); overflow: hidden; }
@@ -966,20 +979,25 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     <div id="favsList"></div>
   </div>
 
-  <!-- TAB 3: SETTINGS & FILTERS -->
+  <!-- TAB 3: SETTINGS & FILTERS (Clean Accordions) -->
   <div id="tab-settings" class="tab-panel">
-    <div class="card">
-      <div class="section-title"><span class="title-ic" id="icSwTitle"></span>Стоп-слова</div>
-      <div class="query-meta">Объявления с этими словами в заголовке или описании скрываются автоматически.</div>
-      <div id="stopWordsChips" class="chips"></div>
-      <div style="display:flex;gap:8px">
-        <input id="newStopWords" class="input" placeholder="аренда, чехол, ps4..." />
-        <button class="btn btn-sm" onclick="addStopWords()">Добавить</button>
+    <details class="card-acc">
+      <summary>
+        <span class="acc-left"><span class="title-ic" id="icSwTitle"></span>Стоп-слова</span>
+        <span class="acc-badge" id="accSwBadge">0</span>
+      </summary>
+      <div class="acc-body">
+        <div class="query-meta" style="margin-bottom:8px">Объявления с этими словами в заголовке или описании скрываются автоматически.</div>
+        <div id="stopWordsChips" class="chips"></div>
+        <div style="display:flex;gap:8px">
+          <input id="newStopWords" class="input" placeholder="аренда, чехол, ps4..." />
+          <button class="btn btn-sm" onclick="addStopWords()">Добавить</button>
+        </div>
       </div>
-    </div>
+    </details>
 
     <div class="card" id="intervalCard" style="display:none">
-      <div class="section-title"><span class="title-ic" id="icIntTitle"></span>Интервал проверки</div>
+      <div class="section-title"><span class="title-ic" id="icIntTitle"></span>Интервал проверки (Админ)</div>
       <div class="seg" id="intervalSeg">
         <button class="seg-btn" data-sec="15" onclick="setIntervalSec(15)">15 сек</button>
         <button class="seg-btn" data-sec="30" onclick="setIntervalSec(30)">30 сек</button>
@@ -988,52 +1006,65 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="card">
-      <div class="query-top">
-        <div>
-          <div class="section-title"><span class="title-ic" id="icSilentTitle"></span>Ночной режим</div>
+    <details class="card-acc">
+      <summary>
+        <span class="acc-left"><span class="title-ic" id="icSilentTitle"></span>Ночной режим</span>
+        <span class="acc-badge" id="accSilentBadge">Выкл</span>
+      </summary>
+      <div class="acc-body">
+        <div class="query-top">
           <div class="query-meta" id="silentStatusText">Уведомления без звука в заданные часы</div>
+          <div id="silentSwitch" class="switch" onclick="toggleSilentPreset()"></div>
         </div>
-        <div id="silentSwitch" class="switch" onclick="toggleSilentPreset()"></div>
-      </div>
-      <div class="row-2" style="margin-top:10px">
-        <div>
-          <span class="field-label" style="margin-top:0">С (Минск)</span>
-          <input id="silentFrom" type="time" class="input" value="23:00" />
+        <div class="row-2" style="margin-top:10px">
+          <div>
+            <span class="field-label" style="margin-top:0">С (Минск)</span>
+            <input id="silentFrom" type="time" class="input" value="23:00" />
+          </div>
+          <div>
+            <span class="field-label" style="margin-top:0">До (Минск)</span>
+            <input id="silentTo" type="time" class="input" value="08:00" />
+          </div>
         </div>
-        <div>
-          <span class="field-label" style="margin-top:0">До (Минск)</span>
-          <input id="silentTo" type="time" class="input" value="08:00" />
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn btn-sm btn-block" onclick="saveSilentCustom()">Сохранить часы</button>
+          <button class="btn btn-sm btn-ghost" onclick="saveSilentVal('off')">Выкл</button>
         </div>
       </div>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="btn btn-sm btn-block" onclick="saveSilentCustom()">Сохранить часы</button>
-        <button class="btn btn-sm btn-ghost" onclick="saveSilentVal('off')">Выкл</button>
-      </div>
-    </div>
+    </details>
 
-    <div class="card">
-      <div class="section-title"><span class="title-ic" id="icTplTitle"></span>Шаблон ответа продавцу</div>
-      <div class="chips" style="margin-bottom:8px">
-        <span class="chip" style="cursor:pointer" onclick="insertTplVar('{name}')">+ {name}</span>
-        <span class="chip" style="cursor:pointer" onclick="insertTplVar('{item}')">+ {item}</span>
-        <span class="chip" style="cursor:pointer" onclick="insertTplVar('{price}')">+ {price}</span>
+    <details class="card-acc">
+      <summary>
+        <span class="acc-left"><span class="title-ic" id="icTplTitle"></span>Шаблон ответа продавцу</span>
+        <span class="acc-badge">Текст</span>
+      </summary>
+      <div class="acc-body">
+        <div class="chips" style="margin-bottom:8px">
+          <span class="chip" style="cursor:pointer" onclick="insertTplVar('{name}')">+ {name}</span>
+          <span class="chip" style="cursor:pointer" onclick="insertTplVar('{item}')">+ {item}</span>
+          <span class="chip" style="cursor:pointer" onclick="insertTplVar('{price}')">+ {price}</span>
+        </div>
+        <textarea id="templateInput" rows="3" class="input"></textarea>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn btn-sm btn-block" onclick="saveTemplate()">Сохранить</button>
+          <button class="btn btn-sm btn-ghost" onclick="resetTemplate()">Сброс</button>
+        </div>
       </div>
-      <textarea id="templateInput" rows="3" class="input"></textarea>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="btn btn-sm btn-block" onclick="saveTemplate()">Сохранить</button>
-        <button class="btn btn-sm btn-ghost" onclick="resetTemplate()">Сброс</button>
-      </div>
-    </div>
+    </details>
 
-    <div class="card">
-      <div class="section-head" style="margin:0 0 8px">
-        <div class="section-title"><span class="title-ic" id="icBlTitle"></span>Чёрный список</div>
-        <button id="clearBlAdsBtn" class="btn btn-sm btn-danger" onclick="clearBlAds()">Очистить</button>
+    <details class="card-acc">
+      <summary>
+        <span class="acc-left"><span class="title-ic" id="icBlTitle"></span>Чёрный список</span>
+        <span class="acc-badge" id="accBlBadge">0</span>
+      </summary>
+      <div class="acc-body">
+        <div class="section-head" style="margin:0 0 8px">
+          <div class="query-meta" id="blSummary">Загрузка...</div>
+          <button id="clearBlAdsBtn" class="btn btn-sm btn-danger" onclick="clearBlAds()">Очистить</button>
+        </div>
+        <div id="blSellersList" class="chips" style="margin-bottom:0"></div>
       </div>
-      <div class="query-meta" id="blSummary">Загрузка...</div>
-      <div id="blSellersList" class="chips" style="margin-bottom:0"></div>
-    </div>
+    </details>
   </div>
 
   <!-- TAB 4: STATUS (ADMIN ONLY) -->
@@ -1190,28 +1221,35 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 
     <div id="editDynamicFilters" class="dyn-section" style="display:none"></div>
 
-    <span class="field-label">Локальные стоп-слова только для этого поиска</span>
-    <input id="editLocalStops" class="input" placeholder="чехол, коробка, обмен..." />
+    <details id="editProDetails" class="dyn-extra">
+      <summary>
+        <span id="editProSummary">Доп. правила (стоп-слова, выгода, ссылка)</span>
+      </summary>
+      <div style="margin-top:8px">
+        <span class="field-label">Локальные стоп-слова только для этого поиска</span>
+        <input id="editLocalStops" class="input" placeholder="чехол, коробка, обмен..." />
 
-    <span class="field-label">Плюс-слова (приоритет и бейдж)</span>
-    <input id="editPlusWords" class="input" placeholder="срочно, чек, торг, оригинал..." />
+        <span class="field-label">Плюс-слова (приоритет и бейдж)</span>
+        <input id="editPlusWords" class="input" placeholder="срочно, чек, торг, оригинал..." />
 
-    <span class="field-label">Порог выгоды для уведомлений</span>
-    <select id="editBargainSelect" class="input">
-      <option value="0">Все подходящие объявления</option>
-      <option value="10">Только ниже рынка на 10%+</option>
-      <option value="15">Только ниже рынка на 15%+</option>
-      <option value="20">Только ниже рынка на 20%+</option>
-      <option value="25">Только ниже рынка на 25%+</option>
-    </select>
+        <span class="field-label">Порог выгоды для уведомлений</span>
+        <select id="editBargainSelect" class="input">
+          <option value="0">Все подходящие объявления</option>
+          <option value="10">Только ниже рынка на 10%+</option>
+          <option value="15">Только ниже рынка на 15%+</option>
+          <option value="20">Только ниже рынка на 20%+</option>
+          <option value="25">Только ниже рынка на 25%+</option>
+        </select>
 
-    <div class="toggle-row">
-      <button type="button" id="editPrivateBtn" class="toggle-pill" onclick="toggleEditMetaFlag('private')"></button>
-      <button type="button" id="editSilentBtn" class="toggle-pill" onclick="toggleEditMetaFlag('silent')"></button>
-    </div>
+        <div class="toggle-row">
+          <button type="button" id="editPrivateBtn" class="toggle-pill" onclick="toggleEditMetaFlag('private')"></button>
+          <button type="button" id="editSilentBtn" class="toggle-pill" onclick="toggleEditMetaFlag('silent')"></button>
+        </div>
 
-    <span class="field-label">Или заменить параметры ссылкой с Kufar.by (опционально)</span>
-    <input id="editUrlInput" class="input" placeholder="https://www.kufar.by/l/..." />
+        <span class="field-label">Или заменить параметры ссылкой с Kufar.by</span>
+        <input id="editUrlInput" class="input" placeholder="https://www.kufar.by/l/..." />
+      </div>
+    </details>
 
     <div id="editExtraInfo" class="query-meta" style="margin-top:10px;display:none"></div>
     <div id="editPreviewBox" class="card" style="display:none;margin-top:12px;background:var(--bg)"></div>
@@ -1472,28 +1510,32 @@ function renderAll() {
   if (!STATE.queries.length) {
     qList.innerHTML = `<div class="empty"><div class="empty-ic">${icon('radar', 'ic ic-xl')}</div>Пока нет поисков.<br>Нажмите <b>«Добавить»</b>, чтобы начать отслеживание.</div>`;
   } else {
-    qList.innerHTML = STATE.queries.map(q => `
-      <div class="card">
-        <div class="query-top">
-          <div>
-            <div class="query-name">${esc(q.name)}</div>
-            <div class="query-meta">
-              <span class="state-dot" style="background:${q.is_active ? 'var(--green)' : 'var(--amber)'}"></span>
-              <span>${q.is_active ? 'Активен' : 'Пауза'}</span> · <span>Просмотрено: ${q.seen_count}</span>
+    qList.innerHTML = STATE.queries.map(q => {
+      const chips = q.chips || [];
+      const shownChips = chips.slice(0, 4);
+      const extraChips = chips.length - shownChips.length;
+      return `
+        <div class="card">
+          <div class="query-top">
+            <div>
+              <div class="query-name">${esc(q.name)}</div>
+              <div class="query-meta">
+                <span class="state-dot" style="background:${q.is_active ? 'var(--green)' : 'var(--amber)'}"></span>
+                <span>${q.is_active ? 'Активен' : 'Пауза'}</span> · <span>Просмотрено: ${q.seen_count}</span>
+              </div>
             </div>
+            <div class="switch ${q.is_active ? 'on' : ''}" onclick="toggleQuery(${q.id}, ${!q.is_active})"></div>
           </div>
-          <div class="switch ${q.is_active ? 'on' : ''}" onclick="toggleQuery(${q.id}, ${!q.is_active})"></div>
+          <div class="chips">${shownChips.map(renderChip).join('')}${extraChips > 0 ? `<span class="chip">+${extraChips} еще</span>` : ''}</div>
+          <div class="query-actions">
+            <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id})">${icon('eye', 'ic ic-sm')} Смотреть</button>
+            <button class="btn btn-sm btn-ghost" onclick="sendQueryToChat(${q.id})">${icon('send', 'ic ic-sm')} В чат</button>
+            <button class="btn btn-sm btn-ghost btn-icon" title="Редактировать" onclick="openEditModal(${q.id})">${icon('edit', 'ic ic-sm')}</button>
+            <button class="btn btn-sm btn-danger btn-icon" title="Удалить" onclick="deleteQuery(${q.id}, '${esc(q.name)}')">${icon('trash', 'ic ic-sm')}</button>
+          </div>
         </div>
-        <div class="chips">${(q.chips || []).map(renderChip).join('')}</div>
-        <div class="query-actions">
-          <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id})">${icon('eye', 'ic ic-sm')} Лента</button>
-          <button class="btn btn-sm btn-ghost" onclick="sendQueryToChat(${q.id})">${icon('send', 'ic ic-sm')} В чат</button>
-          <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id}, true)">${icon('barChart', 'ic ic-sm')} Цены</button>
-          <button class="btn btn-sm btn-ghost btn-icon" title="Редактировать" onclick="openEditModal(${q.id})">${icon('edit', 'ic ic-sm')}</button>
-          <button class="btn btn-sm btn-danger btn-icon" title="Удалить" onclick="deleteQuery(${q.id}, '${esc(q.name)}')">${icon('trash', 'ic ic-sm')}</button>
-        </div>
-      </div>
-    `).join('');
+      `;
+    }).join('');
   }
 
   // Render favorites
@@ -1505,6 +1547,7 @@ function renderAll() {
     ['negotiating', 'Торгуюсь'],
     ['bought', 'Куплено'],
   ];
+  const crmMap = Object.fromEntries(crmLabels);
   if (!STATE.favorites.length) {
     fList.innerHTML = `<div class="empty"><div class="empty-ic">${icon('star', 'ic ic-xl')}</div>В Избранном пока пусто.<br>Отмечайте объявления прямо в чате или ленте.</div>`;
   } else {
@@ -1518,16 +1561,17 @@ function renderAll() {
           <div class="ad-price-row">
             <span class="ad-price">${fmtMoney(f.price_byn)}</span>
             ${f.price_usd ? `<span class="ad-usd">~$${Math.round(f.price_usd)}</span>` : ''}
+            ${f.status && crmMap[f.status] ? `<span class="badge badge-plus">${esc(crmMap[f.status])}</span>` : ''}
             ${f.is_closed ? `<span class="badge badge-closed">Снято / продано</span>` : ''}
           </div>
           <div class="ad-sub">${icon('user', 'ic ic-sm')} ${esc(f.seller_name || 'Частное лицо')}</div>
-          <div class="crm-row">
-            ${crmLabels.map(([code, lbl]) => `
-              <button type="button" class="crm-pill ${f.status === code ? 'active' : ''}" onclick="setFavStatus(${f.ad_id}, '${f.status === code ? '' : code}')">${lbl}</button>
-            `).join('')}
-          </div>
           ${f.note ? `<div class="note-box">${esc(f.note)}</div>` : ''}
           <div id="fav-note-edit-${f.ad_id}" style="display:none;margin-top:8px">
+            <div class="crm-row" style="margin-bottom:6px">
+              ${crmLabels.map(([code, lbl]) => `
+                <button type="button" class="crm-pill ${f.status === code ? 'active' : ''}" onclick="setFavStatus(${f.ad_id}, '${f.status === code ? '' : code}')">${lbl}</button>
+              `).join('')}
+            </div>
             <div style="display:flex;gap:6px">
               <input id="fav-note-inp-${f.ad_id}" class="input" value="${esc(f.note || '')}" placeholder="Заметка по сделке..." />
               <button class="btn btn-sm" onclick="saveFavNote(${f.ad_id})">ОК</button>
@@ -1536,7 +1580,7 @@ function renderAll() {
           <div class="ad-btns">
             <a class="btn btn-sm" href="${esc(f.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
             <button class="btn btn-sm btn-ghost" onclick="copyContact(${f.ad_id}, '${esc(f.seller_name||'')}', '${esc(f.title||'')}', '${fmtMoney(f.price_byn)}')">${icon('message', 'ic ic-sm')} Текст</button>
-            <button class="btn btn-sm btn-ghost btn-icon" title="Заметка" onclick="toggleFavNote(${f.ad_id})">${icon('note', 'ic ic-sm')}</button>
+            <button class="btn btn-sm btn-ghost btn-icon" title="Статус и заметка" onclick="toggleFavNote(${f.ad_id})">${icon('note', 'ic ic-sm')}</button>
             <button class="btn btn-sm btn-danger btn-icon" onclick="removeFav(${f.ad_id})">${icon('x', 'ic ic-sm')}</button>
           </div>
         </div>
@@ -1546,6 +1590,7 @@ function renderAll() {
 
   // Stop words
   const swEl = document.getElementById('stopWordsChips');
+  document.getElementById('accSwBadge').textContent = STATE.stop_words.length ? `${STATE.stop_words.length} шт.` : 'Нет';
   swEl.innerHTML = STATE.stop_words.length
     ? STATE.stop_words.map(w => `<span class="chip">${esc(w)}<span class="x" onclick="removeStopWord('${esc(w)}')">${icon('x', 'ic ic-sm')}</span></span>`).join('')
     : `<span class="query-meta">Стоп-слов пока нет</span>`;
@@ -1557,6 +1602,7 @@ function renderAll() {
 
   // Silent mode
   const isSilentOn = STATE.silent_mode && STATE.silent_mode !== 'off';
+  document.getElementById('accSilentBadge').textContent = isSilentOn ? STATE.silent_mode : 'Выкл';
   document.getElementById('silentSwitch').className = 'switch' + (isSilentOn ? ' on' : '');
   document.getElementById('silentStatusText').textContent = isSilentOn
     ? `Включен: ${STATE.silent_mode}${STATE.in_silent_now ? ' (сейчас активно)' : ''}`
@@ -1571,6 +1617,8 @@ function renderAll() {
   document.getElementById('templateInput').value = STATE.template || '';
 
   // Blacklist
+  const totalBl = (STATE.blacklisted_ads_count || 0) + (STATE.blacklisted_sellers ? STATE.blacklisted_sellers.length : 0);
+  document.getElementById('accBlBadge').textContent = totalBl ? `${totalBl} скрыто` : 'Пусто';
   document.getElementById('clearBlAdsBtn').style.display = STATE.blacklisted_ads_count ? 'inline-flex' : 'none';
   document.getElementById('blSummary').textContent = `Скрытых объявлений: ${STATE.blacklisted_ads_count} · Продавцов в ЧС: ${STATE.blacklisted_sellers.length}`;
   document.getElementById('blSellersList').innerHTML = STATE.blacklisted_sellers.length
@@ -1931,37 +1979,51 @@ function renderDynamicFilters(mode) {
     return '';
   };
 
-  const primaryNonBool = primary.filter(f => f.kind !== 'bool');
-  const primaryBool = primary.filter(f => f.kind === 'bool');
-  const commonHtml = common.map(renderField).join('');
+  const KEY_PRIORITY = new Set(['pb', 'phm', 'ppm', 'cte', 'cbc', 'cbu', 'clb', 'celr', 'rgd', 'crg', 'rms', 're_rooms']);
+  const primaryRanked = [...primary].sort((a, b) => {
+    const ap = KEY_PRIORITY.has(a.key) ? 0 : 1;
+    const bp = KEY_PRIORITY.has(b.key) ? 0 : 1;
+    return ap - bp;
+  });
+  const topFields = primaryRanked.slice(0, 3);
+  const topKeys = new Set(topFields.map(f => f.key));
+  const moreFields = [
+    ...primaryRanked.slice(3),
+    ...common,
+    ...extra,
+  ];
+
+  const renderAnyField = (f) => {
+    if (f.kind === 'bool') {
+      const active = st.kufar_params[f.key] === '1';
+      return `<button type="button" class="toggle-pill ${active ? 'active' : ''}" onclick="onDynBoolToggle('${mode}', '${esc(f.key)}', ${Boolean(f.reload_on_change)})">${active ? icon('check', 'ic ic-sm') : ''} ${esc(f.label)}</button>`;
+    }
+    return renderField(f);
+  };
 
   let html = '';
-  if (primary.length) {
-    html += `<div class="dyn-title">${icon('sliders', 'ic ic-sm')} Характеристики категории</div>`;
-    html += primaryNonBool.map(renderField).join('');
-    if (primaryBool.length) {
-      html += `<div class="dyn-bools">` + primaryBool.map(f => {
-        const active = st.kufar_params[f.key] === '1';
-        return `<button type="button" class="toggle-pill ${active ? 'active' : ''}" onclick="onDynBoolToggle('${mode}', '${esc(f.key)}', ${Boolean(f.reload_on_change)})">${active ? icon('check', 'ic ic-sm') : ''} ${esc(f.label)}</button>`;
-      }).join('') + `</div>`;
+  if (topFields.length) {
+    html += `<div class="dyn-title">${icon('sliders', 'ic ic-sm')} Основные характеристики</div>`;
+    const topNonBool = topFields.filter(f => f.kind !== 'bool');
+    const topBool = topFields.filter(f => f.kind === 'bool');
+    html += topNonBool.map(renderField).join('');
+    if (topBool.length) {
+      html += `<div class="dyn-bools">` + topBool.map(renderAnyField).join('') + `</div>`;
     }
   }
-  if (commonHtml) {
-    html += `<div style="margin-top:6px">${commonHtml}</div>`;
-  }
-  if (extra.length) {
-    const activeExtraCnt = extra.filter(f => st.kufar_params[f.key] === '1').length;
+  if (moreFields.length) {
+    const activeMoreCnt = moreFields.filter(f => Boolean(st.kufar_params[f.key])).length;
+    const moreNonBool = moreFields.filter(f => f.kind !== 'bool');
+    const moreBool = moreFields.filter(f => f.kind === 'bool');
     html += `
-      <details class="dyn-extra">
+      <details class="dyn-extra" ${activeMoreCnt > 0 ? 'open' : ''}>
         <summary>
-          <span>Доп. опции Kufar${activeExtraCnt ? ' (' + activeExtraCnt + ')' : ''}</span>
+          <span>Все фильтры категории (${moreFields.length})${activeMoreCnt ? ' · выбрано ' + activeMoreCnt : ''}</span>
           ${icon('chevronRight', 'ic ic-sm')}
         </summary>
-        <div class="dyn-bools" style="margin-top:10px">
-          ${extra.map(f => {
-            const active = st.kufar_params[f.key] === '1';
-            return `<button type="button" class="toggle-pill ${active ? 'active' : ''}" onclick="onDynBoolToggle('${mode}', '${esc(f.key)}', false)">${active ? icon('check', 'ic ic-sm') : ''} ${esc(f.label)}</button>`;
-          }).join('')}
+        <div style="margin-top:8px">
+          ${moreNonBool.map(renderField).join('')}
+          ${moreBool.length ? `<div class="dyn-bools" style="margin-top:10px">${moreBool.map(renderAnyField).join('')}</div>` : ''}
         </div>
       </details>
     `;
@@ -2257,6 +2319,18 @@ function openEditModal(qid) {
   EDIT_PRIVATE_ONLY = Boolean(m.private_only);
   EDIT_SILENT_QUERY = Boolean(m.silent_query);
   syncEditMetaButtons();
+  const proActive = (m.stop_words && m.stop_words.length ? 1 : 0)
+    + (m.plus_words && m.plus_words.length ? 1 : 0)
+    + (Number(m.only_bargain_pct || 0) > 0 ? 1 : 0)
+    + (EDIT_PRIVATE_ONLY ? 1 : 0)
+    + (EDIT_SILENT_QUERY ? 1 : 0);
+  const proDet = document.getElementById('editProDetails');
+  if (proDet) {
+    proDet.open = proActive > 0;
+    document.getElementById('editProSummary').textContent = proActive
+      ? `Доп. правила (активно: ${proActive})`
+      : 'Доп. правила (стоп-слова, выгода, ссылка)';
+  }
   document.getElementById('editUrlInput').value = '';
   document.getElementById('editPreviewBox').style.display = 'none';
 

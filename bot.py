@@ -991,6 +991,9 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
 
             meta_allowed, matched_plus = evaluate_query_meta_for_ad(ad, meta, market_median=market_median)
             if is_within_budget and meta_allowed:
+                if sent_count >= 5:
+                    # Already recorded as seen above; cap burst notifications per query per cycle to 5
+                    continue
                 if matched_plus:
                     ad["_matched_plus"] = matched_plus
                 try:
@@ -1553,7 +1556,7 @@ def _run_batch_ad_output(
                 if chat_id in STOP_OUTPUT_REQUESTED:
                     stopped_early = True
                     break
-                if shown_for_query >= 10:
+                if shown_for_query >= 3 or total_shown >= 5:
                     break
                 ad_id = ad["ad_id"]
                 if ad_id in seen_in_run:
@@ -1631,13 +1634,12 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int, background: bool = Tru
         return
 
     header = (
-        f"🔍 <b>Загружаю актуальные объявления по вашим фильтрам...</b>\n"
-        f"<i>Активных фильтров: {len(active_queries)}. Пожалуйста, подождите...</i>"
+        f"🔍 <b>Подбираю свежие объявления...</b>"
     )
-    empty = "📭 <b>На Куфаре пока нет подходящих объявлений</b> (или все имеющиеся отфильтрованы стоп-словами / ЧС)."
+    empty = "📭 Пока нет подходящих объявлений."
     done_fn = lambda cnt: (
-        f"✅ <b>Вывод завершён! Всего показано: {cnt} объявлений.</b>\n\n"
-        f"💡 <i>Если объявление не подходит, нажмите «🚫 В ЧС», чтобы оно больше никогда не показывалось.</i>"
+        f"✅ <b>Показано {cnt} свежих объявлений.</b>\n"
+        f"<i>Все остальные лоты и фильтры — в Mini App.</i>"
     )
 
     if background:
@@ -1701,31 +1703,18 @@ def _send_or_edit(
 
 
 def show_main_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
-    """Displays unified compact Inline Dashboard Hub (clears legacy ReplyKeyboard once)."""
-    if not edit_msg_id and get_setting(f"ui_v2_{chat_id}") != "1":
-        set_setting(f"ui_v2_{chat_id}", "1")
-        tg.send_message(
-            chat_id,
-            "<b>Интерфейс обновлён</b> — управление перенесено в единое меню и Mini App.",
-            reply_markup={"remove_keyboard": True},
-            disable_notification=True
-        )
-
+    """Displays clean, minimal Inline Hub without cluttering chat."""
     paused = is_user_monitoring_paused(chat_id)
     queries = get_user_queries(chat_id)
     fav_cnt = get_favorites_count(chat_id)
-    sw_cnt = len(get_stop_words(chat_id))
-    interval = int(GLOBAL_CONFIG.get("check_interval_seconds", 60))
-    silent_mode = get_silent_mode(chat_id)
-    silent_str = "выкл" if silent_mode in ("off", "") else silent_mode
+    admin_chat_id = int(GLOBAL_CONFIG.get("admin_chat_id", 0) or 0)
+    is_admin = bool(admin_chat_id and chat_id == admin_chat_id)
 
-    status_icon = "На паузе" if paused else f"● Активен · {interval}с"
+    status_icon = "На паузе" if paused else "● Активен"
     text = (
-        f"<b>KUFAR HUNTER</b>  ·  <b>{status_icon}</b>\n"
-        f"────────────────────\n"
-        f"Поисков: <b>{len(queries)}</b>  ·  Избранное: <b>{fav_cnt}</b>\n"
-        f"Стоп-слова: <b>{sw_cnt}</b>  ·  Тихий режим: <b>{html.escape(silent_str)}</b>\n\n"
-        f"<i>Отправьте ссылку kufar.by в чат или выберите раздел:</i>"
+        f"<b>KUFAR HUNTER</b> · {status_icon}\n"
+        f"Поисков: <b>{len(queries)}</b> · Избранное: <b>{fav_cnt}</b>\n\n"
+        f"<i>Отправьте ссылку kufar.by или откройте Mini App.</i>"
     )
 
     buttons: List[List[Dict[str, Any]]] = []
@@ -1739,17 +1728,20 @@ def show_main_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] 
         {"text": "⏸ Пауза", "callback_data": "cb:hub_pause"}
     )
     buttons.append([
-        {"text": "Вывести в чат", "callback_data": "cb:all_ads"},
-        pause_btn
-    ])
-    buttons.append([
         {"text": f"Поиски · {len(queries)}", "callback_data": "cb:my_searches"},
         {"text": f"Избранное · {fav_cnt}", "callback_data": "cb:fav_menu"}
     ])
     buttons.append([
-        {"text": "Фильтры и ЧС", "callback_data": "cb:settings"},
-        {"text": "Статус", "callback_data": "cb:stats"}
+        {"text": "Свежие (3 шт)", "callback_data": "cb:all_ads"},
+        pause_btn
     ])
+    if is_admin:
+        buttons.append([
+            {"text": "Фильтры", "callback_data": "cb:settings"},
+            {"text": "Статус (Админ)", "callback_data": "cb:stats"}
+        ])
+    else:
+        buttons.append([{"text": "Настройки и ЧС", "callback_data": "cb:settings"}])
 
     _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
@@ -1790,42 +1782,42 @@ def show_settings_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[i
 
 
 def show_stats_menu(tg: TelegramClient, chat_id: int, config: dict, edit_msg_id: Optional[int] = None):
-    """Displays clean bot statistics in-place inside Hub."""
-    admin_chat_id = config.get("admin_chat_id", 0)
-    uptime_str = str(datetime.now() - START_TIME).split(".")[0]
+    """Displays clean bot statistics in-place inside Hub (server metrics strictly admin-only)."""
+    admin_chat_id = int(config.get("admin_chat_id", 0) or 0)
+    is_admin = bool(admin_chat_id and chat_id == admin_chat_id)
     user_queries = len(get_user_queries(chat_id))
     bl_count = get_blacklist_count(chat_id)
     fav_count = get_favorites_count(chat_id)
     sw_count = len(get_stop_words(chat_id))
     bl_sellers_count = len(get_blacklisted_sellers(chat_id))
     silent_mode_str = get_silent_mode(chat_id)
-    silent_display = "Выключен" if silent_mode_str in ("off", "") else f"Включен ({silent_mode_str})"
-    backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y %H:%M') if LAST_BACKUP_TIME else "актуальна"
+    silent_display = "Выкл" if silent_mode_str in ("off", "") else silent_mode_str
     paused_str = "На паузе" if is_user_monitoring_paused(chat_id) else "● Активен"
 
-    status_text = (
-        f"<b>СТАТУС СИСТЕМЫ</b>\n"
-        f"────────────────────\n"
-        f"<b>Мониторинг:</b> {paused_str}\n"
-        f"<b>Аптайм:</b> {uptime_str} · <b>Проверок:</b> {TOTAL_CHECKS}\n"
-        f"<b>Интервал:</b> {config.get('check_interval_seconds', 60)} сек.\n"
-        f"<b>Поисков:</b> {user_queries} · <b>Избранное:</b> {fav_count}\n"
-        f"<b>Стоп-слов:</b> {sw_count} · <b>ЧС:</b> {bl_count} / {bl_sellers_count} авт.\n"
-        f"<b>Тихий режим:</b> {html.escape(silent_display)}\n"
-        f"<b>Синхронизация:</b> {backup_str}"
-    )
-    if chat_id == admin_chat_id:
-        status_text += (
-            f"\n\n<b>Админ:</b> {get_user_count()} польз. · "
-            f"{len(get_active_queries())} фильтров · {NEW_ADS_FOUND} отпр."
-        )
+    lines = [
+        "<b>МОЙ ПРОФИЛЬ</b>" if not is_admin else "<b>СТАТУС СИСТЕМЫ</b>",
+        "────────────────────",
+        f"<b>Мониторинг:</b> {paused_str}",
+        f"<b>Поисков:</b> {user_queries} · <b>Избранное:</b> {fav_count}",
+        f"<b>Стоп-слов:</b> {sw_count} · <b>ЧС:</b> {bl_count} / {bl_sellers_count} авт.",
+        f"<b>Тихий режим:</b> {html.escape(silent_display)}",
+    ]
+    if is_admin:
+        uptime_str = str(datetime.now() - START_TIME).split(".")[0]
+        backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y %H:%M') if LAST_BACKUP_TIME else "актуальна"
+        lines.extend([
+            "────────────────────",
+            f"<b>Аптайм:</b> {uptime_str} · <b>Проверок:</b> {TOTAL_CHECKS}",
+            f"<b>Интервал:</b> {config.get('check_interval_seconds', 60)}с · <b>Пользователей:</b> {get_user_count()}",
+            f"<b>Активных фильтров:</b> {len(get_active_queries())} · <b>Бэкап:</b> {backup_str}",
+        ])
     buttons = [
         [
             {"text": "Обновить", "callback_data": "cb:stats"},
             {"text": "‹ Назад", "callback_data": "cb:menu"}
         ]
     ]
-    _send_or_edit(tg, chat_id, status_text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
+    _send_or_edit(tg, chat_id, "\n".join(lines), reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
 def show_help_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
@@ -3291,18 +3283,12 @@ def main():
     bot_username = bot_info.get("username", "Unknown")
     print(f"\n🚀 Бот @{bot_username} успешно авторизован!")
 
-    # Register sleek minimal slash commands menu in Telegram
+    # Register clean minimal slash commands menu in Telegram
     tg.set_my_commands([
         {"command": "start", "description": "Главное меню"},
         {"command": "app", "description": "Открыть Mini App"},
-        {"command": "all", "description": "Вывести актуальные объявления"},
         {"command": "list", "description": "Мои поиски"},
-        {"command": "add", "description": "Добавить поиск"},
-        {"command": "favs", "description": "Избранное"},
-        {"command": "settings", "description": "Настройки и ЧС"},
-        {"command": "pause", "description": "Поставить на паузу"},
-        {"command": "resume", "description": "Возобновить мониторинг"},
-        {"command": "status", "description": "Статистика"},
+        {"command": "pause", "description": "Пауза / Старт"},
         {"command": "help", "description": "Справка"}
     ])
 
