@@ -30,6 +30,7 @@ from database import (
     get_blacklist_count,
     get_price_history,
     get_query_seen_count,
+    get_setting,
     get_silent_mode,
     get_stop_words,
     get_user_blacklist,
@@ -335,6 +336,7 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
             "total_active_queries": len(get_active_queries()),
             "users_list": get_admin_users_overview(),
             "api_events": get_events() if callable(get_events) else [],
+            "backup_freq": get_setting("backup_freq", "2") or "2",
         })
 
     return {
@@ -1040,7 +1042,15 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
     <div class="card">
       <div class="section-title"><span class="title-ic" id="icAlbumsTitle"></span>Управление сервером</div>
       <div class="query-meta" style="margin-top:6px">
-        Быстрые действия администратора: внеочередной цикл поиска, облачный бэкап в Telegram и вывод объявлений.
+        Внеочередной цикл поиска, вывод в чат и тихий автобэкап по расписанию (без спама в чате).
+      </div>
+      <span class="field-label" style="margin-top:10px">Автобэкап в Telegram (время Минск)</span>
+      <div class="seg" id="backupSeg" style="grid-template-columns:repeat(5,1fr)">
+        <button class="seg-btn" data-bf="1" onclick="setBackupFreq('1')">1x<br><span style="font-size:9.5px;opacity:0.75">09:00</span></button>
+        <button class="seg-btn" data-bf="2" onclick="setBackupFreq('2')">2x<br><span style="font-size:9.5px;opacity:0.75">09, 21</span></button>
+        <button class="seg-btn" data-bf="3" onclick="setBackupFreq('3')">3x<br><span style="font-size:9.5px;opacity:0.75">09..21</span></button>
+        <button class="seg-btn" data-bf="4" onclick="setBackupFreq('4')">4x<br><span style="font-size:9.5px;opacity:0.75">03..21</span></button>
+        <button class="seg-btn" data-bf="off" onclick="setBackupFreq('off')">Выкл<br><span style="font-size:9.5px;opacity:0.75">ручн.</span></button>
       </div>
       <div class="row-2" style="margin-top:12px">
         <button class="btn btn-ghost btn-block" onclick="triggerCheckNow()" id="btnStatsCheck"></button>
@@ -1623,6 +1633,10 @@ function renderAll() {
           </div>
         `).join('')
       : `<div class="query-meta">Событий пока нет (логи появятся после очередного цикла).</div>`;
+    const bf = String(st.backup_freq || '2');
+    document.querySelectorAll('#backupSeg .seg-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.bf === bf);
+    });
   } else {
     document.getElementById('statsGrid').innerHTML = '';
     document.getElementById('adminUsersList').innerHTML = '';
@@ -2654,7 +2668,14 @@ async function unblockSeller(name) {
 async function syncAdminBackup() {
   haptic('medium');
   await api('/api/admin/backup', 'POST', {});
-  showToast('Бэкап отправлен в Telegram Cloud');
+  showToast('Бэкап тихо обновлён в Telegram Cloud');
+}
+
+async function setBackupFreq(freq) {
+  haptic('light');
+  await api('/api/admin/backup', 'POST', { backup_freq: freq });
+  await loadState();
+  showToast(freq === 'off' ? 'Автобэкап отключён' : `Автобэкап: ${freq}x в день (Минск)`);
 }
 
 async function setFavStatus(adId, status) {
@@ -2889,6 +2910,15 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     admin_chat_id = config.get("admin_chat_id", 0)
                     if not (admin_chat_id and chat_id == admin_chat_id):
                         self._send_json(403, {"ok": False, "error": "Доступно только администратору"})
+                        return
+                    if "backup_freq" in body:
+                        freq = str(body.get("backup_freq") or "2").strip()
+                        if freq not in ("1", "2", "3", "4", "off"):
+                            self._send_json(400, {"ok": False, "error": "Неверная частота автобэкапа"})
+                            return
+                        set_setting("backup_freq", freq)
+                        app_ctx["sync_backup"]()
+                        self._send_json(200, {"ok": True, "backup_freq": freq})
                         return
                     fn = app_ctx.get("sync_cloud_backup_now") or app_ctx["sync_backup"]
                     fn()

@@ -105,9 +105,18 @@ NEW_ADS_FOUND = 0
 FORCE_CHECK_EVENT = threading.Event()
 STOP_EVENT = threading.Event()
 
-# Timestamp of last saved backup
+# Timestamp of last saved backup & scheduled cloud sync settings
 LAST_BACKUP_TIME: Optional[datetime] = None
 BACKUP_FILE = os.path.join(os.path.dirname(__file__), "backup_state.json")
+BACKUP_DIRTY: bool = False
+BACKUP_LOCK = threading.Lock()
+BACKUP_SCHEDULES: Dict[str, List[str]] = {
+    "1": ["09:00"],
+    "2": ["09:00", "21:00"],
+    "3": ["09:00", "15:00", "21:00"],
+    "4": ["03:00", "09:00", "15:00", "21:00"],
+    "off": [],
+}
 
 # Global clients for automatic background state syncing
 GLOBAL_TG: Optional[TelegramClient] = None
@@ -1119,6 +1128,11 @@ def hunter_loop(tg: TelegramClient, config: dict):
                     check_favorites_tracker(tg)
                 except Exception as e:
                     logger.error(f"Error in favorites tracker: {e}")
+
+            try:
+                maybe_run_scheduled_backup(tg, config)
+            except Exception as e:
+                logger.error(f"Error in scheduled backup: {e}")
         except Exception as e:
             logger.error(f"Unexpected error in hunter loop: {e}")
             record_api_event("error", f"Цикл: {e}")
@@ -1130,8 +1144,8 @@ def hunter_loop(tg: TelegramClient, config: dict):
 # ==================== UI & COMMAND HANDLERS ====================
 
 def save_local_backup():
-    """Silently saves current state to backup_state.json and syncs to Telegram Cloud."""
-    global LAST_BACKUP_TIME
+    """Silently saves current state to backup_state.json and marks cloud backup dirty (no Telegram spam)."""
+    global LAST_BACKUP_TIME, BACKUP_DIRTY
     try:
         state = export_database_state()
         has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words") or state.get("favorites"))
@@ -1139,103 +1153,170 @@ def save_local_backup():
             with open(BACKUP_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
             LAST_BACKUP_TIME = datetime.now()
-        
-        # Trigger silent background cloud sync to Telegram
-        if GLOBAL_TG and GLOBAL_CONFIG:
-            sync_backup_to_telegram(GLOBAL_TG, GLOBAL_CONFIG, force_notify=False)
+            BACKUP_DIRTY = True
     except Exception as e:
         logger.error(f"Error saving local backup: {e}")
 
 
-def sync_backup_to_telegram(tg: TelegramClient, config: dict, force_notify: bool = False):
+def sync_backup_to_telegram(
+    tg: TelegramClient,
+    config: dict,
+    force_notify: bool = False,
+    in_place_only: bool = False
+):
     """
-    Saves state locally to backup_state.json and silently syncs to Telegram Cloud.
-    Updates the pinned backup message silently in-place without triggering notifications.
+    Syncs database state to Telegram Cloud.
+    Edits the pinned backup message/document in-place without sending duplicate files or re-pinning.
+    Triggered only on schedule (1-4x/day), manual admin action, or graceful shutdown (in_place_only).
     """
-    global LAST_BACKUP_TIME
+    global LAST_BACKUP_TIME, BACKUP_DIRTY
     admin_chat_id = config.get("admin_chat_id", 0)
     if not admin_chat_id:
         return
 
-    try:
-        state = export_database_state()
-        has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words") or state.get("favorites"))
-        if has_data:
-            with open(BACKUP_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-            LAST_BACKUP_TIME = datetime.now()
+    with BACKUP_LOCK:
+        try:
+            state = export_database_state()
+            has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words") or state.get("favorites"))
+            if has_data:
+                with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+                LAST_BACKUP_TIME = datetime.now()
 
-        raw_json = json.dumps(state, ensure_ascii=False)
-        updated_time = datetime.now().strftime("%d.%m.%Y в %H:%M:%S")
-        q_count = len(state.get("queries", []))
-        bl_count = len(state.get("blacklisted_ads", []))
-        bl_sellers = len(state.get("blacklisted_sellers", []))
-        sw_count = len(state.get("stop_words", []))
-        fav_count = len(state.get("favorites", []))
+            raw_json = json.dumps(state, ensure_ascii=False)
+            minsk_tz = timezone(timedelta(hours=3))
+            updated_time = datetime.now(minsk_tz).strftime("%d.%m.%Y в %H:%M:%S")
+            q_count = len(state.get("queries", []))
+            bl_count = len(state.get("blacklisted_ads", []))
+            bl_sellers = len(state.get("blacklisted_sellers", []))
+            sw_count = len(state.get("stop_words", []))
+            fav_count = len(state.get("favorites", []))
 
-        backup_text = (
-            f"💾 <b>Kufar Hunter — Синхронизация данных</b>\n"
-            f"<i>Хранит ваши фильтры, ЧС, избранное и настройки. Авто-обновление.</i>\n\n"
-            f"• 🎯 Поисков: <b>{q_count}</b>\n"
-            f"• ⭐️ В Избранном: <b>{fav_count}</b>\n"
-            f"• 🚫 В ЧС объявлений: <b>{bl_count}</b>\n"
-            f"• 👤 В ЧС продавцов: <b>{bl_sellers}</b>\n"
-            f"• ⛔ Стоп-слов: <b>{sw_count}</b>\n"
-            f"🕒 <i>Синхронизировано: {updated_time}</i>\n\n"
-            f"#KUFAR_BACKUP_START\n"
-            f"<pre><code class=\"language-json\">{html.escape(raw_json)}</code></pre>\n"
-            f"#KUFAR_BACKUP_END"
-        )
+            backup_text = (
+                f"💾 <b>Kufar Hunter — Синхронизация данных</b>\n"
+                f"<i>Хранит ваши фильтры, ЧС, избранное и настройки.</i>\n\n"
+                f"• Поисков: <b>{q_count}</b>\n"
+                f"• В Избранном: <b>{fav_count}</b>\n"
+                f"• В ЧС объявлений: <b>{bl_count}</b>\n"
+                f"• В ЧС продавцов: <b>{bl_sellers}</b>\n"
+                f"• Стоп-слов: <b>{sw_count}</b>\n"
+                f"<i>Синхронизировано (Минск): {updated_time}</i>\n\n"
+                f"#KUFAR_BACKUP_START\n"
+                f"<pre><code class=\"language-json\">{html.escape(raw_json)}</code></pre>\n"
+                f"#KUFAR_BACKUP_END"
+            )
 
-        chat_info = tg.get_chat(admin_chat_id)
-        pinned = chat_info.get("pinned_message") if chat_info else None
+            chat_info = tg.get_chat(admin_chat_id)
+            pinned = chat_info.get("pinned_message") if chat_info else None
 
-        if not has_data and not force_notify:
-            # If current local state is completely empty, do NOT overwrite an existing cloud backup
-            if pinned and ("#KUFAR_BACKUP_START" in pinned.get("text", "") or "<!--KUFAR_BACKUP_START-->" in pinned.get("text", "") or pinned.get("document")):
-                logger.warning("Local state is empty while cloud backup exists; skipping overwrite to prevent data loss.")
-                return
+            if not has_data and not force_notify:
+                if pinned and ("#KUFAR_BACKUP_START" in pinned.get("text", "") or "<!--KUFAR_BACKUP_START-->" in pinned.get("text", "") or pinned.get("document")):
+                    logger.warning("Local state is empty while cloud backup exists; skipping overwrite.")
+                    return
 
-        if len(backup_text) <= 4000:
-            if pinned and ("#KUFAR_BACKUP_START" in pinned.get("text", "") or "<!--KUFAR_BACKUP_START-->" in pinned.get("text", "")):
-                # Silent in-place edit! Zero notification sound, zero new messages!
-                tg.edit_message_text(admin_chat_id, pinned["message_id"], backup_text, parse_mode="HTML")
+            if len(backup_text) <= 4000:
+                if pinned and ("#KUFAR_BACKUP_START" in pinned.get("text", "") or "<!--KUFAR_BACKUP_START-->" in pinned.get("text", "")):
+                    tg.edit_message_text(admin_chat_id, pinned["message_id"], backup_text, parse_mode="HTML")
+                elif not in_place_only:
+                    old_mid = pinned.get("message_id") if pinned and (pinned.get("document") or "#KUFAR_BACKUP" in (pinned.get("text", "") + pinned.get("caption", ""))) else None
+                    msg = tg.send_message(admin_chat_id, backup_text, disable_notification=True)
+                    if msg and isinstance(msg, dict) and "message_id" in msg:
+                        tg.pin_chat_message(admin_chat_id, msg["message_id"], disable_notification=True)
+                        if old_mid and old_mid != msg["message_id"]:
+                            try:
+                                tg.delete_message(admin_chat_id, old_mid)
+                            except Exception:
+                                pass
             else:
-                msg = tg.send_message(admin_chat_id, backup_text, disable_notification=True)
-                if msg and isinstance(msg, dict) and "message_id" in msg:
-                    tg.pin_chat_message(admin_chat_id, msg["message_id"], disable_notification=True)
-        else:
-            caption = (
-                f"💾 <b>Kufar Hunter — Резервная копия</b>\n\n"
-                f"• Поисков: {q_count}, В ЧС: {bl_count}, Продавцов: {bl_sellers}, Стоп-слов: {sw_count}\n"
-                f"🕒 {updated_time}\n#KUFAR_BACKUP_DOC"
-            )
-            old_mid = pinned.get("message_id") if pinned else None
-            doc_msg = tg.send_document(
-                admin_chat_id,
-                "kufar_backup.json",
-                raw_json.encode("utf-8"),
-                caption=caption
-            )
-            if doc_msg and isinstance(doc_msg, dict) and "message_id" in doc_msg:
-                tg.pin_chat_message(admin_chat_id, doc_msg["message_id"], disable_notification=True)
-                if old_mid and old_mid != doc_msg["message_id"]:
-                    try:
-                        tg.delete_message(admin_chat_id, old_mid)
-                    except Exception:
-                        pass
+                caption = (
+                    f"💾 <b>Kufar Hunter — Резервная копия</b>\n\n"
+                    f"• Поисков: {q_count}, Избр.: {fav_count}, В ЧС: {bl_count}, Продавцов: {bl_sellers}, Стоп-слов: {sw_count}\n"
+                    f"🕒 {updated_time} (Минск)\n#KUFAR_BACKUP_DOC"
+                )
+                if pinned and pinned.get("document"):
+                    # Replace file in-place: zero new messages, zero pin notifications!
+                    ok = tg.edit_message_media_document(
+                        admin_chat_id,
+                        pinned["message_id"],
+                        "kufar_backup.json",
+                        raw_json.encode("utf-8"),
+                        caption=caption,
+                    )
+                    if ok:
+                        BACKUP_DIRTY = False
+                        record_api_event("ok", f"Облачный бэкап обновлён ({updated_time})")
+                        if force_notify:
+                            tg.send_message(
+                                admin_chat_id,
+                                f"✅ <b>Резервная копия обновлена в закрепе!</b>\n"
+                                f"Поисков: {q_count} · Избранное: {fav_count} · ЧС: {bl_count}"
+                            )
+                        return
 
-        if force_notify:
-            tg.send_message(
-                admin_chat_id,
-                f"✅ <b>Резервная копия сохранена в Telegram!</b>\n"
-                f"🎯 Поисков: {q_count}\n"
-                f"🚫 В ЧС объявлений: {bl_count}\n"
-                f"👤 В ЧС продавцов: {bl_sellers}\n"
-                f"⛔ Стоп-слов: {sw_count}"
-            )
-    except Exception as e:
-        logger.error(f"Error syncing backup to Telegram: {e}")
+                if not in_place_only:
+                    old_mid = pinned.get("message_id") if pinned else None
+                    doc_msg = tg.send_document(
+                        admin_chat_id,
+                        "kufar_backup.json",
+                        raw_json.encode("utf-8"),
+                        caption=caption,
+                        disable_notification=True
+                    )
+                    if doc_msg and isinstance(doc_msg, dict) and "message_id" in doc_msg:
+                        tg.pin_chat_message(admin_chat_id, doc_msg["message_id"], disable_notification=True)
+                        if old_mid and old_mid != doc_msg["message_id"]:
+                            try:
+                                tg.delete_message(admin_chat_id, old_mid)
+                            except Exception:
+                                pass
+
+            BACKUP_DIRTY = False
+            record_api_event("ok", f"Облачный бэкап сохранён ({updated_time})")
+            if force_notify:
+                tg.send_message(
+                    admin_chat_id,
+                    f"✅ <b>Резервная копия сохранена в Telegram!</b>\n"
+                    f"🎯 Поисков: {q_count}\n"
+                    f"⭐️ Избранное: {fav_count}\n"
+                    f"🚫 В ЧС объявлений: {bl_count}\n"
+                    f"👤 В ЧС продавцов: {bl_sellers}\n"
+                    f"⛔ Стоп-слов: {sw_count}"
+                )
+        except Exception as e:
+            logger.error(f"Error syncing backup to Telegram: {e}")
+            record_api_event("error", f"Ошибка бэкапа: {e}")
+
+
+def maybe_run_scheduled_backup(tg: TelegramClient, config: dict):
+    """
+    Runs Telegram Cloud backup only at configured fixed times of day (1-4x daily in Minsk UTC+3),
+    never spamming on user actions.
+    """
+    freq = str(get_setting("backup_freq", "2") or "2").strip()
+    slots = BACKUP_SCHEDULES.get(freq, BACKUP_SCHEDULES["2"])
+    if not slots:
+        return
+
+    minsk_tz = timezone(timedelta(hours=3))
+    now_dt = datetime.now(minsk_tz)
+    day_str = now_dt.strftime("%Y-%m-%d")
+    now_min = now_dt.hour * 60 + now_dt.minute
+    last_slot = get_setting("last_backup_slot", "") or ""
+
+    for slot in slots:
+        try:
+            sh, sm = map(int, slot.split(":"))
+            slot_min = sh * 60 + sm
+        except Exception:
+            continue
+        # Trigger once within the 30-minute window after each scheduled time
+        if 0 <= (now_min - slot_min) <= 30:
+            slot_key = f"{day_str}_{slot}"
+            if last_slot != slot_key:
+                set_setting("last_backup_slot", slot_key)
+                logger.info(f"Running scheduled Telegram Cloud backup for slot {slot_key} (freq={freq}x/day)")
+                sync_backup_to_telegram(tg, config, force_notify=False)
+                break
 
 
 def restore_state_from_telegram(tg: TelegramClient, config: dict) -> bool:
@@ -2332,14 +2413,12 @@ def _dispatch_callback_query(
     elif data in ("cb:pause", "cb:hub_pause"):
         set_user_monitoring_paused(chat_id, True)
         save_local_backup()
-        sync_backup_to_telegram(tg, config, force_notify=False)
         ack(text="⏸ Мониторинг поставлен на паузу")
         show_main_menu(tg, chat_id, edit_msg_id=msg_id if data == "cb:hub_pause" else None)
 
     elif data in ("cb:resume", "cb:hub_resume"):
         set_user_monitoring_paused(chat_id, False)
         save_local_backup()
-        sync_backup_to_telegram(tg, config, force_notify=False)
         ack(text="▶️ Мониторинг возобновлен!")
         FORCE_CHECK_EVENT.set()
         show_main_menu(tg, chat_id, edit_msg_id=msg_id if data == "cb:hub_resume" else None)
@@ -2350,7 +2429,6 @@ def _dispatch_callback_query(
         make_active = bool(int(parts[3]))
         toggle_query_active(qid, make_active, chat_id=chat_id)
         save_local_backup()
-        sync_backup_to_telegram(tg, config, force_notify=False)
         status_txt = "возобновлен (активен)" if make_active else "поставлен на паузу"
         ack(text=f"Поиск [ID: {qid}] {status_txt}")
         show_my_searches(tg, chat_id, edit_msg_id=msg_id)
@@ -2449,8 +2527,8 @@ def _dispatch_callback_query(
         # Notify admin of new filter
         notify_admin_new_filter(tg, chat_id, from_user, qid, item["name"], item["params"], config)
 
-        # Sync cloud backup to Telegram so search is never lost on Render deploy
-        sync_backup_to_telegram(tg, config)
+        # Save locally; scheduled Telegram Cloud backup handles periodic sync without spam
+        save_local_backup()
 
         tg.send_message(
             chat_id,
@@ -2469,7 +2547,7 @@ def _dispatch_callback_query(
     elif data.startswith("cb:del:"):
         qid = int(data.split(":")[-1])
         delete_query(qid, chat_id=chat_id)
-        sync_backup_to_telegram(tg, config)
+        save_local_backup()
         ack(text=f"🗑 Поиск [ID: {qid}] удалён")
         show_my_searches(tg, chat_id, edit_msg_id=msg_id)
         admin_chat_id = config.get("admin_chat_id", 0)
@@ -2919,7 +2997,6 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         USER_STATES.pop(chat_id, None)
         set_user_monitoring_paused(chat_id, True)
         save_local_backup()
-        sync_backup_to_telegram(tg, config, force_notify=False)
         tg.send_message(chat_id, "⏸ <b>Мониторинг Kufar приостановлен.</b> Ваши фильтры и ЧС сохранены.")
         show_main_menu(tg, chat_id)
         return
@@ -2938,7 +3015,6 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         USER_STATES.pop(chat_id, None)
         set_user_monitoring_paused(chat_id, False)
         save_local_backup()
-        sync_backup_to_telegram(tg, config, force_notify=False)
         FORCE_CHECK_EVENT.set()
         tg.send_message(chat_id, "▶️ <b>Мониторинг Kufar возобновлён!</b>")
         show_main_menu(tg, chat_id)
@@ -3291,6 +3367,11 @@ def main():
         logger.info(f"Received signal {signum}, gracefully terminating bot instance...")
         STOP_EVENT.set()
         FORCE_CHECK_EVENT.set()
+        if BACKUP_DIRTY:
+            try:
+                sync_backup_to_telegram(tg, config, force_notify=False, in_place_only=True)
+            except Exception:
+                pass
         sys.exit(0)
 
     try:

@@ -286,13 +286,16 @@ class TelegramClient:
         chat_id: int,
         filename: str,
         content_bytes: bytes,
-        caption: Optional[str] = None
+        caption: Optional[str] = None,
+        disable_notification: bool = True
     ) -> Optional[Dict[str, Any]]:
         """Uploads a document (e.g. backup file) using multipart/form-data."""
         import time
         boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
         parts = []
         parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode("utf-8"))
+        if disable_notification:
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"disable_notification\"\r\n\r\ntrue\r\n".encode("utf-8"))
         if caption:
             parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption}\r\n".encode("utf-8"))
             parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n".encode("utf-8"))
@@ -316,3 +319,47 @@ class TelegramClient:
         except Exception as e:
             logger.error(f"Error uploading document: {e}")
             return None
+
+    def edit_message_media_document(
+        self,
+        chat_id: int,
+        message_id: int,
+        filename: str,
+        content_bytes: bytes,
+        caption: Optional[str] = None
+    ) -> bool:
+        """Replaces an existing document message in-place via editMessageMedia without creating/pinning new messages."""
+        import time
+        boundary = f"----WebKitFormBoundary{int(time.time() * 1000)}"
+        media_obj: Dict[str, Any] = {"type": "document", "media": "attach://document"}
+        if caption:
+            media_obj["caption"] = caption
+            media_obj["parse_mode"] = "HTML"
+
+        parts = [
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n".encode("utf-8"),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"message_id\"\r\n\r\n{message_id}\r\n".encode("utf-8"),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"media\"\r\n\r\n{json.dumps(media_obj, ensure_ascii=False)}\r\n".encode("utf-8"),
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"),
+            content_bytes,
+            f"\r\n--{boundary}--\r\n".encode("utf-8"),
+        ]
+        url = f"{self.base_url}/editMessageMedia"
+        req = urllib.request.Request(
+            url,
+            data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=35) as response:
+                res = json.loads(response.read().decode("utf-8"))
+                return bool(res.get("ok"))
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            if "message is not modified" in err_body.lower():
+                return True
+            logger.warning(f"editMessageMedia HTTP {e.code}: {err_body}")
+            return False
+        except Exception as e:
+            logger.warning(f"Error editing document media in-place: {e}")
+            return False
