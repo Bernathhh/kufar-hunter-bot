@@ -1,22 +1,7 @@
 {
   "version": 1,
-  "exported_at": "2026-11-24T15:40:00.000000",
-  "queries": [
-    {
-      "chat_id": 747868993,
-      "name": "slim",
-      "params": {
-        "query": "slim",
-        "prc": "r:100000,210000",
-        "ar": "v.or:22,23,24,25,26,27,28,29,30",
-        "rgn": "7",
-        "cat": "5040",
-        "sort": "lst.d",
-        "size": "30"
-      },
-      "is_active": 1
-    }
-  ],
+  "exported_at": "2026-11-24T15:52:22.727470",
+  "queries": [],
   "users": [
     {
       "chat_id": 747868993,
@@ -84,12 +69,19 @@
     }
   ],
   "settings": {
+    "template_747868993": "Здравствуйте! Готов забрать сегодня за наличные, актуально?",
     "check_interval_seconds": "30"
   },
   "deleted_queries": [
     {
       "chat_id": 747868993,
       "name": "PlayStation 5 Slim"
+    },
+    {
+      "chat_id": 747868993,
+      "name": "slim"
     }
-  ]
+  ],
+  "stop_words": [],
+  "blacklisted_sellers": []
 }

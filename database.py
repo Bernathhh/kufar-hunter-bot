@@ -10,12 +10,14 @@ from typing import List, Dict, Optional, Any, Set
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "kufar_hunter.db")
 
-def get_connection(db_path: str = DB_FILE) -> sqlite3.Connection:
+def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+    if not db_path:
+        db_path = DB_FILE
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db(db_path: str = DB_FILE):
+def init_db(db_path: Optional[str] = None):
     """Initializes tables and indices."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -129,7 +131,7 @@ def init_db(db_path: str = DB_FILE):
         conn.commit()
 
 
-def set_setting(key: str, value: str, db_path: str = DB_FILE):
+def set_setting(key: str, value: str, db_path: Optional[str] = None):
     """Sets a persistent key-value setting."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -137,7 +139,7 @@ def set_setting(key: str, value: str, db_path: str = DB_FILE):
         conn.commit()
 
 
-def get_setting(key: str, default: Optional[str] = None, db_path: str = DB_FILE) -> Optional[str]:
+def get_setting(key: str, default: Optional[str] = None, db_path: Optional[str] = None) -> Optional[str]:
     """Retrieves a persistent setting value."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -146,7 +148,7 @@ def get_setting(key: str, default: Optional[str] = None, db_path: str = DB_FILE)
         return row["value"] if row else default
 
 
-def add_query(chat_id: int, name: str, params: Dict[str, Any], db_path: str = DB_FILE) -> int:
+def add_query(chat_id: int, name: str, params: Dict[str, Any], db_path: Optional[str] = None) -> int:
     """Adds a new search query to track and unmarks it from deleted_queries if present."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -159,7 +161,7 @@ def add_query(chat_id: int, name: str, params: Dict[str, Any], db_path: str = DB
         return cursor.lastrowid
 
 
-def get_active_queries(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
+def get_active_queries(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Returns all active tracking queries across all chats."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -177,7 +179,7 @@ def get_active_queries(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
         return result
 
 
-def get_user_queries(chat_id: int, db_path: str = DB_FILE) -> List[Dict[str, Any]]:
+def get_user_queries(chat_id: int, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Returns all queries created by a specific user/chat."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -196,7 +198,7 @@ def get_user_queries(chat_id: int, db_path: str = DB_FILE) -> List[Dict[str, Any
         return result
 
 
-def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: str = DB_FILE) -> bool:
+def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
     """Deletes a query by ID and marks it in deleted_queries to prevent resurrection on restart."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -221,7 +223,7 @@ def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: str = DB
         return deleted
 
 
-def mark_query_deleted(chat_id: int, name: str, db_path: str = DB_FILE):
+def mark_query_deleted(chat_id: int, name: str, db_path: Optional[str] = None):
     """Records that a query was explicitly deleted by user to prevent resurrection on restart."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -232,7 +234,7 @@ def mark_query_deleted(chat_id: int, name: str, db_path: str = DB_FILE):
         conn.commit()
 
 
-def get_deleted_queries(chat_id: int, db_path: str = DB_FILE) -> Set[str]:
+def get_deleted_queries(chat_id: int, db_path: Optional[str] = None) -> Set[str]:
     """Returns set of query names that were deleted by user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -240,7 +242,7 @@ def get_deleted_queries(chat_id: int, db_path: str = DB_FILE) -> Set[str]:
         return {r["name"] for r in cursor.fetchall()}
 
 
-def is_ad_seen(query_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+def is_ad_seen(query_id: int, ad_id: int, db_path: Optional[str] = None) -> bool:
     """Checks if an ad has already been recorded for this query."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -248,7 +250,7 @@ def is_ad_seen(query_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
         return cursor.fetchone() is not None
 
 
-def get_ad_seen_price(query_id: int, ad_id: int, db_path: str = DB_FILE) -> Tuple[bool, Optional[float], Optional[float]]:
+def get_ad_seen_price(query_id: int, ad_id: int, db_path: Optional[str] = None) -> Tuple[bool, Optional[float], Optional[float]]:
     """
     Returns (is_seen, last_price_byn, last_price_usd).
     If not seen before, returns (False, None, None).
@@ -270,7 +272,7 @@ def mark_ad_seen(
     ad_id: int,
     price_byn: Optional[float] = None,
     price_usd: Optional[float] = None,
-    db_path: str = DB_FILE
+    db_path: Optional[str] = None
 ):
     """Marks an ad as seen and records its price."""
     with get_connection(db_path) as conn:
@@ -286,7 +288,7 @@ def mark_ad_seen(
         conn.commit()
 
 
-def mark_ads_seen(query_id: int, ad_ids: List[int], db_path: str = DB_FILE):
+def mark_ads_seen(query_id: int, ad_ids: List[int], db_path: Optional[str] = None):
     """Batch marks ad IDs as seen."""
     if not ad_ids:
         return
@@ -300,7 +302,7 @@ def mark_ads_seen(query_id: int, ad_ids: List[int], db_path: str = DB_FILE):
 def mark_ads_seen_batch(
     query_id: int,
     ads: List[Dict[str, Any]],
-    db_path: str = DB_FILE
+    db_path: Optional[str] = None
 ):
     """Batch marks ads as seen with their current prices."""
     if not ads:
@@ -322,7 +324,7 @@ def mark_ads_seen_batch(
         conn.commit()
 
 
-def get_query_seen_count(query_id: int, db_path: str = DB_FILE) -> int:
+def get_query_seen_count(query_id: int, db_path: Optional[str] = None) -> int:
     """Returns the total number of ads seen for this query."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -338,7 +340,7 @@ def register_or_update_user(
     username: Optional[str] = None,
     first_name: Optional[str] = None,
     last_name: Optional[str] = None,
-    db_path: str = DB_FILE
+    db_path: Optional[str] = None
 ) -> bool:
     """
     Registers a new bot user or updates existing user's last_seen timestamp.
@@ -366,7 +368,7 @@ def register_or_update_user(
             return False
 
 
-def get_all_users(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
+def get_all_users(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """Returns all registered users."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -375,7 +377,7 @@ def get_all_users(db_path: str = DB_FILE) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-def get_user_count(db_path: str = DB_FILE) -> int:
+def get_user_count(db_path: Optional[str] = None) -> int:
     """Returns total number of registered users."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -386,7 +388,7 @@ def get_user_count(db_path: str = DB_FILE) -> int:
 
 # ==================== BLACKLIST (ЧС / НЕ ИНТЕРЕСНО) ====================
 
-def add_to_blacklist(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+def add_to_blacklist(chat_id: int, ad_id: int, db_path: Optional[str] = None) -> bool:
     """Adds an ad_id to user's blacklist so it is hidden and never shown again."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -398,7 +400,7 @@ def add_to_blacklist(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
         return cursor.rowcount > 0
 
 
-def remove_from_blacklist(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+def remove_from_blacklist(chat_id: int, ad_id: int, db_path: Optional[str] = None) -> bool:
     """Removes an ad_id from user's blacklist."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -410,7 +412,7 @@ def remove_from_blacklist(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> b
         return cursor.rowcount > 0
 
 
-def is_ad_blacklisted(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
+def is_ad_blacklisted(chat_id: int, ad_id: int, db_path: Optional[str] = None) -> bool:
     """Checks if an ad_id is in user's blacklist."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -421,7 +423,7 @@ def is_ad_blacklisted(chat_id: int, ad_id: int, db_path: str = DB_FILE) -> bool:
         return cursor.fetchone() is not None
 
 
-def get_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> Set[int]:
+def get_user_blacklist(chat_id: int, db_path: Optional[str] = None) -> Set[int]:
     """Returns a set of ad_ids currently blacklisted by user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -429,7 +431,7 @@ def get_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> Set[int]:
         return {r["ad_id"] for r in cursor.fetchall()}
 
 
-def get_blacklist_count(chat_id: int, db_path: str = DB_FILE) -> int:
+def get_blacklist_count(chat_id: int, db_path: Optional[str] = None) -> int:
     """Returns total blacklisted ads count for user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -438,7 +440,7 @@ def get_blacklist_count(chat_id: int, db_path: str = DB_FILE) -> int:
         return row["cnt"] if row else 0
 
 
-def clear_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> int:
+def clear_user_blacklist(chat_id: int, db_path: Optional[str] = None) -> int:
     """Clears all blacklisted ads for a user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -449,7 +451,7 @@ def clear_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> int:
 
 # ==================== STOP WORDS (МИНУС-СЛОВА) ====================
 
-def add_stop_word(chat_id: int, word: str, db_path: str = DB_FILE) -> bool:
+def add_stop_word(chat_id: int, word: str, db_path: Optional[str] = None) -> bool:
     """Adds a stop word for a user. Stored in lowercase."""
     clean_word = word.strip().lower()
     if not clean_word:
@@ -464,7 +466,7 @@ def add_stop_word(chat_id: int, word: str, db_path: str = DB_FILE) -> bool:
         return cursor.rowcount > 0
 
 
-def remove_stop_word(chat_id: int, word: str, db_path: str = DB_FILE) -> bool:
+def remove_stop_word(chat_id: int, word: str, db_path: Optional[str] = None) -> bool:
     """Removes a stop word for a user."""
     clean_word = word.strip().lower()
     with get_connection(db_path) as conn:
@@ -477,7 +479,7 @@ def remove_stop_word(chat_id: int, word: str, db_path: str = DB_FILE) -> bool:
         return cursor.rowcount > 0
 
 
-def get_stop_words(chat_id: int, db_path: str = DB_FILE) -> List[str]:
+def get_stop_words(chat_id: int, db_path: Optional[str] = None) -> List[str]:
     """Returns list of stop words for a user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -485,7 +487,7 @@ def get_stop_words(chat_id: int, db_path: str = DB_FILE) -> List[str]:
         return [r["word"] for r in cursor.fetchall()]
 
 
-def clear_stop_words(chat_id: int, db_path: str = DB_FILE) -> int:
+def clear_stop_words(chat_id: int, db_path: Optional[str] = None) -> int:
     """Clears all stop words for a user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -496,7 +498,7 @@ def clear_stop_words(chat_id: int, db_path: str = DB_FILE) -> int:
 
 # ==================== BLACKLISTED SELLERS (ЧС ПРОДАВЦОВ) ====================
 
-def add_blacklisted_seller(chat_id: int, seller_name: str, account_id: Optional[str] = None, db_path: str = DB_FILE) -> bool:
+def add_blacklisted_seller(chat_id: int, seller_name: str, account_id: Optional[str] = None, db_path: Optional[str] = None) -> bool:
     """Adds a seller to user's blacklisted sellers list."""
     sname = seller_name.strip()
     if not sname:
@@ -511,7 +513,7 @@ def add_blacklisted_seller(chat_id: int, seller_name: str, account_id: Optional[
         return True
 
 
-def remove_blacklisted_seller(chat_id: int, seller_name: str, db_path: str = DB_FILE) -> bool:
+def remove_blacklisted_seller(chat_id: int, seller_name: str, db_path: Optional[str] = None) -> bool:
     """Removes a seller from user's blacklisted sellers list."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -523,7 +525,7 @@ def remove_blacklisted_seller(chat_id: int, seller_name: str, db_path: str = DB_
         return cursor.rowcount > 0
 
 
-def get_blacklisted_sellers(chat_id: int, db_path: str = DB_FILE) -> Set[str]:
+def get_blacklisted_sellers(chat_id: int, db_path: Optional[str] = None) -> Set[str]:
     """Returns set of blacklisted seller names for user."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -531,7 +533,7 @@ def get_blacklisted_sellers(chat_id: int, db_path: str = DB_FILE) -> Set[str]:
         return {r["seller_name"] for r in cursor.fetchall()}
 
 
-def is_seller_blacklisted(chat_id: int, seller_name: str, account_id: Optional[str] = None, db_path: str = DB_FILE) -> bool:
+def is_seller_blacklisted(chat_id: int, seller_name: str, account_id: Optional[str] = None, db_path: Optional[str] = None) -> bool:
     """Checks if a seller is in user's blacklist."""
     sname = (seller_name or "").strip()
     if not sname:
@@ -555,19 +557,19 @@ def is_seller_blacklisted(chat_id: int, seller_name: str, account_id: Optional[s
 
 DEFAULT_CONTACT_TEMPLATE = "Здравствуйте! Готов забрать сегодня за наличные, актуально?"
 
-def get_user_template(chat_id: int, db_path: str = DB_FILE) -> str:
+def get_user_template(chat_id: int, db_path: Optional[str] = None) -> str:
     """Returns custom message template for contacting sellers, or default."""
     return get_setting(f"template_{chat_id}", DEFAULT_CONTACT_TEMPLATE, db_path=db_path)
 
 
-def set_user_template(chat_id: int, template: str, db_path: str = DB_FILE):
+def set_user_template(chat_id: int, template: str, db_path: Optional[str] = None):
     """Saves custom message template for contacting sellers."""
     set_setting(f"template_{chat_id}", template.strip(), db_path=db_path)
 
 
 # ==================== CLOUD STATE BACKUP & RESTORE ====================
 
-def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
+def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
     """Exports all queries, users, and blacklisted ads to a dictionary."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
@@ -624,7 +626,7 @@ def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
         }
 
 
-def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict[str, int]:
+def import_database_state(state: Dict[str, Any], db_path: Optional[str] = None) -> Dict[str, int]:
     """Imports queries, users, and blacklisted ads from a state dictionary."""
     init_db(db_path)
     imported_queries = 0
@@ -726,7 +728,7 @@ def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict
     }
 
 
-def cleanup_legacy_queries(db_path: str = DB_FILE):
+def cleanup_legacy_queries(db_path: Optional[str] = None):
     """Purges any legacy starter queries (e.g. PlayStation 5 Slim) from the database."""
     with get_connection(db_path) as conn:
         cursor = conn.cursor()
