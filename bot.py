@@ -162,6 +162,34 @@ def start_health_server(port: int):
         logger.warning(f"Could not start health check HTTP server on port {port}: {e}")
 
 
+def keep_alive_loop():
+    """Pings the public Render URL every 10 minutes to prevent Render Free Tier from sleeping."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    health_url = url.rstrip("/") + "/health"
+    logger.info(f"Keep-alive background pinger started for {health_url}")
+    time.sleep(60)  # Wait 1 minute after startup before first ping
+    while not STOP_EVENT.is_set():
+        try:
+            req = urllib.request.Request(
+                health_url,
+                headers={"User-Agent": "KufarHunterKeepAlive/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                logger.debug(f"Keep-alive ping to {health_url} succeeded (status: {resp.status})")
+        except Exception as e:
+            logger.debug(f"Keep-alive ping error to {health_url}: {e}")
+        time.sleep(600)  # Ping every 10 minutes (Render sleep threshold is 15 minutes)
+
+
+def start_keep_alive_pinger():
+    """Starts background thread to ping Render public URL and prevent spin-down."""
+    if os.getenv("RENDER_EXTERNAL_URL"):
+        thread = threading.Thread(target=keep_alive_loop, daemon=True)
+        thread.start()
+
+
 def parse_price_range(prc_param: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
     """
     Parses Kufar 'prc' parameter, e.g. 'r:100000,210000' -> (1000.0, 2100.0).
@@ -1591,6 +1619,9 @@ def main():
         start_health_server(int(port_env))
     elif os.getenv("ENABLE_HEALTH_SERVER"):
         start_health_server(8080)
+
+    # Start self-pinger to prevent Render Free Tier from sleeping
+    start_keep_alive_pinger()
 
     # Start Hunter background thread
     hunter_thread = threading.Thread(target=hunter_loop, args=(tg, config), daemon=True)
