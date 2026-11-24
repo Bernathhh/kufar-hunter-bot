@@ -2,11 +2,12 @@
 SQLite Database manager for Kufar Hunter Bot.
 Stores tracking queries and seen advertisements to avoid duplicates.
 """
+from __future__ import annotations
 import sqlite3
 import json
 import os
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Optional, Any, Set
+from typing import List, Dict, Optional, Any, Set, Tuple
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "kufar_hunter.db")
 
