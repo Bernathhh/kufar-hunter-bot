@@ -37,7 +37,11 @@ class TelegramClient:
                     return None
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
-            logger.error(f"HTTPError on {method}: {e.code} - {err_body}")
+            if e.code == 409:
+                logger.warning("Telegram conflict (HTTP 409): another bot instance is polling getUpdates. Backing off for 5s...")
+                time.sleep(5)
+            else:
+                logger.error(f"HTTPError on {method}: {e.code} - {err_body}")
             return None
         except Exception as e:
             logger.error(f"Exception on {method}: {e}")

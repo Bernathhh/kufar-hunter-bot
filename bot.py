@@ -15,6 +15,7 @@ import http.server
 import socketserver
 import re
 import statistics
+import signal
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -2300,6 +2301,10 @@ def telegram_listener(tg: TelegramClient, config: dict):
     while not STOP_EVENT.is_set():
         try:
             updates = tg.get_updates(offset=last_update_id, timeout=20)
+            if not updates:
+                time.sleep(0.5)
+                continue
+
             for u in updates:
                 last_update_id = u["update_id"] + 1
 
@@ -2425,14 +2430,26 @@ def main():
     interval = config.get("check_interval_seconds", 60)
     print(f"📡 Охотник запущен (интервал: {interval} сек).")
 
+    def handle_shutdown(signum, frame):
+        logger.info(f"Received signal {signum}, gracefully terminating bot instance...")
+        STOP_EVENT.set()
+        FORCE_CHECK_EVENT.set()
+        sys.exit(0)
+
     try:
-        while True:
+        signal.signal(signal.SIGTERM, handle_shutdown)
+        signal.signal(signal.SIGINT, handle_shutdown)
+    except Exception:
+        pass
+
+    try:
+        while not STOP_EVENT.is_set():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Остановка бота...")
         STOP_EVENT.set()
         FORCE_CHECK_EVENT.set()
-        time.sleep(1)
+        time.sleep(0.5)
         print("Бот остановлен.")
 
 
