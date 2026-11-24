@@ -13,6 +13,8 @@ import html
 import json
 import http.server
 import socketserver
+import re
+import statistics
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Set
 
@@ -45,7 +47,18 @@ from database import (
     get_setting,
     set_setting,
     export_database_state,
-    import_database_state
+    import_database_state,
+    add_stop_word,
+    remove_stop_word,
+    get_stop_words,
+    clear_stop_words,
+    add_blacklisted_seller,
+    remove_blacklisted_seller,
+    get_blacklisted_sellers,
+    is_seller_blacklisted,
+    get_user_template,
+    set_user_template,
+    DEFAULT_CONTACT_TEMPLATE
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -75,6 +88,9 @@ BACKUP_FILE = os.path.join(os.path.dirname(__file__), "backup_state.json")
 
 # Photos cache for on-demand gallery viewing (ad_id -> list of urls)
 AD_PHOTOS_CACHE: Dict[int, List[str]] = {}
+
+# Full ad data cache for fast callbacks (seller blacklist, contact template, etc.)
+AD_DATA_CACHE: Dict[int, Dict[str, Any]] = {}
 
 # Map of (chat_id, ad_id) -> list of Telegram message IDs sent for this ad
 AD_MESSAGES_MAP: Dict[Tuple[int, int], List[int]] = {}
@@ -110,6 +126,7 @@ MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
         [{"text": "📦 Вывести всё"}, {"text": "⏱ Интервал"}],
+        [{"text": "⛔ Стоп-слова"}, {"text": "💬 Мой шаблон"}],
         [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
     ],
     "resize_keyboard": True
@@ -120,6 +137,7 @@ def make_ad_keyboard(
     ad_link: str,
     ad_id: int,
     photo_count: int = 0,
+    seller_name: Optional[str] = None,
     is_blacklisted: bool = False
 ) -> Dict[str, Any]:
     """Builds inline action keyboard attached directly to ad cards."""
@@ -127,18 +145,120 @@ def make_ad_keyboard(
     
     # 1. Open on Kufar
     buttons.append([{"text": "🔗 Открыть на Kufar", "url": ad_link}])
+
+    # 2. Quick message template
+    buttons.append([{"text": "💬 Написать продавцу (шаблон)", "callback_data": f"cb:contact:{ad_id}"}])
     
-    # 2. Show all photos button if multiple photos exist
+    # 3. Show all photos button if multiple photos exist
     if photo_count > 1:
         buttons.append([{"text": f"📸 Показать все фото ({photo_count} шт.)", "callback_data": f"cb:photos:{ad_id}"}])
 
-    # 3. Blacklist toggle button
+    # 4. Blacklist ad & Blacklist seller
+    bl_row = []
     if is_blacklisted:
-        buttons.append([{"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"}])
+        bl_row.append({"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"})
     else:
-        buttons.append([{"text": "🚫 Не интересно (в ЧС)", "callback_data": f"cb:bl:{ad_id}"}])
+        bl_row.append({"text": "🚫 В ЧС (скрыть)", "callback_data": f"cb:bl:{ad_id}"})
+
+    if seller_name:
+        clean_s = seller_name.strip()
+        short_s = clean_s[:13] + "…" if len(clean_s) > 14 else clean_s
+        bl_row.append({"text": f"👤 В ЧС: {short_s}", "callback_data": f"cb:bl_seller:{ad_id}"})
+    else:
+        bl_row.append({"text": "👤 В ЧС продавца", "callback_data": f"cb:bl_seller:{ad_id}"})
+
+    buttons.append(bl_row)
 
     return {"inline_keyboard": buttons}
+
+
+def calculate_market_stats(ads: List[Dict[str, Any]]) -> Optional[float]:
+    """Calculates median market price across current search results."""
+    prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
+    if len(prices) >= 3:
+        try:
+            return round(float(statistics.median(prices)), 2)
+        except Exception:
+            return None
+    return None
+
+
+def get_bargain_badge(price_byn: Optional[float], median_byn: Optional[float]) -> Optional[str]:
+    """Returns eye-catching market price badge comparing ad price to market median."""
+    if price_byn is None or median_byn is None or median_byn <= 0:
+        return None
+    diff_ratio = (price_byn - median_byn) / median_byn
+    med_str = f"{median_byn:,.0f} BYN".replace(",", " ")
+    if diff_ratio <= -0.18:
+        pct = round(abs(diff_ratio) * 100)
+        return f"💎 <b>ВЫГОДНО: на {pct}% ниже рынка!</b> (медиана ~{med_str})"
+    elif diff_ratio <= -0.07:
+        pct = round(abs(diff_ratio) * 100)
+        return f"🔥 <b>Хорошая цена: -{pct}% от рынка</b> (медиана ~{med_str})"
+    elif diff_ratio >= 0.20:
+        pct = round(diff_ratio * 100)
+        return f"⚠️ <b>Выше рынка на {pct}%</b> (медиана ~{med_str})"
+    elif diff_ratio >= 0.08:
+        pct = round(diff_ratio * 100)
+        return f"🏷 <b>Чуть выше рынка (+{pct}%)</b> (медиана ~{med_str})"
+    else:
+        return f"⚖️ <b>В рынке</b> (медиана ~{med_str})"
+
+
+def extract_smart_badges(subject: str, description: Optional[str]) -> List[str]:
+    """
+    Extracts key selling points, equipment and nuances from title and description.
+    (e.g. 2 gamepads, disc edition, warranty, full box, included games, regional version, jailbreak, defects).
+    """
+    text = (subject + " " + (description or "")).lower()
+    badges = []
+
+    # 1. Controllers / Gamepads
+    if re.search(r'(2\s*(геймпада|джойстика|контроллера|dualsense|dualshock)|два\s*(геймпада|джойстика|dualsense)|пара\s*(геймпадов|джойстиков)|\+2-й\s*геймпад|\+второй\s*(геймпад|джойстик))', text):
+        badges.append("🎮 2 геймпада")
+    elif re.search(r'(3\s*(геймпада|джойстика|контроллера)|три\s*(геймпада|джойстика))', text):
+        badges.append("🎮 3 геймпада")
+    elif re.search(r'(геймпад|джойстик|dualsense|dualshock)', text):
+        badges.append("🎮 Геймпад в комплекте")
+
+    # 2. Disc drive vs Digital
+    if re.search(r'(с\s+дисковод|дисковод|disc\s*edition|disk\s*edition|blu-?ray|дисковая\s+версия)', text) and not re.search(r'(без\s+дисковод|дисковод\s+отдельно)', text):
+        badges.append("📀 С дисководом")
+    elif re.search(r'(digital\s*edition|диджитал|без\s+дисковод|digital\s*версия|без\s+привода)', text):
+        badges.append("📱 Digital (без дисковода)")
+
+    # 3. Box / Complete kit
+    if re.search(r'(полный\s+комплект|родная\s+коробка|заводская\s+коробка|в\s+коробке|коробка\s+есть|есть\s+коробка|full\s*set)', text):
+        badges.append("📦 Полный комплект / Коробка")
+
+    # 4. Games included
+    if re.search(r'(\d+\s*(диска|дисков|игры|игр)|диски\s+в\s+комплекте|игры\s+в\s+комплекте|отдам\s+(диски|игры)|игры\s+на\s+аккаунт|аккаунт\s+с\s+играми)', text):
+        badges.append("💿 Игры в комплекте")
+
+    # 5. Warranty & Receipt
+    if re.search(r'(на\s+гаранти|официальная\s+гарантия|гарантийный\s+талон|чек\s+о\s+покупке|есть\s+чек|чек\s+и\s+гарантия|действует\s+гарантия|куплен\s+в\s+(5\s*элемент|электросил|21\s*век))', text):
+        badges.append("🧾 На гарантии / Чек")
+
+    # 6. Region / Version
+    if re.search(r'(японк|япония|cfi-?\d+00|japan|\(jp\))', text):
+        badges.append("🇯🇵 Версия: Япония")
+    elif re.search(r'(европ|европейка|евротест|cfi-?\d+16|europe|\(eu\))', text):
+        badges.append("🇪🇺 Версия: Европа")
+    elif re.search(r'(китай|китаянка|бэкап|cfi-?\d+09|china|\(cn\))', text):
+        badges.append("🇨🇳 Версия: Китай (бэкап)")
+
+    # 7. Jailbreak / Firmare
+    if re.search(r'(прошит|прошивка|jailbreak|hen|goldhen)', text):
+        badges.append("⚡ Прошита")
+
+    # 8. Defects / Nuances warning (filtering out "без дефектов", "не шумит", etc.)
+    has_defect_word = re.search(r'(дефект|нюанс|не\s+работает|дрифт|дрифтит|шумит|греется|царапин|трещин|скол|глючит)', text)
+    if has_defect_word:
+        is_negated = re.search(r'(без\s+(дефектов|нюансов|царапин|сколов|проблем|глюков)|не\s+(шумит|греется|глючит|дрифтит)|отличное\s+состояние|в\s+идеале)', text)
+        if not is_negated:
+            badges.append("⚠️ Есть нюансы/дефекты")
+
+    return badges
 
 
 class HealthHandler(http.server.SimpleHTTPRequestHandler):
@@ -336,9 +456,10 @@ def format_ad_caption(
     description: str = "",
     update_type: str = "new",
     old_price_byn: Optional[float] = None,
-    new_price_byn: Optional[float] = None
+    new_price_byn: Optional[float] = None,
+    market_median: Optional[float] = None
 ) -> str:
-    """Creates a clean, attractive HTML caption for the ad, including price updates."""
+    """Creates a clean, attractive HTML caption for the ad, including price updates, seller badge and market stats."""
     subject = html.escape(ad.get("subject", "Объявление"))
     link = ad.get("ad_link", "")
     price_byn = ad.get("price_byn")
@@ -360,7 +481,15 @@ def format_ad_caption(
         loc_parts.append(ad["area"])
     location = html.escape(", ".join(loc_parts)) if loc_parts else "Беларусь"
 
-    seller = html.escape(ad.get("seller", "").strip()) or "Частное лицо"
+    # Seller inspection (Частное лицо vs Магазин / ИП)
+    raw_seller = (ad.get("seller") or "").strip()
+    is_company = ad.get("company_ad", False)
+    seller_lower = raw_seller.lower()
+    if is_company or any(tag in seller_lower for tag in ["ип ", "ооо", "магазин", "store", "shop", "сервис", "дилер"]):
+        seller_label = f"🏪 {html.escape(raw_seller or 'Магазин / Компания')} <i>(Магазин / ИП)</i>"
+    else:
+        seller_label = f"👤 {html.escape(raw_seller or 'Частное лицо')} <i>(Частное лицо)</i>"
+
     time_label = "Первично создано:" if timing["is_repost"] else "Опубликовано:"
 
     # Format header and price depending on whether this is a price update
@@ -395,23 +524,34 @@ def format_ad_caption(
         price_line = f"💰 <b>Цена:</b> {price_str}"
         note_line = timing.get("note")
 
+    # Bargain badge (Индикатор «Сладкая цена»)
+    effective_price = new_price_byn if (update_type == "price_change" and new_price_byn is not None) else price_byn
+    bargain_badge = get_bargain_badge(effective_price, market_median)
+    if bargain_badge:
+        price_line += f"\n📊 {bargain_badge}"
+
     lines = [
         header_text,
         f"📌 <b>{subject}</b>",
         price_line,
         f"🕒 <b>{time_label}</b> {timing['time_str']}",
         f"📍 <b>Локация:</b> {location}",
-        f"👤 <b>Продавец:</b> {seller}",
+        f"<b>Продавец:</b> {seller_label}",
         f"📞 <b>Телефон:</b> {phone_str}",
         f"🎯 <i>Поиск: {html.escape(query_name)}</i>"
     ]
     if note_line:
         lines.append(note_line)
 
+    # Smart description badges (Умная выжимка описания)
+    smart_badges = extract_smart_badges(ad.get("subject", ""), description)
+    if smart_badges:
+        lines.append(f"\n✨ <b>Комплект & Особенности:</b>\n" + " • ".join(smart_badges))
+
     if description:
         clean_desc = html.escape(description.strip())
-        if len(clean_desc) > 360:
-            clean_desc = clean_desc[:360] + "..."
+        if len(clean_desc) > 320:
+            clean_desc = clean_desc[:320] + "..."
         lines.append(f"\n📝 <b>Описание:</b>\n<i>{clean_desc}</i>")
 
     return "\n".join(lines)
@@ -424,7 +564,8 @@ def send_ad_notification(
     query_name: str,
     update_type: str = "new",
     old_price_byn: Optional[float] = None,
-    new_price_byn: Optional[float] = None
+    new_price_byn: Optional[float] = None,
+    market_median: Optional[float] = None
 ) -> bool:
     """
     Sends unified notification with photo, caption and action buttons attached directly.
@@ -438,17 +579,40 @@ def send_ad_notification(
         logger.info(f"Ad {ad_id} is blacklisted by chat {chat_id}, skipping")
         return False
 
+    # Check seller blacklist
+    seller_name = ad.get("seller", "")
+    account_id = ad.get("account_id")
+    if is_seller_blacklisted(chat_id, seller_name, account_id):
+        logger.info(f"Seller '{seller_name}' is blacklisted by chat {chat_id}, skipping ad {ad_id}")
+        return False
+
     description = ad.get("description")
     if description is None:
         description = fetch_ad_description(ad_id)
         ad["description"] = description
+
+    # Check stop-words (negative keywords)
+    stop_words = get_stop_words(chat_id)
+    if stop_words:
+        check_text = f"{ad.get('subject', '')} {description or ''}".lower()
+        for sw in stop_words:
+            if sw in check_text:
+                logger.info(f"Ad {ad_id} matches stop-word '{sw}', skipping")
+                return False
+
+    # Cache ad data for quick interactive callbacks (seller blacklist, contact template)
+    AD_DATA_CACHE[ad_id] = ad
+    if len(AD_DATA_CACHE) > 1000:
+        for old_k in list(AD_DATA_CACHE.keys())[:200]:
+            AD_DATA_CACHE.pop(old_k, None)
 
     caption = format_ad_caption(
         ad, query_name,
         description=description,
         update_type=update_type,
         old_price_byn=old_price_byn,
-        new_price_byn=new_price_byn
+        new_price_byn=new_price_byn,
+        market_median=market_median
     )
     image_urls = ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else [])
     ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
@@ -456,7 +620,12 @@ def send_ad_notification(
     if image_urls:
         AD_PHOTOS_CACHE[ad_id] = image_urls
 
-    markup = make_ad_keyboard(ad_link, ad_id, photo_count=len(image_urls))
+    markup = make_ad_keyboard(
+        ad_link,
+        ad_id,
+        photo_count=len(image_urls),
+        seller_name=seller_name
+    )
 
     # Prune old cache entries to prevent memory growth
     if len(AD_MESSAGES_MAP) > 1000:
@@ -523,11 +692,15 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
         return 0
 
     bl = get_user_blacklist(chat_id)
+    market_median = calculate_market_stats(ads)
     sent_count = 0
 
     for ad in reversed(ads):
         ad_id = ad["ad_id"]
         if ad_id in bl:
+            continue
+
+        if is_seller_blacklisted(chat_id, ad.get("seller", ""), ad.get("account_id")):
             continue
 
         curr_byn = ad.get("price_byn")
@@ -550,7 +723,7 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
             # Only notify if within user's budget
             if is_within_budget:
                 try:
-                    if send_ad_notification(tg, chat_id, ad, name, update_type="new"):
+                    if send_ad_notification(tg, chat_id, ad, name, update_type="new", market_median=market_median):
                         sent_count += 1
                         NEW_ADS_FOUND += 1
                         time.sleep(1.0)
@@ -585,7 +758,8 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
                                 tg, chat_id, ad, name,
                                 update_type="price_change",
                                 old_price_byn=last_byn,
-                                new_price_byn=curr_byn
+                                new_price_byn=curr_byn,
+                                market_median=market_median
                             ):
                                 sent_count += 1
                                 NEW_ADS_FOUND += 1
@@ -858,13 +1032,19 @@ def output_all_user_ads(tg: TelegramClient, chat_id: int):
             logger.error(f"Error fetching ads for query {q.get('id')}: {e}")
             continue
 
-        valid_ads = [a for a in ads if a["ad_id"] not in bl and a["ad_id"] not in seen_in_run]
+        q_median = calculate_market_stats(ads)
+        valid_ads = [
+            a for a in ads
+            if a["ad_id"] not in bl
+            and a["ad_id"] not in seen_in_run
+            and not is_seller_blacklisted(chat_id, a.get("seller", ""), a.get("account_id"))
+        ]
         # Show top 10 most recent listings per query
         for ad in valid_ads[:10]:
             seen_in_run.add(ad["ad_id"])
             mark_ad_seen(q["id"], ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
             try:
-                if send_ad_notification(tg, chat_id, ad, q_name):
+                if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
                     total_shown += 1
                     time.sleep(0.8)
             except Exception as e:
@@ -909,13 +1089,18 @@ def output_ads_for_query(tg: TelegramClient, chat_id: int, qid: int):
         tg.send_message(chat_id, f"⚠️ Ошибка загрузки объявлений: {e}", reply_markup=MAIN_KEYBOARD)
         return
 
-    valid_ads = [a for a in ads if a["ad_id"] not in bl]
+    q_median = calculate_market_stats(ads)
+    valid_ads = [
+        a for a in ads
+        if a["ad_id"] not in bl
+        and not is_seller_blacklisted(chat_id, a.get("seller", ""), a.get("account_id"))
+    ]
     total_shown = 0
 
     for ad in valid_ads[:10]:
         mark_ad_seen(qid, ad["ad_id"], price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
         try:
-            if send_ad_notification(tg, chat_id, ad, q_name):
+            if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median):
                 total_shown += 1
                 time.sleep(0.8)
         except Exception as e:
@@ -1018,6 +1203,59 @@ def show_interval_options(tg: TelegramClient, chat_id: int, current: int):
                 {"text": "⏳ 120 сек", "callback_data": "cb:interval:120"}
             ],
             [{"text": "🔙 Назад", "callback_data": "cb:menu"}]
+        ]
+    }
+    tg.send_message(chat_id, text, reply_markup=markup)
+
+
+def show_stop_words_menu(tg: TelegramClient, chat_id: int):
+    """Displays current stop words and interactive management buttons."""
+    sw_list = get_stop_words(chat_id)
+    if sw_list:
+        words_str = ", ".join(f"<code>{html.escape(w)}</code>" for w in sw_list)
+        text = (
+            f"⛔ <b>Ваши стоп-слова (минус-слова):</b>\n\n"
+            f"{words_str}\n\n"
+            f"💡 <i>Объявления, содержащие эти слова в названии или описании, будут автоматически скрываться.</i>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "➕ Добавить стоп-слова", "callback_data": "cb:sw_add"}],
+                [{"text": "🗑 Удалить конкретное слово", "callback_data": "cb:sw_del_menu"}],
+                [{"text": "🧹 Очистить все слова", "callback_data": "cb:sw_clear"}],
+                [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+            ]
+        }
+    else:
+        text = (
+            "⛔ <b>Стоп-слова (минус-слова)</b>\n\n"
+            "У вас пока не добавлено ни одного стоп-слова.\n\n"
+            "Вы можете добавить слова, которые вам не интересны (например: <code>аренда, чехол, запчасти, коробка, обмен</code>), "
+            "и бот будет автоматически скрывать такие объявления!"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "➕ Добавить стоп-слова", "callback_data": "cb:sw_add"}],
+                [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+            ]
+        }
+    tg.send_message(chat_id, text, reply_markup=markup)
+
+
+def show_template_menu(tg: TelegramClient, chat_id: int):
+    """Displays current quick contact message template."""
+    tpl = get_user_template(chat_id)
+    text = (
+        "💬 <b>Настраиваемый шаблон для связи с продавцом</b>\n\n"
+        "В карточке каждого объявления есть кнопка <b>«💬 Написать продавцу (шаблон)»</b>. "
+        "При нажатии бот выдает готовый текст сообщения в виде блока, который можно скопировать в один клик и отправить продавцу на Куфаре!\n\n"
+        f"<b>Текущий шаблон:</b>\n<code>{html.escape(tpl)}</code>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "✏️ Изменить текст шаблона", "callback_data": "cb:tpl_edit"}],
+            [{"text": "🔄 Сбросить по умолчанию", "callback_data": "cb:tpl_reset"}],
+            [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
         ]
     }
     tg.send_message(chat_id, text, reply_markup=markup)
@@ -1304,11 +1542,55 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         else:
             tg.answer_callback_query(cb_id, text="Не удалось загрузить дополнительные фото")
 
+    elif data.startswith("cb:contact:"):
+        ad_id = int(data.split(":")[-1])
+        ad = AD_DATA_CACHE.get(ad_id, {})
+        ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+        tpl = get_user_template(chat_id)
+        text = (
+            f"💬 <b>Шаблон первого сообщения продавцу:</b>\n\n"
+            f"Нажмите на текст ниже, чтобы скопировать его в буфер обмена одним кликом:\n\n"
+            f"<code>{html.escape(tpl)}</code>\n\n"
+            f"Затем откройте чат с продавцом на Куфаре и вставьте сообщение 👇"
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "💬 Открыть диалог на Kufar", "url": ad_link}]
+            ]
+        }
+        tg.send_message(chat_id, text, reply_markup=markup)
+
     elif data.startswith("cb:bl:"):
         ad_id = int(data.split(":")[-1])
         add_to_blacklist(chat_id, ad_id)
         save_local_backup()
         tg.answer_callback_query(cb_id, text="🚫 Объявление добавлено в ЧС и удалено!", show_alert=False)
+
+        # Delete all messages related to this ad (album photos + description card)
+        mids = AD_MESSAGES_MAP.pop((chat_id, ad_id), [])
+        if msg_id and msg_id not in mids:
+            mids.append(msg_id)
+        for m in mids:
+            try:
+                tg.delete_message(chat_id, m)
+            except Exception as e:
+                logger.debug(f"Could not delete message {m}: {e}")
+
+    elif data.startswith("cb:bl_seller:"):
+        ad_id = int(data.split(":")[-1])
+        ad = AD_DATA_CACHE.get(ad_id, {})
+        sname = (ad.get("seller") or "").strip()
+        account_id = ad.get("account_id")
+        if sname:
+            add_blacklisted_seller(chat_id, sname, account_id)
+        add_to_blacklist(chat_id, ad_id)
+        save_local_backup()
+        disp_name = f"«{sname}»" if sname else "данного продавца"
+        tg.answer_callback_query(
+            cb_id,
+            text=f"👤 Продавец {disp_name} добавлен в ЧС! Все его объявления скрыты.",
+            show_alert=True
+        )
 
         # Delete all messages related to this ad (album photos + description card)
         mids = AD_MESSAGES_MAP.pop((chat_id, ad_id), [])
@@ -1326,7 +1608,8 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         save_local_backup()
         tg.answer_callback_query(cb_id, text="✅ Объявление убрано из ЧС", show_alert=False)
         ad_link = f"https://www.kufar.by/item/{ad_id}"
-        new_markup = make_ad_keyboard(ad_link, ad_id, is_blacklisted=False)
+        ad = AD_DATA_CACHE.get(ad_id, {})
+        new_markup = make_ad_keyboard(ad_link, ad_id, seller_name=ad.get("seller"), is_blacklisted=False)
         if msg.get("text"):
             tg.edit_message_text(
                 chat_id,
@@ -1336,6 +1619,63 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
             )
         else:
             tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
+
+    elif data == "cb:sw_menu":
+        USER_STATES.pop(chat_id, None)
+        show_stop_words_menu(tg, chat_id)
+
+    elif data == "cb:sw_add":
+        USER_STATES[chat_id] = {"step": "WAIT_STOP_WORDS"}
+        text = (
+            "⛔ <b>Добавление стоп-слов</b>\n\n"
+            "Отправьте слова, при наличии которых в названии или описании объявление будет скрыто.\n"
+            "Можно отправлять через запятую или пробел (например: <code>аренда, чехол, запчасти, коробка, обмен</code>):"
+        )
+        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:sw_menu"}]]}
+        tg.send_message(chat_id, text, reply_markup=markup)
+
+    elif data == "cb:sw_del_menu":
+        sw_list = get_stop_words(chat_id)
+        if not sw_list:
+            tg.send_message(chat_id, "ℹ️ Список стоп-слов пуст.", reply_markup=MAIN_KEYBOARD)
+            return
+        buttons = []
+        for w in sw_list:
+            buttons.append([{"text": f"❌ {w}", "callback_data": f"cb:sw_del:{w}"}])
+        buttons.append([{"text": "🔙 Назад", "callback_data": "cb:sw_menu"}])
+        tg.send_message(chat_id, "Выберите слово, которое хотите удалить:", reply_markup={"inline_keyboard": buttons})
+
+    elif data.startswith("cb:sw_del:"):
+        word = data[len("cb:sw_del:"):]
+        remove_stop_word(chat_id, word)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text=f"Удалено: {word}")
+        show_stop_words_menu(tg, chat_id)
+
+    elif data == "cb:sw_clear":
+        cnt = clear_stop_words(chat_id)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text=f"🧹 Удалено {cnt} стоп-слов!", show_alert=True)
+        show_stop_words_menu(tg, chat_id)
+
+    elif data == "cb:tpl_menu":
+        USER_STATES.pop(chat_id, None)
+        show_template_menu(tg, chat_id)
+
+    elif data == "cb:tpl_edit":
+        USER_STATES[chat_id] = {"step": "WAIT_TEMPLATE"}
+        text = (
+            "✏️ <b>Редактирование шаблона</b>\n\n"
+            "Отправьте мне новым сообщением текст, который вы хотите отправлять продавцам первым делом:"
+        )
+        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:tpl_menu"}]]}
+        tg.send_message(chat_id, text, reply_markup=markup)
+
+    elif data == "cb:tpl_reset":
+        set_user_template(chat_id, DEFAULT_CONTACT_TEMPLATE)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text="🔄 Шаблон сброшен к исходному!", show_alert=True)
+        show_template_menu(tg, chat_id)
 
     elif data.startswith("cb:interval:"):
         sec = int(data.split(":")[-1])
@@ -1392,6 +1732,16 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         show_interval_options(tg, chat_id, config.get("check_interval_seconds", 60))
         return
 
+    if text in ["⛔ Стоп-слова", "/stop_words", "/stopwords"]:
+        USER_STATES.pop(chat_id, None)
+        show_stop_words_menu(tg, chat_id)
+        return
+
+    if text in ["💬 Мой шаблон", "/template", "/tpl"]:
+        USER_STATES.pop(chat_id, None)
+        show_template_menu(tg, chat_id)
+        return
+
     if text in [
         "📦 Вывести всё",
         "📦 Вывести все",
@@ -1426,12 +1776,16 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         uptime_str = str(datetime.now() - START_TIME).split(".")[0]
         user_queries = len(get_user_queries(chat_id))
         bl_count = get_blacklist_count(chat_id)
+        sw_count = len(get_stop_words(chat_id))
+        bl_sellers_count = len(get_blacklisted_sellers(chat_id))
         backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y в %H:%M:%S') if LAST_BACKUP_TIME else "сохранена"
         status_text = (
             f"📊 <b>Статус Kufar Hunter Bot</b>\n\n"
             f"⏱ <b>Время работы:</b> {uptime_str}\n"
             f"🎯 <b>Ваших активных поисков:</b> {user_queries}\n"
-            f"🚫 <b>В вашем чёрном списке:</b> {bl_count}\n"
+            f"⛔ <b>Стоп-слов настроено:</b> {sw_count}\n"
+            f"👤 <b>Продавцов в ЧС:</b> {bl_sellers_count}\n"
+            f"🚫 <b>Объявлений в ЧС:</b> {bl_count}\n"
             f"💾 <b>Резервная копия:</b> {backup_str}\n"
             f"🔄 <b>Проверок выполнено:</b> {TOTAL_CHECKS}\n"
             f"⏳ <b>Интервал проверки:</b> {config.get('check_interval_seconds', 60)} сек."
@@ -1478,6 +1832,45 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
                 handle_link_submission(tg, chat_id, text)
             else:
                 tg.send_message(chat_id, "⚠️ Это не похоже на ссылку с Kufar.by. Отправьте корректную ссылку:")
+            return
+
+        if step == "WAIT_STOP_WORDS":
+            raw_tokens = re.split(r'[,;\n]+', text)
+            added_words = []
+            for t in raw_tokens:
+                clean = t.strip().lower()
+                if clean and len(clean) >= 2:
+                    if add_stop_word(chat_id, clean):
+                        added_words.append(clean)
+            USER_STATES.pop(chat_id, None)
+            save_local_backup()
+            if added_words:
+                tg.send_message(
+                    chat_id,
+                    f"✅ <b>Добавлено стоп-слов: {len(added_words)}!</b>\n"
+                    f"({', '.join(added_words)})\n\n"
+                    f"Теперь объявления, содержащие эти слова, будут автоматически отсекаться.",
+                    reply_markup=MAIN_KEYBOARD
+                )
+            else:
+                tg.send_message(chat_id, "ℹ️ Эти слова уже есть в списке или введены некорректно.", reply_markup=MAIN_KEYBOARD)
+            show_stop_words_menu(tg, chat_id)
+            return
+
+        if step == "WAIT_TEMPLATE":
+            new_tpl = text.strip()
+            if len(new_tpl) >= 3:
+                set_user_template(chat_id, new_tpl)
+                USER_STATES.pop(chat_id, None)
+                save_local_backup()
+                tg.send_message(
+                    chat_id,
+                    f"✅ <b>Новый шаблон для связи сохранён!</b>\n\n<code>{html.escape(new_tpl)}</code>",
+                    reply_markup=MAIN_KEYBOARD
+                )
+                show_template_menu(tg, chat_id)
+            else:
+                tg.send_message(chat_id, "⚠️ Текст шаблона слишком короткий. Отправьте текст сообщения:")
             return
 
         if step == "QUERY":

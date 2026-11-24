@@ -218,7 +218,9 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
             "seller": seller_name,
             "image_url": image_url,
             "image_urls": image_urls,
-            "phone_hidden": phone_hidden
+            "phone_hidden": phone_hidden,
+            "company_ad": ad.get("company_ad", False),
+            "account_id": ad.get("account_id")
         })
 
     return results

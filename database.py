@@ -100,6 +100,31 @@ def init_db(db_path: str = DB_FILE):
                 value TEXT NOT NULL
             )
         """)
+
+        # Stop words / negative keywords (per chat)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS stop_words (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                word TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, word)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_stopwords_chat ON stop_words(chat_id)")
+
+        # Blacklisted sellers (per chat)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blacklisted_sellers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                seller_name TEXT NOT NULL,
+                account_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, seller_name)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_blsellers_chat ON blacklisted_sellers(chat_id)")
         
         conn.commit()
 
@@ -422,6 +447,124 @@ def clear_user_blacklist(chat_id: int, db_path: str = DB_FILE) -> int:
         return cursor.rowcount
 
 
+# ==================== STOP WORDS (МИНУС-СЛОВА) ====================
+
+def add_stop_word(chat_id: int, word: str, db_path: str = DB_FILE) -> bool:
+    """Adds a stop word for a user. Stored in lowercase."""
+    clean_word = word.strip().lower()
+    if not clean_word:
+        return False
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO stop_words (chat_id, word) VALUES (?, ?)",
+            (chat_id, clean_word)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def remove_stop_word(chat_id: int, word: str, db_path: str = DB_FILE) -> bool:
+    """Removes a stop word for a user."""
+    clean_word = word.strip().lower()
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM stop_words WHERE chat_id = ? AND word = ?",
+            (chat_id, clean_word)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_stop_words(chat_id: int, db_path: str = DB_FILE) -> List[str]:
+    """Returns list of stop words for a user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT word FROM stop_words WHERE chat_id = ? ORDER BY word ASC", (chat_id,))
+        return [r["word"] for r in cursor.fetchall()]
+
+
+def clear_stop_words(chat_id: int, db_path: str = DB_FILE) -> int:
+    """Clears all stop words for a user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM stop_words WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        return cursor.rowcount
+
+
+# ==================== BLACKLISTED SELLERS (ЧС ПРОДАВЦОВ) ====================
+
+def add_blacklisted_seller(chat_id: int, seller_name: str, account_id: Optional[str] = None, db_path: str = DB_FILE) -> bool:
+    """Adds a seller to user's blacklisted sellers list."""
+    sname = seller_name.strip()
+    if not sname:
+        return False
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO blacklisted_sellers (chat_id, seller_name, account_id) VALUES (?, ?, ?)",
+            (chat_id, sname, account_id)
+        )
+        conn.commit()
+        return True
+
+
+def remove_blacklisted_seller(chat_id: int, seller_name: str, db_path: str = DB_FILE) -> bool:
+    """Removes a seller from user's blacklisted sellers list."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM blacklisted_sellers WHERE chat_id = ? AND seller_name = ?",
+            (chat_id, seller_name.strip())
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def get_blacklisted_sellers(chat_id: int, db_path: str = DB_FILE) -> Set[str]:
+    """Returns set of blacklisted seller names for user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT seller_name FROM blacklisted_sellers WHERE chat_id = ?", (chat_id,))
+        return {r["seller_name"] for r in cursor.fetchall()}
+
+
+def is_seller_blacklisted(chat_id: int, seller_name: str, account_id: Optional[str] = None, db_path: str = DB_FILE) -> bool:
+    """Checks if a seller is in user's blacklist."""
+    sname = (seller_name or "").strip()
+    if not sname:
+        return False
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        if account_id:
+            cursor.execute(
+                "SELECT 1 FROM blacklisted_sellers WHERE chat_id = ? AND (seller_name = ? OR account_id = ?)",
+                (chat_id, sname, account_id)
+            )
+        else:
+            cursor.execute(
+                "SELECT 1 FROM blacklisted_sellers WHERE chat_id = ? AND seller_name = ?",
+                (chat_id, sname)
+            )
+        return cursor.fetchone() is not None
+
+
+# ==================== USER MESSAGE TEMPLATE (ШАБЛОН ДЛЯ СВЯЗИ) ====================
+
+DEFAULT_CONTACT_TEMPLATE = "Здравствуйте! Готов забрать сегодня за наличные, актуально?"
+
+def get_user_template(chat_id: int, db_path: str = DB_FILE) -> str:
+    """Returns custom message template for contacting sellers, or default."""
+    return get_setting(f"template_{chat_id}", DEFAULT_CONTACT_TEMPLATE, db_path=db_path)
+
+
+def set_user_template(chat_id: int, template: str, db_path: str = DB_FILE):
+    """Saves custom message template for contacting sellers."""
+    set_setting(f"template_{chat_id}", template.strip(), db_path=db_path)
+
+
 # ==================== CLOUD STATE BACKUP & RESTORE ====================
 
 def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
@@ -460,6 +603,14 @@ def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
         cursor.execute("SELECT chat_id, name FROM deleted_queries")
         deleted_queries = [dict(r) for r in cursor.fetchall()]
 
+        # Stop words
+        cursor.execute("SELECT chat_id, word FROM stop_words")
+        stop_words = [dict(r) for r in cursor.fetchall()]
+
+        # Blacklisted sellers
+        cursor.execute("SELECT chat_id, seller_name, account_id FROM blacklisted_sellers")
+        blacklisted_sellers = [dict(r) for r in cursor.fetchall()]
+
         return {
             "version": 1,
             "exported_at": datetime.now().isoformat(),
@@ -467,7 +618,9 @@ def export_database_state(db_path: str = DB_FILE) -> Dict[str, Any]:
             "users": users,
             "blacklisted_ads": blacklisted,
             "settings": settings,
-            "deleted_queries": deleted_queries
+            "deleted_queries": deleted_queries,
+            "stop_words": stop_words,
+            "blacklisted_sellers": blacklisted_sellers
         }
 
 
@@ -536,6 +689,27 @@ def import_database_state(state: Dict[str, Any], db_path: str = DB_FILE) -> Dict
                     (cid, int(ad_id))
                 )
                 imported_bl += 1
+
+        # Import Stop Words
+        for sw in state.get("stop_words", []):
+            cid = sw.get("chat_id")
+            w = sw.get("word")
+            if cid and w:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO stop_words (chat_id, word) VALUES (?, ?)",
+                    (cid, w.strip().lower())
+                )
+
+        # Import Blacklisted Sellers
+        for bs in state.get("blacklisted_sellers", []):
+            cid = bs.get("chat_id")
+            sname = bs.get("seller_name")
+            acc_id = bs.get("account_id")
+            if cid and sname:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO blacklisted_sellers (chat_id, seller_name, account_id) VALUES (?, ?, ?)",
+                    (cid, sname.strip(), acc_id)
+                )
 
         # Import Settings
         for k, v in state.get("settings", {}).items():
