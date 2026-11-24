@@ -186,6 +186,60 @@ CONSOLES_BRAND_MAP = {
     "defender": "1",
 }
 
+PHONES_BRAND_MAP = {
+    "apple": "5",
+    "iphone": "5",
+    "samsung": "24",
+    "xiaomi": "35",
+    "redmi": "35",
+    "huawei": "11",
+    "honor": "12",
+    "google": "9",
+    "pixel": "9",
+    "oneplus": "20",
+    "poco": "35",
+    "realme": "22",
+}
+
+# Internal bot keys that must NEVER be passed in the HTTP query string to Kufar search API
+# (Kufar strictly returns HTTP 422 Unprocessable Entity if unrecognized query parameters are sent)
+BOT_INTERNAL_KEYS = {
+    "brand",
+    "name",
+    "chat_id",
+    "id",
+    "qid",
+    "initial_ads",
+    "is_active",
+    "created_at",
+    "updated_at",
+    "seen_count",
+    "user_id",
+    "min_price",
+    "max_price",
+    "stop_words",
+    "ad_id",
+    "category_name",
+    "region_name",
+}
+
+
+def clean_kufar_api_params(params: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Cleans parameters dictionary before sending it to Kufar Search API.
+    Strips internal bot metadata fields that Kufar's API strictly rejects with HTTP 422.
+    """
+    clean: Dict[str, str] = {}
+    for k, v in params.items():
+        if k in BOT_INTERNAL_KEYS or str(k).startswith("_"):
+            continue
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip() and k != "query":
+            continue
+        clean[str(k)] = str(v)
+    return clean
+
 def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
     """
     Parses either a full Kufar URL (e.g. https://www.kufar.by/l/r~minsk/pristavki-i-igry?prc=r:150000,220000)
@@ -224,11 +278,15 @@ def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
             params["brand"] = b_val.capitalize()
             if b_val in CONSOLES_BRAND_MAP:
                 params["cbc"] = CONSOLES_BRAND_MAP[b_val]
+            elif b_val in PHONES_BRAND_MAP:
+                params["pb"] = PHONES_BRAND_MAP[b_val]
         if "brand" in params:
             b_val = params["brand"].lower()
             params["brand"] = b_val.capitalize()
             if b_val in CONSOLES_BRAND_MAP:
                 params["cbc"] = CONSOLES_BRAND_MAP[b_val]
+            elif b_val in PHONES_BRAND_MAP:
+                params["pb"] = PHONES_BRAND_MAP[b_val]
         
         # Parse path for region, category, and brand slugs
         # e.g. /l/r~minsk/pristavki/pr~sony or /l/minsk/noutbuki
@@ -253,11 +311,19 @@ def parse_kufar_url_or_query(input_str: str) -> Dict[str, Any]:
                 # If this is consoles category or slug has consoles brands:
                 if brand_slug in CONSOLES_BRAND_MAP:
                     params["cbc"] = CONSOLES_BRAND_MAP[brand_slug]
+                elif brand_slug in PHONES_BRAND_MAP:
+                    params["pb"] = PHONES_BRAND_MAP[brand_slug]
                 continue
 
             # 3. Check for category slug in path (e.g. pristavki-i-igry, pristavki, noutbuki, mebel)
             if part_lower in CATEGORY_SLUGS_MAP and "cat" not in params:
                 params["cat"] = CATEGORY_SLUGS_MAP[part_lower]
+                if part_lower in ("pristavki", "igrovye-pristavki", "konsoli") and "cte" not in params:
+                    params["cte"] = "1"
+                elif part_lower == "igry-dlya-pristavok" and "cte" not in params:
+                    params["cte"] = "2"
+                elif part_lower == "gejmpady-i-aksessuary" and "cte" not in params:
+                    params["cte"] = "3"
                 continue
 
             # 4. Check for SEO landing URL, e.g. /l/kupit-playstation-5
@@ -330,7 +396,7 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
     Fetches listings matching params from Kufar API.
     Returns a cleaned list of ads.
     """
-    query_params = dict(params)
+    query_params = clean_kufar_api_params(params)
     if "sort" not in query_params:
         query_params["sort"] = "lst.d"
     if "size" not in query_params:
@@ -354,8 +420,11 @@ def fetch_ads(params: Dict[str, Any], timeout: int = 10) -> List[Dict[str, Any]]
                 logger.error(f"Kufar API error status: {response.status}")
                 return []
             payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        logger.error(f"Error fetching Kufar ads: HTTP Error {e.code}: {e.reason} (URL: {full_url})")
+        return []
     except Exception as e:
-        logger.error(f"Error fetching Kufar ads: {e}")
+        logger.error(f"Error fetching Kufar ads: {e} (URL: {full_url})")
         return []
 
     ads_raw = payload.get("ads", [])
