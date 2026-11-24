@@ -16,6 +16,7 @@ class TelegramClient:
     def __init__(self, token: str):
         self.token = token.strip()
         self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self.created_at = time.time()
 
     def _api_call(self, method: str, payload: Optional[Dict[str, Any]] = None, timeout: int = 35, retries: int = 2) -> Optional[Any]:
         url = f"{self.base_url}/{method}"
@@ -39,7 +40,10 @@ class TelegramClient:
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="ignore")
                 if e.code == 409:
-                    logger.warning("Telegram conflict (HTTP 409): another bot instance is polling getUpdates. Backing off for 5s...")
+                    if time.time() - self.created_at < 30:
+                        logger.info("Render deploy handoff (HTTP 409): previous container winding down, waiting 5s...")
+                    else:
+                        logger.warning("Telegram conflict (HTTP 409): another bot instance is polling getUpdates. Backing off for 5s...")
                     time.sleep(5)
                     return None
                 if e.code == 429 and attempt < retries:

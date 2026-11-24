@@ -1131,23 +1131,25 @@ def create_http_handler(app_ctx: Dict[str, Any]):
         def log_message(self, format, *args):
             pass
 
-        def _send_json(self, code: int, payload: Dict[str, Any]):
+        def _send_json(self, code: int, payload: Dict[str, Any], head_only: bool = False):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not head_only:
+                self.wfile.write(body)
 
-        def _send_html(self, code: int, html_text: str):
+        def _send_html(self, code: int, html_text: str, head_only: bool = False):
             body = html_text.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not head_only:
+                self.wfile.write(body)
 
         def _read_json_body(self) -> Dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -1175,7 +1177,7 @@ def create_http_handler(app_ctx: Dict[str, Any]):
             )
             return chat_id
 
-        def do_GET(self):
+        def _handle_get_or_head(self, head_only: bool = False):
             path = urllib.parse.urlparse(self.path).path
             if path == "/health":
                 total_checks, _ = app_ctx["get_counters"]()
@@ -1187,21 +1189,27 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     "total_checks": total_checks,
                     "active_queries": len(get_active_queries()),
                     "timestamp": datetime.now().isoformat(),
-                })
+                }, head_only=head_only)
                 return
 
             if path in ("/", "/webapp"):
-                self._send_html(200, WEBAPP_HTML)
+                self._send_html(200, WEBAPP_HTML, head_only=head_only)
                 return
 
-            if path == "/api/state":
+            if path == "/api/state" and not head_only:
                 chat_id = self._auth_chat_id()
                 if chat_id is None:
                     return
                 self._send_json(200, _build_user_state_payload(chat_id, app_ctx))
                 return
 
-            self._send_json(404, {"ok": False, "error": "Not found"})
+            self._send_json(404, {"ok": False, "error": "Not found"}, head_only=head_only)
+
+        def do_HEAD(self):
+            self._handle_get_or_head(head_only=True)
+
+        def do_GET(self):
+            self._handle_get_or_head(head_only=False)
 
         def do_POST(self):
             path = urllib.parse.urlparse(self.path).path
