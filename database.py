@@ -5,7 +5,7 @@ Stores tracking queries and seen advertisements to avoid duplicates.
 import sqlite3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Any, Set
 
 DB_FILE = os.path.join(os.path.dirname(__file__), "kufar_hunter.db")
@@ -127,6 +127,24 @@ def init_db(db_path: Optional[str] = None):
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_blsellers_chat ON blacklisted_sellers(chat_id)")
+
+        # Favorites / Saved ads table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                ad_id INTEGER NOT NULL,
+                title TEXT,
+                price_byn REAL,
+                price_usd REAL,
+                ad_link TEXT,
+                seller_name TEXT,
+                image_url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(chat_id, ad_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_fav_user ON favorites(chat_id, ad_id)")
         
         conn.commit()
 
@@ -567,6 +585,124 @@ def set_user_template(chat_id: int, template: str, db_path: Optional[str] = None
     set_setting(f"template_{chat_id}", template.strip(), db_path=db_path)
 
 
+# ==================== FAVORITES (ИЗБРАННОЕ) ====================
+
+def add_favorite(
+    chat_id: int,
+    ad_id: int,
+    title: str = "",
+    price_byn: Optional[float] = None,
+    price_usd: Optional[float] = None,
+    ad_link: str = "",
+    seller_name: str = "",
+    image_url: str = "",
+    db_path: Optional[str] = None
+) -> bool:
+    """Adds an ad to user's favorites."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO favorites 
+               (chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (chat_id, int(ad_id), title, price_byn, price_usd, ad_link, seller_name, image_url)
+        )
+        conn.commit()
+        return True
+
+
+def remove_favorite(chat_id: int, ad_id: int, db_path: Optional[str] = None) -> bool:
+    """Removes an ad from user's favorites."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM favorites WHERE chat_id = ? AND ad_id = ?", (chat_id, int(ad_id)))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def is_favorite(chat_id: int, ad_id: int, db_path: Optional[str] = None) -> bool:
+    """Checks if an ad is in user's favorites."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM favorites WHERE chat_id = ? AND ad_id = ?", (chat_id, int(ad_id)))
+        return cursor.fetchone() is not None
+
+
+def get_user_favorites(chat_id: int, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns all favorites saved by a user, ordered by newest first."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at "
+            "FROM favorites WHERE chat_id = ? ORDER BY id DESC",
+            (chat_id,)
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+
+def get_favorites_count(chat_id: int, db_path: Optional[str] = None) -> int:
+    """Returns total favorites count for user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM favorites WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        return row["cnt"] if row else 0
+
+
+def clear_user_favorites(chat_id: int, db_path: Optional[str] = None) -> int:
+    """Clears all favorites for a user."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM favorites WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+        return cursor.rowcount
+
+
+# ==================== SILENT / NIGHT MODE (ТИХИЙ РЕЖИМ) ====================
+
+def get_silent_mode(chat_id: int, db_path: Optional[str] = None) -> str:
+    """Returns silent hours setting for user: 'off', or '23:00-08:00', or custom 'HH:MM-HH:MM'."""
+    return get_setting(f"silent_{chat_id}", "off", db_path=db_path) or "off"
+
+
+def set_silent_mode(chat_id: int, value: str, db_path: Optional[str] = None):
+    """Sets silent hours setting for user ('off', '23:00-08:00', etc.)."""
+    set_setting(f"silent_{chat_id}", value.strip(), db_path=db_path)
+
+
+def is_in_silent_hours(chat_id: int, current_dt: Optional[datetime] = None, db_path: Optional[str] = None) -> bool:
+    """
+    Checks if current time in Minsk timezone (UTC+3) falls within user's configured silent hours.
+    """
+    mode = get_silent_mode(chat_id, db_path=db_path)
+    if not mode or mode.lower() in ("off", "none", "disabled", "0"):
+        return False
+
+    try:
+        if current_dt is None:
+            # Minsk / Belarus timezone: UTC+3
+            current_dt = datetime.now(timezone(timedelta(hours=3)))
+        
+        parts = mode.split("-")
+        if len(parts) != 2:
+            return False
+        
+        start_h, start_m = map(int, parts[0].strip().split(":"))
+        end_h, end_m = map(int, parts[1].strip().split(":"))
+        
+        cur_min = current_dt.hour * 60 + current_dt.minute
+        start_min = start_h * 60 + start_m
+        end_min = end_h * 60 + end_m
+        
+        if start_min <= end_min:
+            return start_min <= cur_min < end_min
+        else:
+            # Overnight window, e.g. 23:00 (1380) to 08:00 (480)
+            return cur_min >= start_min or cur_min < end_min
+    except Exception:
+        return False
+
+
 # ==================== CLOUD STATE BACKUP & RESTORE ====================
 
 def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
@@ -613,6 +749,10 @@ def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
         cursor.execute("SELECT chat_id, seller_name, account_id FROM blacklisted_sellers")
         blacklisted_sellers = [dict(r) for r in cursor.fetchall()]
 
+        # Favorites
+        cursor.execute("SELECT chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at FROM favorites")
+        favorites = [dict(r) for r in cursor.fetchall()]
+
         return {
             "version": 1,
             "exported_at": datetime.now().isoformat(),
@@ -622,7 +762,8 @@ def export_database_state(db_path: Optional[str] = None) -> Dict[str, Any]:
             "settings": settings,
             "deleted_queries": deleted_queries,
             "stop_words": stop_words,
-            "blacklisted_sellers": blacklisted_sellers
+            "blacklisted_sellers": blacklisted_sellers,
+            "favorites": favorites
         }
 
 
@@ -719,12 +860,26 @@ def import_database_state(state: Dict[str, Any], db_path: Optional[str] = None) 
         for k, v in state.get("settings", {}).items():
             cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, str(v)))
 
+        # Import Favorites
+        imported_favs = 0
+        for f in state.get("favorites", []):
+            cid = f.get("chat_id")
+            ad_id = f.get("ad_id")
+            if cid and ad_id:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO favorites (chat_id, ad_id, title, price_byn, price_usd, ad_link, seller_name, image_url, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+                    (cid, int(ad_id), f.get("title", ""), f.get("price_byn"), f.get("price_usd"), f.get("ad_link", ""), f.get("seller_name", ""), f.get("image_url", ""), f.get("created_at"))
+                )
+                imported_favs += 1
+
         conn.commit()
         
     return {
         "queries": imported_queries,
         "users": imported_users,
-        "blacklisted": imported_bl
+        "blacklisted": imported_bl,
+        "favorites": imported_favs
     }
 
 

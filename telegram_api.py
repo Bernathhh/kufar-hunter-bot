@@ -149,7 +149,8 @@ class TelegramClient:
         photo_url: str,
         caption: Optional[str] = None,
         parse_mode: str = "HTML",
-        reply_markup: Optional[Dict[str, Any]] = None
+        reply_markup: Optional[Dict[str, Any]] = None,
+        disable_notification: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Sends a photo with optional caption and reply_markup.
@@ -158,7 +159,8 @@ class TelegramClient:
         payload = {
             "chat_id": chat_id,
             "photo": photo_url,
-            "parse_mode": parse_mode
+            "parse_mode": parse_mode,
+            "disable_notification": disable_notification
         }
         if caption:
             payload["caption"] = caption
@@ -172,7 +174,13 @@ class TelegramClient:
         # Fallback to sendMessage if photo URL is rejected by Telegram
         if caption:
             logger.info("Photo sending failed, falling back to sendMessage")
-            return self.send_message(chat_id, caption, parse_mode=parse_mode, reply_markup=reply_markup)
+            return self.send_message(
+                chat_id,
+                caption,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_notification=disable_notification
+            )
         return None
 
     def get_chat(self, chat_id: int) -> Optional[Dict[str, Any]]:

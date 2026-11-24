@@ -59,7 +59,16 @@ from database import (
     get_user_template,
     set_user_template,
     DEFAULT_CONTACT_TEMPLATE,
-    cleanup_legacy_queries
+    cleanup_legacy_queries,
+    add_favorite,
+    remove_favorite,
+    is_favorite,
+    get_user_favorites,
+    get_favorites_count,
+    clear_user_favorites,
+    get_silent_mode,
+    set_silent_mode,
+    is_in_silent_hours
 )
 from kufar_api import (
     parse_kufar_url_or_query,
@@ -130,8 +139,9 @@ REGIONS = [
 MAIN_KEYBOARD = {
     "keyboard": [
         [{"text": "➕ Добавить поиск"}, {"text": "📋 Мои поиски"}],
-        [{"text": "📦 Вывести всё"}, {"text": "⏱ Интервал"}],
+        [{"text": "📦 Вывести всё"}, {"text": "⭐️ Избранное"}],
         [{"text": "⛔ Стоп-слова"}, {"text": "💬 Мой шаблон"}],
+        [{"text": "⏱ Интервал"}, {"text": "🌙 Ночной режим"}],
         [{"text": "📊 Статистика"}, {"text": "❓ Помощь"}]
     ],
     "resize_keyboard": True
@@ -143,36 +153,38 @@ def make_ad_keyboard(
     ad_id: int,
     photo_count: int = 0,
     seller_name: Optional[str] = None,
-    is_blacklisted: bool = False
+    is_blacklisted: bool = False,
+    is_fav: bool = False
 ) -> Dict[str, Any]:
-    """Builds inline action keyboard attached directly to ad cards."""
+    """Builds clean two-column inline action keyboard attached directly to ad cards."""
     buttons = []
     
-    # 1. Open on Kufar
+    # Row 1: Direct link to listing on Kufar
     buttons.append([{"text": "🔗 Открыть на Kufar", "url": ad_link}])
 
-    # 2. Quick message template
-    buttons.append([{"text": "💬 Написать продавцу (шаблон)", "callback_data": f"cb:contact:{ad_id}"}])
-    
-    # 3. Show all photos button if multiple photos exist
+    # Row 2: Contact template + Gallery photo button (if multiple photos exist)
+    row2 = [{"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}]
     if photo_count > 1:
-        buttons.append([{"text": f"📸 Показать все фото ({photo_count} шт.)", "callback_data": f"cb:photos:{ad_id}"}])
+        row2.append({"text": f"📸 Фото ({photo_count})", "callback_data": f"cb:photos:{ad_id}"})
+    buttons.append(row2)
 
-    # 4. Blacklist ad & Blacklist seller
-    bl_row = []
-    if is_blacklisted:
-        bl_row.append({"text": "↩️ Вернуть из ЧС", "callback_data": f"cb:unbl:{ad_id}"})
-    else:
-        bl_row.append({"text": "🚫 В ЧС (скрыть)", "callback_data": f"cb:bl:{ad_id}"})
+    # Row 3: Favorite toggle + Blacklist toggle (in 2 ergonomic columns)
+    fav_text = "⭐️ В избранном" if is_fav else "⭐️ В Избранное"
+    fav_cb = f"cb:unfav:{ad_id}" if is_fav else f"cb:fav:{ad_id}"
+    bl_text = "↩️ Из ЧС" if is_blacklisted else "🚫 В ЧС"
+    bl_cb = f"cb:unbl:{ad_id}" if is_blacklisted else f"cb:bl:{ad_id}"
+    buttons.append([
+        {"text": fav_text, "callback_data": fav_cb},
+        {"text": bl_text, "callback_data": bl_cb}
+    ])
 
+    # Row 4: Seller blacklist button
     if seller_name:
         clean_s = seller_name.strip()
-        short_s = clean_s[:13] + "…" if len(clean_s) > 14 else clean_s
-        bl_row.append({"text": f"👤 В ЧС: {short_s}", "callback_data": f"cb:bl_seller:{ad_id}"})
+        short_s = clean_s[:16] + "…" if len(clean_s) > 17 else clean_s
+        buttons.append([{"text": f"👤 В ЧС: {short_s}", "callback_data": f"cb:bl_seller:{ad_id}"}])
     else:
-        bl_row.append({"text": "👤 В ЧС продавца", "callback_data": f"cb:bl_seller:{ad_id}"})
-
-    buttons.append(bl_row)
+        buttons.append([{"text": "👤 В ЧС продавца", "callback_data": f"cb:bl_seller:{ad_id}"}])
 
     return {"inline_keyboard": buttons}
 
@@ -464,7 +476,7 @@ def format_ad_caption(
     new_price_byn: Optional[float] = None,
     market_median: Optional[float] = None
 ) -> str:
-    """Creates a clean, attractive HTML caption for the ad, including price updates, seller badge and market stats."""
+    """Creates a sleek, modern HTML caption for the ad, with structured blocks and elegant badges."""
     subject = html.escape(ad.get("subject", "Объявление"))
     link = ad.get("ad_link", "")
     price_byn = ad.get("price_byn")
@@ -475,7 +487,7 @@ def format_ad_caption(
     if price_byn is not None:
         price_str = f"<b>{price_byn:,.2f} BYN</b>".replace(",", " ")
         if price_usd is not None:
-            price_str += f" (~${price_usd:,.0f})".replace(",", " ")
+            price_str += f" <i>(~${price_usd:,.0f})</i>".replace(",", " ")
     else:
         price_str = "<b>Договорная / Бесплатно</b>"
 
@@ -491,9 +503,9 @@ def format_ad_caption(
     is_company = ad.get("company_ad", False)
     seller_lower = raw_seller.lower()
     if is_company or any(tag in seller_lower for tag in ["ип ", "ооо", "магазин", "store", "shop", "сервис", "дилер"]):
-        seller_label = f"🏪 {html.escape(raw_seller or 'Магазин / Компания')} <i>(Магазин / ИП)</i>"
+        seller_label = f"🏪 {html.escape(raw_seller or 'Магазин / Компания')} <i>(Магазин/ИП)</i>"
     else:
-        seller_label = f"👤 {html.escape(raw_seller or 'Частное лицо')} <i>(Частное лицо)</i>"
+        seller_label = f"👤 {html.escape(raw_seller or 'Частное лицо')} <i>(Частник)</i>"
 
     time_label = "Первично создано:" if timing["is_repost"] else "Опубликовано:"
 
@@ -504,29 +516,27 @@ def format_ad_caption(
         if diff_byn > 0:
             # Price decreased (discount / bargain!)
             pct = round((diff_byn / old_price_byn) * 100) if old_price_byn > 0 else 0
-            header_text = f"📉 <b>Цена снижена! (-{diff_byn:,.0f} BYN)</b>\n"
+            header_text = f"📉 <b>ЦЕНА СНИЖЕНА! (-{diff_byn:,.0f} BYN)</b>\n━━━━━━━━━━━━━━━━━━━━"
             price_line = (
-                f"💰 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
-                + (f" (~${price_usd:,.0f})" if price_usd is not None else "")
-                + f"\n🏷 <b>Старая цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
-                + f"\n🔻 <b>Скидка:</b> -{pct}% (дешевле на {diff_byn:,.2f} BYN!)"
+                f"💵 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
+                + (f" <i>(~${price_usd:,.0f})</i>" if price_usd is not None else "")
+                + f"\n🏷 <b>Было:</b> <s>{old_price_byn:,.2f} BYN</s>  •  🔻 <b>Скидка:</b> -{pct}% (-{diff_byn:,.0f} BYN)"
             )
-            note_line = "💡 <i>Продавец снизил цену этого объявления на Куфаре.</i>"
+            note_line = "💡 <i>Продавец снизил цену на Куфаре.</i>"
         else:
             # Price increased (seller raised the price!)
             raise_byn = abs(diff_byn)
             pct = round((raise_byn / old_price_byn) * 100) if old_price_byn > 0 else 0
-            header_text = f"📈 <b>Внимание: продавец поднял цену! (+{raise_byn:,.0f} BYN)</b>\n"
+            header_text = f"📈 <b>ВНИМАНИЕ: ЦЕНА ВЫРОСЛА! (+{raise_byn:,.0f} BYN)</b>\n━━━━━━━━━━━━━━━━━━━━"
             price_line = (
-                f"💰 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
-                + (f" (~${price_usd:,.0f})" if price_usd is not None else "")
-                + f"\n🏷 <b>Прежняя цена:</b> <s>{old_price_byn:,.2f} BYN</s>"
-                + f"\n🔺 <b>Повышение:</b> +{raise_byn:,.2f} BYN (+{pct}%)"
+                f"💵 <b>Новая цена:</b> <b>{new_price_byn:,.2f} BYN</b>"
+                + (f" <i>(~${price_usd:,.0f})</i>" if price_usd is not None else "")
+                + f"\n🏷 <b>Было:</b> <s>{old_price_byn:,.2f} BYN</s>  •  🔺 <b>Повышение:</b> +{raise_byn:,.0f} BYN (+{pct}%)"
             )
-            note_line = "⚠️ <i>Продавец только что повысил цену на это объявление на Куфаре!</i>"
+            note_line = "⚠️ <i>Продавец только что поднял цену на Куфаре.</i>"
     else:
-        header_text = f"{timing['header']}\n"
-        price_line = f"💰 <b>Цена:</b> {price_str}"
+        header_text = f"{timing['header']}\n━━━━━━━━━━━━━━━━━━━━"
+        price_line = f"💵 <b>Цена:</b> {price_str}"
         note_line = timing.get("note")
 
     # Bargain badge (Индикатор «Сладкая цена»)
@@ -535,29 +545,31 @@ def format_ad_caption(
     if bargain_badge:
         price_line += f"\n📊 {bargain_badge}"
 
+    clean_tag = re.sub(r'[^a-zA-Zа-яА-Я0-9_]', '', query_name) or 'поиск'
     lines = [
         header_text,
         f"📌 <b>{subject}</b>",
         price_line,
-        f"🕒 <b>{time_label}</b> {timing['time_str']}",
+        "━━━━━━━━━━━━━━━━━━━━",
         f"📍 <b>Локация:</b> {location}",
         f"<b>Продавец:</b> {seller_label}",
+        f"🕒 <b>{time_label}</b> {timing['time_str']}",
         f"📞 <b>Телефон:</b> {phone_str}",
-        f"🎯 <i>Поиск: {html.escape(query_name)}</i>"
+        f"🎯 <i>Поиск: #{html.escape(clean_tag)}</i>"
     ]
     if note_line:
-        lines.append(note_line)
+        lines.append(f"\n{note_line}")
 
     # Smart description badges (Умная выжимка описания)
     smart_badges = extract_smart_badges(ad.get("subject", ""), description)
     if smart_badges:
-        lines.append(f"\n✨ <b>Комплект & Особенности:</b>\n" + " • ".join(smart_badges))
+        lines.append(f"\n✨ <b>Особенности & Комплект:</b>\n" + " • ".join(smart_badges))
 
     if description:
         clean_desc = html.escape(description.strip())
-        if len(clean_desc) > 320:
-            clean_desc = clean_desc[:320] + "..."
-        lines.append(f"\n📝 <b>Описание:</b>\n<i>{clean_desc}</i>")
+        if len(clean_desc) > 300:
+            clean_desc = clean_desc[:300] + "..."
+        lines.append(f"\n📝 <b>Описание:</b>\n<blockquote>{clean_desc}</blockquote>")
 
     return "\n".join(lines)
 
@@ -576,7 +588,7 @@ def send_ad_notification(
     Sends unified notification with photo, caption and action buttons attached directly.
     Supports both new listings and price change updates.
     - Single unified message: Photo + Full description + Inline buttons directly under it.
-    - If multiple photos: includes «📸 Показать все фото» button to view the full gallery.
+    - If multiple photos: includes «📸 Фото» button to view the full gallery.
     - Text fallback if no photos available.
     """
     ad_id = ad["ad_id"]
@@ -605,7 +617,7 @@ def send_ad_notification(
                 logger.info(f"Ad {ad_id} matches stop-word '{sw}', skipping")
                 return False
 
-    # Cache ad data for quick interactive callbacks (seller blacklist, contact template)
+    # Cache ad data for quick interactive callbacks (seller blacklist, contact template, favorites)
     AD_DATA_CACHE[ad_id] = ad
     if len(AD_DATA_CACHE) > 1000:
         for old_k in list(AD_DATA_CACHE.keys())[:200]:
@@ -625,11 +637,14 @@ def send_ad_notification(
     if image_urls:
         AD_PHOTOS_CACHE[ad_id] = image_urls
 
+    is_fav = is_favorite(chat_id, ad_id)
     markup = make_ad_keyboard(
         ad_link,
         ad_id,
         photo_count=len(image_urls),
-        seller_name=seller_name
+        seller_name=seller_name,
+        is_blacklisted=False,
+        is_fav=is_fav
     )
 
     # Prune old cache entries to prevent memory growth
@@ -637,16 +652,30 @@ def send_ad_notification(
         for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
             AD_MESSAGES_MAP.pop(old_k, None)
 
+    disable_notif = is_in_silent_hours(chat_id)
+
     # Send unified card: Photo + Description + Action buttons attached directly
     if image_urls:
         photo_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
-        res_photo = tg.send_photo(chat_id, image_urls[0], caption=photo_caption, reply_markup=markup)
+        res_photo = tg.send_photo(
+            chat_id,
+            image_urls[0],
+            caption=photo_caption,
+            reply_markup=markup,
+            disable_notification=disable_notif
+        )
         if res_photo and isinstance(res_photo, dict) and "message_id" in res_photo:
             AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
             return True
 
     # Fallback: Text only with buttons attached directly
-    res_msg = tg.send_message(chat_id, caption, disable_web_page_preview=False, reply_markup=markup)
+    res_msg = tg.send_message(
+        chat_id,
+        caption,
+        disable_web_page_preview=False,
+        reply_markup=markup,
+        disable_notification=disable_notif
+    )
     if res_msg and isinstance(res_msg, dict) and "message_id" in res_msg:
         AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_msg["message_id"]]
         return True
@@ -813,7 +842,7 @@ def save_local_backup():
     global LAST_BACKUP_TIME
     try:
         state = export_database_state()
-        has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words"))
+        has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words") or state.get("favorites"))
         if has_data:
             with open(BACKUP_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -838,7 +867,7 @@ def sync_backup_to_telegram(tg: TelegramClient, config: dict, force_notify: bool
 
     try:
         state = export_database_state()
-        has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words"))
+        has_data = bool(state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words") or state.get("favorites"))
         if has_data:
             with open(BACKUP_FILE, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -850,11 +879,13 @@ def sync_backup_to_telegram(tg: TelegramClient, config: dict, force_notify: bool
         bl_count = len(state.get("blacklisted_ads", []))
         bl_sellers = len(state.get("blacklisted_sellers", []))
         sw_count = len(state.get("stop_words", []))
+        fav_count = len(state.get("favorites", []))
 
         backup_text = (
             f"💾 <b>Kufar Hunter — Синхронизация данных</b>\n"
-            f"<i>Хранит ваши фильтры, ЧС и настройки. Авто-обновление.</i>\n\n"
+            f"<i>Хранит ваши фильтры, ЧС, избранное и настройки. Авто-обновление.</i>\n\n"
             f"• 🎯 Поисков: <b>{q_count}</b>\n"
+            f"• ⭐️ В Избранном: <b>{fav_count}</b>\n"
             f"• 🚫 В ЧС объявлений: <b>{bl_count}</b>\n"
             f"• 👤 В ЧС продавцов: <b>{bl_sellers}</b>\n"
             f"• ⛔ Стоп-слов: <b>{sw_count}</b>\n"
@@ -1232,11 +1263,109 @@ def show_my_searches(tg: TelegramClient, chat_id: int):
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"}],
+                [
+                    {"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"},
+                    {"text": "📊 Аналитика цен", "callback_data": f"cb:market_stats:{qid}"}
+                ],
                 [{"text": "🗑 Удалить этот поиск", "callback_data": f"cb:del:{qid}"}]
             ]
         }
         tg.send_message(chat_id, text, reply_markup=markup)
+
+
+def show_favorites_menu(tg: TelegramClient, chat_id: int):
+    """Displays saved favorite ads with links and quick actions."""
+    favs = get_user_favorites(chat_id)
+    if not favs:
+        text = (
+            "⭐️ <b>Ваше Избранное пока пусто.</b>\n\n"
+            "Чтобы отложить понравившееся объявление, нажмите кнопку <b>«⭐️ В Избранное»</b> прямо под карточкой товара в чате!\n"
+            "Бот сохранит его сюда, и вы в любой момент сможете быстро вернуться к нему."
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "📦 Вывести все объявления", "callback_data": "cb:all_ads"}],
+                [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+            ]
+        }
+        tg.send_message(chat_id, text, reply_markup=markup)
+        return
+
+    tg.send_message(chat_id, f"⭐️ <b>Ваши сохранённые объявления ({len(favs)} шт.):</b>")
+
+    for f in favs[:10]:
+        ad_id = f["ad_id"]
+        title = html.escape(f.get("title") or f"Объявление #{ad_id}")
+        price_byn = f.get("price_byn")
+        price_usd = f.get("price_usd")
+        if price_byn:
+            price_str = f"💵 <b>{price_byn:,.2f} BYN</b>".replace(",", " ")
+            if price_usd:
+                price_str += f" <i>(~${price_usd:,.0f})</i>".replace(",", " ")
+        else:
+            price_str = "💵 <b>Цена не указана</b>"
+
+        sname = html.escape(f.get("seller_name") or "Частное лицо")
+        link = f.get("ad_link") or f"https://www.kufar.by/item/{ad_id}"
+
+        item_text = (
+            f"⭐️ <b>{title}</b>\n"
+            f"{price_str}\n"
+            f"👤 Продавец: {sname}\n"
+            f"🔗 <a href=\"{link}\">Открыть объявление на Kufar</a>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔗 На Kufar", "url": link},
+                    {"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}
+                ],
+                [
+                    {"text": "❌ Удалить из Избранного", "callback_data": f"cb:unfav_list:{ad_id}"}
+                ]
+            ]
+        }
+        tg.send_message(chat_id, item_text, reply_markup=markup, disable_web_page_preview=True)
+
+    if len(favs) > 10:
+        tg.send_message(chat_id, f"<i>...и ещё {len(favs) - 10} объявлений в Избранном.</i>")
+
+    clear_markup = {
+        "inline_keyboard": [
+            [{"text": "🧹 Очистить всё Избранное", "callback_data": "cb:fav_clear"}],
+            [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+        ]
+    }
+    tg.send_message(chat_id, "⚙️ <b>Управление Избранным:</b>", reply_markup=clear_markup)
+
+
+def show_silent_mode_menu(tg: TelegramClient, chat_id: int):
+    """Displays menu for configuring night/silent hours."""
+    current_mode = get_silent_mode(chat_id)
+    is_active_now = is_in_silent_hours(chat_id)
+
+    if not current_mode or current_mode.lower() in ("off", "none", "disabled", "0"):
+        status_str = "☀️ <b>Выключен</b>\n<i>(Новые объявления приходят со звуком круглосуточно)</i>"
+    else:
+        active_badge = " 🟢 <b>[СЕЙЧАС ДЕЙСТВУЕТ ТИШИНА]</b>" if is_active_now else ""
+        status_str = (
+            f"🌙 <b>Включен: {html.escape(current_mode)}</b>{active_badge}\n"
+            f"<i>(В эти часы бот присылает объявления полностью БЕЗ ЗВУКА и вибрации, не беспокоя вас ночью)</i>"
+        )
+
+    text = (
+        f"🌙 <b>Опциональный ночной (тихий) режим</b>\n\n"
+        f"Текущий статус:\n{status_str}\n\n"
+        f"Выберите предустановку или настройте свои часы тишины:"
+    )
+    buttons = [
+        [{"text": "🌙 Включить (23:00 — 08:00)", "callback_data": "cb:silent_set:23:00-08:00"}],
+        [{"text": "🌙 Включить (00:00 — 09:00)", "callback_data": "cb:silent_set:00:00-09:00"}],
+        [{"text": "☀️ Выключить (звук всегда)", "callback_data": "cb:silent_set:off"}],
+        [{"text": "✏️ Настроить свои часы", "callback_data": "cb:silent_custom"}],
+        [{"text": "🔙 В главное меню", "callback_data": "cb:menu"}]
+    ]
+    tg.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
 
 
 def show_interval_options(tg: TelegramClient, chat_id: int, current: int):
@@ -1300,10 +1429,15 @@ def show_template_menu(tg: TelegramClient, chat_id: int):
     """Displays current quick contact message template."""
     tpl = get_user_template(chat_id)
     text = (
-        "💬 <b>Настраиваемый шаблон для связи с продавцом</b>\n\n"
-        "В карточке каждого объявления есть кнопка <b>«💬 Написать продавцу (шаблон)»</b>. "
-        "При нажатии бот выдает готовый текст сообщения в виде блока, который можно скопировать в один клик и отправить продавцу на Куфаре!\n\n"
-        f"<b>Текущий шаблон:</b>\n<code>{html.escape(tpl)}</code>"
+        "💬 <b>Умный шаблон первого сообщения продавцу</b>\n\n"
+        "В карточке каждого объявления есть кнопка <b>«💬 Написать»</b>. "
+        "Бот выдаёт готовый текст, который можно скопировать в один клик и отправить продавцу на Куфаре!\n\n"
+        f"<b>Текущий шаблон:</b>\n<code>{html.escape(tpl)}</code>\n\n"
+        "💡 <b>Поддерживаемые переменные (подставляются автоматически):</b>\n"
+        "• <code>{name}</code> — имя продавца (напр. <i>Алексей</i>)\n"
+        "• <code>{item}</code> — название товара (напр. <i>PlayStation 5 Slim</i>)\n"
+        "• <code>{price}</code> — цена объявления (напр. <i>2 100 BYN</i>)\n\n"
+        "<i>Пример шаблона: «Здравствуйте, {name}! По поводу {item}, готов забрать сегодня за наличные. Актуально?»</i>"
     )
     markup = {
         "inline_keyboard": [
@@ -1494,6 +1628,14 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         USER_STATES.pop(chat_id, None)
         show_main_menu(tg, chat_id)
 
+    elif data in ("cb:my_searches", "cb:list"):
+        USER_STATES.pop(chat_id, None)
+        show_my_searches(tg, chat_id)
+
+    elif data == "cb:all_ads":
+        USER_STATES.pop(chat_id, None)
+        output_all_user_ads(tg, chat_id)
+
     elif data == "cb:add_link":
         USER_STATES[chat_id] = {"step": "WAIT_URL", "data": {}}
         text = (
@@ -1601,17 +1743,180 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         ad = AD_DATA_CACHE.get(ad_id, {})
         ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
         tpl = get_user_template(chat_id)
+
+        # Smart variables replacement
+        seller_raw = (ad.get("seller") or "").strip()
+        subject_raw = (ad.get("subject") or "").strip()
+        price_byn = ad.get("price_byn")
+        price_str = f"{price_byn:,.0f} BYN".replace(",", " ") if price_byn else ""
+
+        personalized_msg = tpl
+        if "{name}" in personalized_msg:
+            personalized_msg = personalized_msg.replace("{name}", seller_raw if seller_raw else "продавец")
+        if "{item}" in personalized_msg:
+            personalized_msg = personalized_msg.replace("{item}", subject_raw if subject_raw else "товар")
+        if "{price}" in personalized_msg:
+            personalized_msg = personalized_msg.replace("{price}", price_str)
+
         text = (
-            f"💬 <b>Шаблон первого сообщения продавцу:</b>\n\n"
-            f"Нажмите на текст ниже, чтобы скопировать его в буфер обмена одним кликом:\n\n"
-            f"<code>{html.escape(tpl)}</code>\n\n"
-            f"Затем откройте чат с продавцом на Куфаре и вставьте сообщение 👇"
+            f"💬 <b>Готовое сообщение продавцу:</b>\n"
+            f"👤 Продавец: <b>{html.escape(seller_raw or 'Не указан')}</b>\n"
+            f"📌 Товар: <b>{html.escape(subject_raw or 'Товар')}</b>\n\n"
+            f"<i>Нажмите на текст в рамке ниже, чтобы скопировать его в буфер обмена одним кликом:</i>\n\n"
+            f"<code>{html.escape(personalized_msg)}</code>\n\n"
+            f"Затем нажмите кнопку ниже, чтобы открыть чат с продавцом на Kufar 👇"
         )
         markup = {
             "inline_keyboard": [
                 [{"text": "💬 Открыть диалог на Kufar", "url": ad_link}]
             ]
         }
+        tg.send_message(chat_id, text, reply_markup=markup)
+
+    elif data.startswith("cb:fav:"):
+        ad_id = int(data.split(":")[-1])
+        ad = AD_DATA_CACHE.get(ad_id, {})
+        title = ad.get("subject", "")
+        price_byn = ad.get("price_byn")
+        price_usd = ad.get("price_usd")
+        ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+        sname = ad.get("seller", "")
+        img_url = ad.get("image_url", "")
+
+        add_favorite(chat_id, ad_id, title=title, price_byn=price_byn, price_usd=price_usd, ad_link=ad_link, seller_name=sname, image_url=img_url)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text="⭐️ Добавлено в Избранное!", show_alert=False)
+
+        is_bl = is_ad_blacklisted(chat_id, ad_id)
+        photos = AD_PHOTOS_CACHE.get(ad_id, [])
+        new_markup = make_ad_keyboard(
+            ad_link, ad_id,
+            photo_count=len(photos),
+            seller_name=sname,
+            is_blacklisted=is_bl,
+            is_fav=True
+        )
+        try:
+            tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
+        except Exception:
+            pass
+
+    elif data.startswith("cb:unfav:"):
+        ad_id = int(data.split(":")[-1])
+        remove_favorite(chat_id, ad_id)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text="Удалено из Избранного", show_alert=False)
+
+        ad = AD_DATA_CACHE.get(ad_id, {})
+        ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+        sname = ad.get("seller", "")
+        is_bl = is_ad_blacklisted(chat_id, ad_id)
+        photos = AD_PHOTOS_CACHE.get(ad_id, [])
+        new_markup = make_ad_keyboard(
+            ad_link, ad_id,
+            photo_count=len(photos),
+            seller_name=sname,
+            is_blacklisted=is_bl,
+            is_fav=False
+        )
+        try:
+            tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
+        except Exception:
+            pass
+
+    elif data.startswith("cb:unfav_list:"):
+        ad_id = int(data.split(":")[-1])
+        remove_favorite(chat_id, ad_id)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text="Удалено из Избранного", show_alert=False)
+        try:
+            tg.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+
+    elif data == "cb:fav_clear":
+        cnt = clear_user_favorites(chat_id)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text=f"Удалено {cnt} объявлений из Избранного", show_alert=True)
+        show_favorites_menu(tg, chat_id)
+
+    elif data == "cb:fav_menu":
+        USER_STATES.pop(chat_id, None)
+        show_favorites_menu(tg, chat_id)
+
+    elif data.startswith("cb:market_stats:"):
+        qid = int(data.split(":")[-1])
+        queries = get_user_queries(chat_id)
+        q = next((item for item in queries if item["id"] == qid), None)
+        if not q:
+            tg.answer_callback_query(cb_id, text="Поиск не найден", show_alert=True)
+            return
+
+        tg.answer_callback_query(cb_id, text="📊 Анализирую рынок на Kufar...", show_alert=False)
+        params = dict(q["params"])
+        params["size"] = "50"
+        ads = fetch_ads(params)
+
+        if not ads:
+            tg.send_message(chat_id, f"ℹ️ По запросу «{html.escape(q['name'])}» сейчас нет объявлений на Kufar.")
+            return
+
+        prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
+        if not prices:
+            tg.send_message(chat_id, f"ℹ️ По запросу «{html.escape(q['name'])}» нет объявлений с указанной ценой.")
+            return
+
+        min_p = min(prices)
+        max_p = max(prices)
+        med_p = round(float(statistics.median(prices)), 2)
+        avg_p = round(float(statistics.mean(prices)), 2)
+
+        sorted_ads = sorted([a for a in ads if a.get("price_byn") and a["price_byn"] > 0], key=lambda x: x["price_byn"])
+        top3_lines = []
+        for i, a in enumerate(sorted_ads[:3], 1):
+            top3_lines.append(
+                f"{i}. <a href=\"{a['ad_link']}\">{html.escape(a['subject'])}</a> — <b>{a['price_byn']:,.0f} BYN</b>".replace(",", " ")
+            )
+
+        report = (
+            f"📊 <b>Аналитика цен: {html.escape(q['name'])}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>Проанализировано объявлений:</b> {len(prices)} шт.\n\n"
+            f"💵 <b>Минимальная цена:</b> <b>{min_p:,.0f} BYN</b>\n"
+            f"⚖️ <b>Медианная (рыночная):</b> <b>{med_p:,.0f} BYN</b>\n"
+            f"📈 <b>Средняя цена:</b> {avg_p:,.0f} BYN\n"
+            f"🏷 <b>Максимальная цена:</b> {max_p:,.0f} BYN\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔥 <b>Топ-3 самых выгодных предложений прямо сейчас:</b>\n"
+            + "\n".join(top3_lines)
+        )
+        markup = {
+            "inline_keyboard": [
+                [{"text": "📦 Показать объявления", "callback_data": f"cb:show_ads:{qid}"}],
+                [{"text": "📋 К моим поискам", "callback_data": "cb:my_searches"}]
+            ]
+        }
+        tg.send_message(chat_id, report, reply_markup=markup, disable_web_page_preview=True)
+
+    elif data == "cb:silent_menu":
+        USER_STATES.pop(chat_id, None)
+        show_silent_mode_menu(tg, chat_id)
+
+    elif data.startswith("cb:silent_set:"):
+        val = data.split(":", 2)[-1]
+        set_silent_mode(chat_id, val)
+        save_local_backup()
+        tg.answer_callback_query(cb_id, text="Настройки сохранены!", show_alert=False)
+        show_silent_mode_menu(tg, chat_id)
+
+    elif data == "cb:silent_custom":
+        USER_STATES[chat_id] = {"step": "WAIT_SILENT_HOURS"}
+        text = (
+            "🌙 <b>Настройка часов тишины</b>\n\n"
+            "Отправьте сообщением желаемый интервал в формате <code>ЧЧ:ММ-ЧЧ:ММ</code>\n"
+            "(например: <code>22:30-07:30</code> или <code>01:00-09:00</code>):"
+        )
+        markup = {"inline_keyboard": [[{"text": "🔙 Отмена", "callback_data": "cb:silent_menu"}]]}
         tg.send_message(chat_id, text, reply_markup=markup)
 
     elif data.startswith("cb:bl:"):
@@ -1782,6 +2087,16 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         show_my_searches(tg, chat_id)
         return
 
+    if text in ["⭐️ Избранное", "⭐️ Избранное / Закладки", "/favorites", "/fav", "/favs"]:
+        USER_STATES.pop(chat_id, None)
+        show_favorites_menu(tg, chat_id)
+        return
+
+    if text in ["🌙 Ночной режим", "🌙 Тихий режим", "/silent", "/night"]:
+        USER_STATES.pop(chat_id, None)
+        show_silent_mode_menu(tg, chat_id)
+        return
+
     if text in ["⏱ Интервал", "/interval"]:
         show_interval_options(tg, chat_id, config.get("check_interval_seconds", 60))
         return
@@ -1830,16 +2145,21 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
         uptime_str = str(datetime.now() - START_TIME).split(".")[0]
         user_queries = len(get_user_queries(chat_id))
         bl_count = get_blacklist_count(chat_id)
+        fav_count = get_favorites_count(chat_id)
         sw_count = len(get_stop_words(chat_id))
         bl_sellers_count = len(get_blacklisted_sellers(chat_id))
+        silent_mode_str = get_silent_mode(chat_id)
+        silent_display = "Выключен" if silent_mode_str in ("off", "") else f"Включен ({silent_mode_str})"
         backup_str = LAST_BACKUP_TIME.strftime('%d.%m.%Y в %H:%M:%S') if LAST_BACKUP_TIME else "сохранена"
         status_text = (
             f"📊 <b>Статус Kufar Hunter Bot</b>\n\n"
             f"⏱ <b>Время работы:</b> {uptime_str}\n"
             f"🎯 <b>Ваших активных поисков:</b> {user_queries}\n"
+            f"⭐️ <b>Объявлений в избранном:</b> {fav_count}\n"
             f"⛔ <b>Стоп-слов настроено:</b> {sw_count}\n"
             f"👤 <b>Продавцов в ЧС:</b> {bl_sellers_count}\n"
             f"🚫 <b>Объявлений в ЧС:</b> {bl_count}\n"
+            f"🌙 <b>Ночной режим:</b> {silent_display}\n"
             f"💾 <b>Резервная копия:</b> {backup_str}\n"
             f"🔄 <b>Проверок выполнено:</b> {TOTAL_CHECKS}\n"
             f"⏳ <b>Интервал проверки:</b> {config.get('check_interval_seconds', 60)} сек."
@@ -1864,7 +2184,9 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
             "3. Перейдите на <b>kufar.by</b>, выставьте нужные параметры (категорию, город, районы, цену, бренд и т.д.) и скопируйте ссылку.\n"
             "4. Отправьте ссылку сюда сообщением — бот перенесет все фильтры 1 в 1!\n\n"
             "📦 <b>«Вывести всё»</b> — выводит актуальные объявления по вашим сохранённым фильтрам.\n"
-            "🚫 <b>«Не интересно (в ЧС)»</b> — скрывает ненужное объявление, чтобы оно больше никогда не показывалось."
+            "⭐️ <b>«⭐️ Избранное»</b> — список отложенных вами объявлений.\n"
+            "🌙 <b>«🌙 Ночной режим»</b> — тихие часы (без звука/вибрации) ночью.\n"
+            "🚫 <b>«В ЧС (скрыть)»</b> — скрывает ненужное объявление, чтобы оно больше никогда не показывалось."
         )
         tg.send_message(chat_id, help_text, reply_markup=MAIN_KEYBOARD)
         return
@@ -1886,6 +2208,28 @@ def process_text_message(tg: TelegramClient, chat_id: int, text: str, config: di
                 handle_link_submission(tg, chat_id, text)
             else:
                 tg.send_message(chat_id, "⚠️ Это не похоже на ссылку с Kufar.by. Отправьте корректную ссылку:")
+            return
+
+        if step == "WAIT_SILENT_HOURS":
+            val = text.strip()
+            m = re.match(r'^([0-1]?[0-9]|2[0-3]):([0-5][0-9])\s*-\s*([0-1]?[0-9]|2[0-3]):([0-5][0-9])$', val)
+            if m:
+                clean_val = f"{int(m.group(1)):02d}:{m.group(2)}-{int(m.group(3)):02d}:{m.group(4)}"
+                set_silent_mode(chat_id, clean_val)
+                USER_STATES.pop(chat_id, None)
+                save_local_backup()
+                tg.send_message(
+                    chat_id,
+                    f"🌙 <b>Ночной режим успешно настроен на часы: {clean_val}!</b>\n"
+                    f"В этот интервал времени объявления будут приходить полностью без звука.",
+                    reply_markup=MAIN_KEYBOARD
+                )
+                show_silent_mode_menu(tg, chat_id)
+            else:
+                tg.send_message(
+                    chat_id,
+                    "⚠️ Неверный формат времени. Отправьте интервал в формате <code>ЧЧ:ММ-ЧЧ:ММ</code> (например: <code>23:00-08:00</code> или <code>01:30-09:30</code>):"
+                )
             return
 
         if step == "WAIT_STOP_WORDS":
@@ -2051,7 +2395,7 @@ def main():
     
     # Save local backup only if there is data
     state = export_database_state()
-    if state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words"):
+    if state.get("queries") or state.get("blacklisted_ads") or state.get("blacklisted_sellers") or state.get("stop_words") or state.get("favorites"):
         save_local_backup()
 
     # Load persistent interval setting if saved in database
