@@ -195,21 +195,21 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
     admin_chat_id = config.get("admin_chat_id", 0)
     is_admin = bool(admin_chat_id and chat_id == admin_chat_id)
 
-    stats: Dict[str, Any] = {
-        "uptime": uptime,
-        "total_checks": total_checks,
-        "new_ads_found": new_ads_found,
-        "is_admin": is_admin,
-    }
+    stats: Dict[str, Any] = {"is_admin": is_admin}
     if is_admin:
-        stats["total_users"] = get_user_count()
-        stats["total_active_queries"] = len(get_active_queries())
+        stats.update({
+            "uptime": uptime,
+            "total_checks": total_checks,
+            "new_ads_found": new_ads_found,
+            "total_users": get_user_count(),
+            "total_active_queries": len(get_active_queries()),
+        })
 
     return {
         "ok": True,
         "chat_id": chat_id,
         "monitoring_paused": paused,
-        "interval_seconds": int(config.get("check_interval_seconds", 60)),
+        "interval_seconds": int(config.get("check_interval_seconds", 60)) if is_admin else None,
         "silent_mode": silent_mode,
         "in_silent_now": is_in_silent_hours(chat_id),
         "template": template,
@@ -705,7 +705,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" id="intervalCard" style="display:none">
       <div class="section-title"><span class="title-ic" id="icIntTitle"></span>Интервал проверки</div>
       <div class="seg" id="intervalSeg">
         <button class="seg-btn" data-sec="15" onclick="setIntervalSec(15)">15 сек</button>
@@ -946,7 +946,7 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   <button class="nav-btn" data-tab="settings" onclick="switchTab('settings')">
     <span id="navIcSettings"></span><span>Фильтры</span>
   </button>
-  <button class="nav-btn" data-tab="stats" onclick="switchTab('stats')">
+  <button id="navBtnStats" class="nav-btn" data-tab="stats" style="display:none" onclick="switchTab('stats')">
     <span id="navIcStats"></span><span>Статус</span>
   </button>
 </div>
@@ -1079,6 +1079,9 @@ function fmtMoney(n) {
 }
 
 function switchTab(tab) {
+  if (tab === 'stats' && !(STATE && STATE.stats && STATE.stats.is_admin)) {
+    tab = 'searches';
+  }
   haptic('light');
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -1094,9 +1097,19 @@ function renderChip(c) {
 function renderAll() {
   if (!STATE) return;
   const paused = STATE.monitoring_paused;
+  const st = STATE.stats || {};
+  const isAdmin = Boolean(st.is_admin);
   document.getElementById('monitorDot').className = 'dot' + (paused ? ' paused' : '');
   document.getElementById('monitorLabel').textContent = paused ? 'На паузе' : 'Активен';
-  document.getElementById('subHeader').textContent = `${paused ? 'Пауза' : 'Опрос каждые ' + STATE.interval_seconds + 'с'} · Поисков: ${STATE.queries.length}`;
+  document.getElementById('subHeader').textContent = isAdmin
+    ? `${paused ? 'Пауза' : 'Опрос каждые ' + STATE.interval_seconds + 'с'} · Поисков: ${STATE.queries.length}`
+    : `${paused ? 'Мониторинг на паузе' : 'Мониторинг активен'} · Поисков: ${STATE.queries.length}`;
+
+  document.getElementById('navBtnStats').style.display = isAdmin ? 'flex' : 'none';
+  document.getElementById('intervalCard').style.display = isAdmin ? 'block' : 'none';
+  if (!isAdmin && document.getElementById('tab-stats').classList.contains('active')) {
+    switchTab('searches');
+  }
 
   const bq = document.getElementById('badgeQueries');
   bq.textContent = STATE.queries.length;
@@ -1195,28 +1208,25 @@ function renderAll() {
     ? STATE.blacklisted_sellers.map(s => `<span class="chip">${icon('user', 'ic ic-sm')}${esc(s)}<span class="x" onclick="unblockSeller('${esc(s)}')">${icon('undo', 'ic ic-sm')}</span></span>`).join('')
     : '';
 
-  // Stats
-  const st = STATE.stats || {};
-  let statsHtml = `
-    <div class="stat-box">
-      <div class="stat-top"><span class="stat-lbl">Аптайм сервера</span>${icon('clock')}</div>
-      <div class="stat-val">${esc(st.uptime || '0:00')}</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-top"><span class="stat-lbl">Проверок</span>${icon('activity')}</div>
-      <div class="stat-val">${st.total_checks || 0}</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-top"><span class="stat-lbl">Отправлено</span>${icon('send')}</div>
-      <div class="stat-val">${st.new_ads_found || 0}</div>
-    </div>
-    <div class="stat-box">
-      <div class="stat-top"><span class="stat-lbl">Поисков</span>${icon('radar')}</div>
-      <div class="stat-val">${STATE.queries.length}</div>
-    </div>
-  `;
-  if (st.is_admin) {
-    statsHtml += `
+  // Stats (Admin only)
+  if (isAdmin) {
+    document.getElementById('statsGrid').innerHTML = `
+      <div class="stat-box">
+        <div class="stat-top"><span class="stat-lbl">Аптайм сервера</span>${icon('clock')}</div>
+        <div class="stat-val">${esc(st.uptime || '0:00')}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-top"><span class="stat-lbl">Проверок</span>${icon('activity')}</div>
+        <div class="stat-val">${st.total_checks || 0}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-top"><span class="stat-lbl">Отправлено</span>${icon('send')}</div>
+        <div class="stat-val">${st.new_ads_found || 0}</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-top"><span class="stat-lbl">Поисков</span>${icon('radar')}</div>
+        <div class="stat-val">${STATE.queries.length}</div>
+      </div>
       <div class="stat-box">
         <div class="stat-top"><span class="stat-lbl">Пользователей</span>${icon('users')}</div>
         <div class="stat-val">${st.total_users || 1}</div>
@@ -1226,8 +1236,9 @@ function renderAll() {
         <div class="stat-val">${st.total_active_queries || 0}</div>
       </div>
     `;
+  } else {
+    document.getElementById('statsGrid').innerHTML = '';
   }
-  document.getElementById('statsGrid').innerHTML = statsHtml;
 
   const catSel = document.getElementById('addCatSelect');
   if (!catSel.options.length) {
@@ -1892,6 +1903,10 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     return
 
                 if path == "/api/check_now":
+                    admin_chat_id = config.get("admin_chat_id", 0)
+                    if not (admin_chat_id and chat_id == admin_chat_id):
+                        self._send_json(403, {"ok": False, "error": "Доступно только администратору"})
+                        return
                     app_ctx["trigger_force_check"]()
                     self._send_json(200, {"ok": True})
                     return
@@ -2097,6 +2112,10 @@ def create_http_handler(app_ctx: Dict[str, Any]):
 
                 if path == "/api/settings":
                     if "interval_seconds" in body:
+                        admin_chat_id = config.get("admin_chat_id", 0)
+                        if not (admin_chat_id and chat_id == admin_chat_id):
+                            self._send_json(403, {"ok": False, "error": "Интервал сервера меняет только администратор"})
+                            return
                         sec = max(10, min(600, int(body["interval_seconds"])))
                         config["check_interval_seconds"] = sec
                         set_setting("check_interval_seconds", str(sec))
