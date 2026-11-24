@@ -172,19 +172,16 @@ def make_ad_keyboard(
     is_blacklisted: bool = False,
     is_fav: bool = False
 ) -> Dict[str, Any]:
-    """Builds clean two-column inline action keyboard attached directly to ad cards."""
+    """Builds clean inline action keyboard attached directly to ad cards."""
     buttons = []
     
-    # Row 1: Direct link to listing on Kufar
-    buttons.append([{"text": "🔗 Открыть на Kufar", "url": ad_link}])
+    # Row 1: Direct link to listing on Kufar + Contact template
+    buttons.append([
+        {"text": "🔗 Открыть на Kufar", "url": ad_link},
+        {"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}
+    ])
 
-    # Row 2: Contact template + Gallery photo button (if multiple photos exist)
-    row2 = [{"text": "💬 Написать", "callback_data": f"cb:contact:{ad_id}"}]
-    if photo_count > 1:
-        row2.append({"text": f"📸 Фото ({photo_count})", "callback_data": f"cb:photos:{ad_id}"})
-    buttons.append(row2)
-
-    # Row 3: Favorite toggle + Blacklist toggle (in 2 ergonomic columns)
+    # Row 2: Favorite toggle + Blacklist toggle (in 2 ergonomic columns)
     fav_text = "⭐️ В избранном" if is_fav else "⭐️ В Избранное"
     fav_cb = f"cb:unfav:{ad_id}" if is_fav else f"cb:fav:{ad_id}"
     bl_text = "↩️ Из ЧС" if is_blacklisted else "🚫 В ЧС"
@@ -194,7 +191,7 @@ def make_ad_keyboard(
         {"text": bl_text, "callback_data": bl_cb}
     ])
 
-    # Row 4: Seller blacklist button
+    # Row 3: Seller blacklist button
     if seller_name:
         clean_s = seller_name.strip()
         short_s = clean_s[:16] + "…" if len(clean_s) > 17 else clean_s
@@ -687,9 +684,39 @@ def send_ad_notification(
 
     disable_notif = is_in_silent_hours(chat_id)
 
-    # Send unified card: Photo + Description + Action buttons attached directly
+    # Send ad card: All photos immediately as album, or single photo, or text fallback
     if image_urls:
         photo_caption = caption if len(caption) <= 1000 else caption[:996] + "..."
+
+        # 1. Multiple photos: output all photos immediately as a native media group album
+        if len(image_urls) > 1:
+            media = [
+                {
+                    "type": "photo",
+                    "media": image_urls[0],
+                    "caption": photo_caption,
+                    "parse_mode": "HTML"
+                }
+            ]
+            for u in image_urls[1:10]:
+                media.append({"type": "photo", "media": u})
+
+            res_album = tg.send_media_group(chat_id, media, disable_notification=disable_notif)
+            if res_album and isinstance(res_album, list):
+                mids = [m["message_id"] for m in res_album if isinstance(m, dict) and "message_id" in m]
+                # Send compact action bar attached immediately under album
+                res_btn = tg.send_message(
+                    chat_id,
+                    "⚡ <b>Действия с объявлением:</b>",
+                    reply_markup=markup,
+                    disable_notification=disable_notif
+                )
+                if res_btn and isinstance(res_btn, dict) and "message_id" in res_btn:
+                    mids.append(res_btn["message_id"])
+                AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
+                return True
+
+        # 2. Single photo (or fallback if album failed)
         res_photo = tg.send_photo(
             chat_id,
             image_urls[0],
@@ -701,7 +728,7 @@ def send_ad_notification(
             AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
             return True
 
-    # Fallback: Text only with buttons attached directly
+    # 3. Fallback: Text only with buttons attached directly
     res_msg = tg.send_message(
         chat_id,
         caption,
@@ -1932,29 +1959,7 @@ def process_callback_query(tg: TelegramClient, cb: Dict[str, Any], config: dict)
         output_ads_for_query(tg, chat_id, qid)
 
     elif data.startswith("cb:photos:"):
-        ad_id = int(data.split(":")[-1])
-        photos = AD_PHOTOS_CACHE.get(ad_id)
-        if not photos:
-            photos = fetch_ad_photos(ad_id)
-            if photos:
-                AD_PHOTOS_CACHE[ad_id] = photos
-
-        if photos and len(photos) >= 2:
-            tg.answer_callback_query(cb_id, text=f"📸 Отправляю {len(photos)} фото...")
-            media = [{"type": "photo", "media": photos[0], "caption": f"📸 <b>Все фотографии к объявлению #{ad_id}</b>", "parse_mode": "HTML"}]
-            for u in photos[1:10]:
-                media.append({"type": "photo", "media": u})
-            res_album = tg.send_media_group(chat_id, media)
-            if res_album and isinstance(res_album, list):
-                mids = AD_MESSAGES_MAP.get((chat_id, ad_id), [])
-                for m in res_album:
-                    if isinstance(m, dict) and "message_id" in m:
-                        mids.append(m["message_id"])
-                AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
-        elif photos:
-            tg.answer_callback_query(cb_id, text="В этом объявлении только 1 фото")
-        else:
-            tg.answer_callback_query(cb_id, text="Не удалось загрузить дополнительные фото")
+        tg.answer_callback_query(cb_id, text="📸 Все фотографии к объявлению уже отображены в чате")
 
     elif data.startswith("cb:contact:"):
         ad_id = int(data.split(":")[-1])

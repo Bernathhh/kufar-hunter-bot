@@ -137,12 +137,19 @@ class TelegramClient:
         res = self._api_call("deleteMessage", payload=payload)
         return res is not None
 
-    def send_media_group(self, chat_id: int, media: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    def send_media_group(
+        self,
+        chat_id: int,
+        media: List[Dict[str, Any]],
+        disable_notification: bool = False
+    ) -> Optional[List[Dict[str, Any]]]:
         """Sends an album of photos/videos (up to 10 items). Returns list of message dicts or None."""
-        payload = {
+        payload: Dict[str, Any] = {
             "chat_id": chat_id,
             "media": media
         }
+        if disable_notification:
+            payload["disable_notification"] = True
         res = self._api_call("sendMediaGroup", payload=payload)
         if isinstance(res, list):
             return res
