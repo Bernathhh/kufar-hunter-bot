@@ -297,17 +297,30 @@ def extract_smart_badges(subject: str, description: Optional[str]) -> List[str]:
 class HealthHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "application/json; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"OK - Kufar Hunter Bot is running")
+        uptime = str(datetime.now() - START_TIME).split(".")[0]
+        status = {
+            "status": "online",
+            "bot": "Kufar Hunter Bot",
+            "uptime": uptime,
+            "total_checks": TOTAL_CHECKS,
+            "active_queries": len(get_active_queries()),
+            "timestamp": datetime.now().isoformat()
+        }
+        self.wfile.write(json.dumps(status, ensure_ascii=False).encode("utf-8"))
 
     def log_message(self, format, *args):
         pass
 
 
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
 def start_health_server(port: int):
     try:
-        server = socketserver.TCPServer(("0.0.0.0", port), HealthHandler)
+        server = ReusableTCPServer(("0.0.0.0", port), HealthHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         logger.info(f"Health check HTTP server running on port {port}")
@@ -2595,7 +2608,10 @@ def telegram_listener(tg: TelegramClient, config: dict):
 
                 # Handle Inline Button Clicks
                 if "callback_query" in u:
-                    process_callback_query(tg, u["callback_query"], config)
+                    try:
+                        process_callback_query(tg, u["callback_query"], config)
+                    except Exception as e:
+                        logger.error(f"Error handling callback query: {e}")
                     continue
 
                 # Handle Text Messages
@@ -2633,7 +2649,10 @@ def telegram_listener(tg: TelegramClient, config: dict):
                         continue
 
                 if chat_id and text:
-                    process_text_message(tg, chat_id, text, config, user_info=from_user)
+                    try:
+                        process_text_message(tg, chat_id, text, config, user_info=from_user)
+                    except Exception as e:
+                        logger.error(f"Error handling text message: {e}")
         except Exception as e:
             logger.error(f"Error in Telegram listener: {e}")
             time.sleep(2.0)
@@ -2729,7 +2748,15 @@ def main():
 
     try:
         while not STOP_EVENT.is_set():
-            time.sleep(1)
+            if not listener_thread.is_alive():
+                logger.warning("Listener thread died! Auto-restarting telegram_listener...")
+                listener_thread = threading.Thread(target=telegram_listener, args=(tg, config), daemon=True)
+                listener_thread.start()
+            if not hunter_thread.is_alive():
+                logger.warning("Hunter thread died! Auto-restarting hunter_loop...")
+                hunter_thread = threading.Thread(target=hunter_loop, args=(tg, config), daemon=True)
+                hunter_thread.start()
+            time.sleep(2)
     except KeyboardInterrupt:
         print("\n🛑 Остановка бота...")
         STOP_EVENT.set()
