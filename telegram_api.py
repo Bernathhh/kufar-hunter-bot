@@ -79,7 +79,7 @@ class TelegramClient:
         res = self._api_call("setMyCommands", payload={"commands": commands})
         return res is not None
 
-    def set_chat_menu_button(self, web_app_url: Optional[str] = None, text: str = "Приложение") -> bool:
+    def set_chat_menu_button(self, web_app_url: Optional[str] = None, text: str = "Mini App") -> bool:
         """Configures the Telegram chat menu button to launch the Mini App or default commands."""
         if web_app_url:
             payload = {

@@ -48,6 +48,7 @@ from database import (
     set_user_monitoring_paused,
     set_user_template,
     toggle_query_active,
+    update_query,
 )
 from kufar_api import fetch_ads, parse_kufar_url_or_query
 
@@ -156,6 +157,12 @@ def _build_query_chips(p: Dict[str, Any], app_ctx: Dict[str, Any]) -> List[Dict[
         chips.append({"icon": "wallet", "text": f"от {int(min_p):,} BYN".replace(",", " ")})
     elif max_p:
         chips.append({"icon": "wallet", "text": f"до {int(max_p):,} BYN".replace(",", " ")})
+    cnd_map = {"1": "Б/У", "2": "Новое"}
+    if str(p.get("cnd", "")) in cnd_map:
+        chips.append({"icon": "sparkles", "text": cnd_map[str(p["cnd"])]})
+    cmp_map = {"0": "Частные", "1": "Компании"}
+    if str(p.get("cmp", "")) in cmp_map:
+        chips.append({"icon": "users", "text": cmp_map[str(p["cmp"])]})
     return chips or [{"icon": "grid", "text": "Все объявления"}]
 
 
@@ -254,6 +261,93 @@ def _params_from_body(body: Dict[str, Any], app_ctx: Dict[str, Any]) -> Tuple[Di
 
     name = kw or cat_map.get(cat_id, "Куфар поиск")
     return params, name
+
+
+def _merge_edited_params(
+    existing_params: Dict[str, Any],
+    body: Dict[str, Any],
+    app_ctx: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Merges edited filter fields into existing query params while preserving specialized Kufar keys."""
+    cat_map = {k: _plain_label(v) for k, v in app_ctx.get("categories", [])}
+    url_raw = (body.get("url") or "").strip()
+    if url_raw:
+        params = parse_kufar_url_or_query(url_raw)
+        cat_name = cat_map.get(str(params.get("cat", "")), "Куфар поиск")
+        brand = params.get("brand") or ("Sony" if str(params.get("cbc")) == "31" else "")
+        auto_name = params.get("query") or (f"{cat_name} ({brand})" if brand else cat_name)
+        name_val = (body.get("name") or "").strip() or auto_name
+        return params, name_val
+
+    params: Dict[str, Any] = dict(existing_params or {})
+    params.setdefault("sort", "lst.d")
+    params.setdefault("size", "30")
+
+    if "query" in body:
+        kw = str(body.get("query") or "").strip()
+        if kw:
+            params["query"] = kw
+        else:
+            params.pop("query", None)
+
+    if "cat" in body:
+        cat_id = str(body.get("cat") or "").strip()
+        if not cat_id or cat_id == "all":
+            params.pop("cat", None)
+        else:
+            params["cat"] = cat_id
+
+    if "rgn" in body:
+        old_rgn = str(params.get("rgn", ""))
+        rgn_id = str(body.get("rgn") or "").strip()
+        if not rgn_id or rgn_id == "all":
+            params.pop("rgn", None)
+            params.pop("ar", None)
+        else:
+            params["rgn"] = rgn_id
+            if rgn_id != old_rgn:
+                if rgn_id == "7":
+                    params["ar"] = "v.or:22,23,24,25,26,27,28,29,30"
+                else:
+                    params.pop("ar", None)
+
+    if "min_price" in body or "max_price" in body:
+        min_raw = str(body.get("min_price") or "").strip()
+        max_raw = str(body.get("max_price") or "").strip()
+        min_p = int(float(min_raw)) if min_raw and min_raw.replace(".", "", 1).isdigit() else None
+        max_p = int(float(max_raw)) if max_raw and max_raw.replace(".", "", 1).isdigit() else None
+        if min_p is not None and max_p is not None and min_p > max_p:
+            min_p, max_p = max_p, min_p
+        if min_p is not None and max_p is not None:
+            params["prc"] = f"r:{min_p * 100},{max_p * 100}"
+        elif min_p is not None:
+            params["prc"] = f"r:{min_p * 100},999999999"
+        elif max_p is not None:
+            params["prc"] = f"r:0,{max_p * 100}"
+        else:
+            params.pop("prc", None)
+
+    if "cnd" in body:
+        cnd = str(body.get("cnd") or "").strip()
+        if cnd in ("1", "2"):
+            params["cnd"] = cnd
+        else:
+            params.pop("cnd", None)
+
+    if "cmp" in body:
+        cmp_val = str(body.get("cmp") or "").strip()
+        if cmp_val in ("0", "1"):
+            params["cmp"] = cmp_val
+        else:
+            params.pop("cmp", None)
+
+    if "sort" in body:
+        sort_val = str(body.get("sort") or "").strip()
+        if sort_val in ("lst.d", "prc.a", "prc.d"):
+            params["sort"] = sort_val
+
+    name_val = (body.get("name") or "").strip() or None
+    return params, name_val
 
 
 WEBAPP_HTML = r"""<!DOCTYPE html>
@@ -387,7 +481,38 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   }
   .chip .x:hover { opacity: 1; color: var(--red); background: var(--red-soft); }
 
-  .query-actions { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 6px; }
+  .query-actions { display: grid; grid-template-columns: 1fr 1fr 1fr auto auto; gap: 6px; }
+  .pill-mini-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .pill-mini {
+    border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 8px; padding: 5px 9px; font-size: 11.5px; font-weight: 600;
+    cursor: pointer; transition: background .15s, transform .1s;
+  }
+  .pill-mini:active { transform: scale(0.96); }
+  .feed-toolbar { display: grid; grid-template-columns: 1fr auto auto; gap: 6px; margin-bottom: 10px; }
+  .feed-toolbar .input, .feed-toolbar select { padding: 8px 10px; font-size: 12.5px; }
+  .thumb-wrap.clickable { cursor: zoom-in; }
+  .lightbox-bg {
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(5, 7, 11, 0.94); backdrop-filter: blur(8px);
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    padding: 16px;
+  }
+  .lightbox-bg.open { display: flex; }
+  .lightbox-top {
+    position: absolute; top: 14px; left: 16px; right: 16px;
+    display: flex; align-items: center; justify-content: space-between; color: #fff;
+  }
+  .lightbox-counter { font-size: 13px; font-weight: 700; opacity: 0.9; }
+  .lightbox-img {
+    max-width: 100%; max-height: 76vh; border-radius: 14px; object-fit: contain;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+  }
+  .lightbox-nav {
+    display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 14px;
+  }
+  .spin { animation: spin 0.8s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
   .switch {
     position: relative; width: 44px; height: 26px; flex-shrink: 0;
@@ -538,10 +663,13 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
         <div class="brand-sub" id="subHeader">Загрузка...</div>
       </div>
     </div>
-    <button id="monitorPill" class="status-pill" onclick="toggleGlobalMonitoring()">
-      <span id="monitorDot" class="dot"></span>
-      <span id="monitorLabel">Активен</span>
-    </button>
+    <div style="display:flex;align-items:center;gap:6px">
+      <button id="btnRefreshHeader" class="btn btn-sm btn-ghost btn-icon" title="Обновить" onclick="refreshState()"></button>
+      <button id="monitorPill" class="status-pill" onclick="toggleGlobalMonitoring()">
+        <span id="monitorDot" class="dot"></span>
+        <span id="monitorLabel">Активен</span>
+      </button>
+    </div>
   </div>
 
   <!-- TAB 1: SEARCHES -->
@@ -643,7 +771,10 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       <div class="query-meta" style="margin-top:8px">
         Свежие объявления отправляются в чат нативным альбомом со всеми фотографиями, аналитикой цены относительно медианы и быстрым переходом к продавцу.
       </div>
-      <button class="btn btn-block" style="margin-top:14px" onclick="sendAllToChat()" id="btnStatsSend"></button>
+      <div class="row-2" style="margin-top:14px">
+        <button class="btn btn-ghost btn-block" onclick="triggerCheckNow()" id="btnStatsCheck"></button>
+        <button class="btn btn-block" onclick="sendAllToChat()" id="btnStatsSend"></button>
+      </div>
     </div>
   </div>
 </div>
@@ -693,6 +824,81 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- EDIT FILTER MODAL -->
+<div id="editModal" class="modal-bg" onclick="if(event.target===this)closeModal('editModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title" id="editModalTitle">Редактировать фильтр</div>
+      <button class="btn btn-sm btn-ghost btn-icon" onclick="closeModal('editModal')" id="btnCloseEdit"></button>
+    </div>
+
+    <span class="field-label">Название поиска</span>
+    <input id="editNameInput" class="input" placeholder="Например: PS5 Минск" />
+
+    <span class="field-label">Ключевые слова (необязательно)</span>
+    <input id="editQueryInput" class="input" placeholder="playstation 5, slim, pro..." />
+
+    <div class="row-2">
+      <div>
+        <span class="field-label">Категория</span>
+        <select id="editCatSelect" class="input"></select>
+      </div>
+      <div>
+        <span class="field-label">Регион</span>
+        <select id="editRgnSelect" class="input"></select>
+      </div>
+    </div>
+
+    <div class="row-2">
+      <div>
+        <span class="field-label">Цена от (BYN)</span>
+        <input id="editMinInput" type="number" class="input" placeholder="0" />
+      </div>
+      <div>
+        <span class="field-label">Цена до (BYN)</span>
+        <input id="editMaxInput" type="number" class="input" placeholder="Любая" />
+      </div>
+    </div>
+    <div class="pill-mini-row">
+      <button type="button" class="pill-mini" onclick="adjustEditPrice(-100)">-100 к «до»</button>
+      <button type="button" class="pill-mini" onclick="adjustEditPrice(100)">+100 к «до»</button>
+      <button type="button" class="pill-mini" onclick="adjustEditPrice(250)">+250 к «до»</button>
+      <button type="button" class="pill-mini" onclick="resetEditPrice()">Сбросить цену</button>
+    </div>
+
+    <div class="row-2">
+      <div>
+        <span class="field-label">Состояние</span>
+        <select id="editCndSelect" class="input">
+          <option value="">Любое</option>
+          <option value="1">Б/У</option>
+          <option value="2">Новое</option>
+        </select>
+      </div>
+      <div>
+        <span class="field-label">Продавец</span>
+        <select id="editCmpSelect" class="input">
+          <option value="">Все</option>
+          <option value="0">Частные</option>
+          <option value="1">Компании</option>
+        </select>
+      </div>
+    </div>
+
+    <span class="field-label">Или заменить параметры ссылкой с Kufar.by (опционально)</span>
+    <input id="editUrlInput" class="input" placeholder="https://www.kufar.by/l/..." />
+
+    <div id="editExtraInfo" class="query-meta" style="margin-top:10px;display:none"></div>
+    <div id="editPreviewBox" class="card" style="display:none;margin-top:12px;background:var(--bg)"></div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px">
+      <button class="btn btn-ghost btn-block" onclick="previewEditedQuery()" id="btnPreviewEdit"></button>
+      <button class="btn btn-ghost btn-block" onclick="saveEditedQuery(true)" id="btnCopyEdit"></button>
+    </div>
+    <button class="btn btn-block" style="margin-top:8px" onclick="saveEditedQuery(false)" id="btnSaveEdit"></button>
+  </div>
+</div>
+
 <!-- FEED & ANALYTICS MODAL -->
 <div id="feedModal" class="modal-bg" onclick="if(event.target===this)closeModal('feedModal')">
   <div class="modal">
@@ -701,7 +907,30 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
       <button class="btn btn-sm btn-ghost btn-icon" onclick="closeModal('feedModal')" id="btnCloseFeed"></button>
     </div>
     <div id="feedAnalytics"></div>
+    <div id="feedToolbar" class="feed-toolbar" style="display:none">
+      <input id="feedSearchInput" class="input" placeholder="Фильтр по названию..." oninput="filterAndRenderFeed()" />
+      <select id="feedSortSelect" onchange="filterAndRenderFeed()">
+        <option value="default">Сначала новые</option>
+        <option value="price_asc">Дешевле</option>
+        <option value="price_desc">Дороже</option>
+        <option value="bargains">Выгодные</option>
+      </select>
+      <button class="btn btn-sm btn-ghost btn-icon" title="Копировать ссылку Kufar" onclick="copyFeedKufarUrl()" id="btnFeedCopyUrl"></button>
+    </div>
     <div id="feedItems"></div>
+  </div>
+</div>
+
+<!-- PHOTO LIGHTBOX MODAL -->
+<div id="lightboxModal" class="lightbox-bg" onclick="if(event.target===this)closeModal('lightboxModal')">
+  <div class="lightbox-top">
+    <span class="lightbox-counter" id="lightboxCounter">1 / 1</span>
+    <button class="btn btn-sm btn-ghost btn-icon" style="color:#fff;border-color:rgba(255,255,255,0.2)" onclick="closeModal('lightboxModal')" id="btnLightboxClose"></button>
+  </div>
+  <img id="lightboxImg" class="lightbox-img" src="" alt="" />
+  <div class="lightbox-nav">
+    <button class="btn btn-sm btn-ghost" style="color:#fff;border-color:rgba(255,255,255,0.2)" onclick="stepLightbox(-1)" id="btnLightboxPrev"></button>
+    <button class="btn btn-sm btn-ghost" style="color:#fff;border-color:rgba(255,255,255,0.2)" onclick="stepLightbox(1)" id="btnLightboxNext"></button>
   </div>
 </div>
 
@@ -753,7 +982,13 @@ const SVG_PATHS = {
   users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
   activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
   rocket: '<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/>',
-  inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>'
+  inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  refreshCw: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  chevronLeft: '<path d="m15 18-6-6 6-6"/>',
+  chevronRight: '<path d="m9 18 6-6-6-6"/>',
+  sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>'
 };
 
 function icon(name, cls = 'ic') {
@@ -763,6 +998,7 @@ function icon(name, cls = 'ic') {
 function initStaticIcons() {
   document.getElementById('brandLogo').innerHTML = icon('radar', 'ic ic-lg');
   document.getElementById('outsideLogo').innerHTML = icon('radar', 'ic ic-xl');
+  document.getElementById('btnRefreshHeader').innerHTML = icon('refreshCw', 'ic ic-sm');
   document.getElementById('btnAllToChat').innerHTML = `${icon('send', 'ic ic-sm')} В чат`;
   document.getElementById('btnOpenAdd').innerHTML = `${icon('plus', 'ic ic-sm')} Добавить`;
   document.getElementById('clearFavsBtn').innerHTML = `${icon('trash', 'ic ic-sm')} Очистить`;
@@ -772,14 +1008,24 @@ function initStaticIcons() {
   document.getElementById('icTplTitle').innerHTML = icon('message', 'ic ic-sm');
   document.getElementById('icBlTitle').innerHTML = icon('ban', 'ic ic-sm');
   document.getElementById('icAlbumsTitle').innerHTML = icon('images', 'ic ic-sm');
-  document.getElementById('btnStatsSend').innerHTML = `${icon('send')} Вывести свежие объявления в чат`;
+  document.getElementById('btnStatsCheck').innerHTML = `${icon('refreshCw', 'ic ic-sm')} Проверить сейчас`;
+  document.getElementById('btnStatsSend').innerHTML = `${icon('send')} В чат`;
   document.getElementById('addModalTitle').innerHTML = `${icon('plus')} Новый поиск Kufar`;
+  document.getElementById('editModalTitle').innerHTML = `${icon('edit')} Редактировать фильтр`;
   document.getElementById('btnCloseAdd').innerHTML = icon('x');
+  document.getElementById('btnCloseEdit').innerHTML = icon('x');
   document.getElementById('btnCloseFeed').innerHTML = icon('x');
+  document.getElementById('btnFeedCopyUrl').innerHTML = icon('copy', 'ic ic-sm');
+  document.getElementById('btnLightboxClose').innerHTML = icon('x');
+  document.getElementById('btnLightboxPrev').innerHTML = `${icon('chevronLeft', 'ic ic-sm')} Назад`;
+  document.getElementById('btnLightboxNext').innerHTML = `Далее ${icon('chevronRight', 'ic ic-sm')}`;
   document.getElementById('modeLinkBtn').innerHTML = `${icon('link', 'ic ic-sm')} По ссылке`;
   document.getElementById('modeFormBtn').innerHTML = `${icon('sliders', 'ic ic-sm')} Конструктор`;
   document.getElementById('btnPreviewQuery').innerHTML = `${icon('search', 'ic ic-sm')} Проверить`;
   document.getElementById('btnCreateQuery').innerHTML = `${icon('rocket', 'ic ic-sm')} Запустить`;
+  document.getElementById('btnPreviewEdit').innerHTML = `${icon('search', 'ic ic-sm')} Проверить`;
+  document.getElementById('btnCopyEdit').innerHTML = `${icon('copy', 'ic ic-sm')} Как копию`;
+  document.getElementById('btnSaveEdit').innerHTML = `${icon('check', 'ic ic-sm')} Сохранить фильтр`;
   document.getElementById('navIcSearches').innerHTML = icon('radar', 'ic ic-lg');
   document.getElementById('navIcFavs').innerHTML = icon('star', 'ic ic-lg');
   document.getElementById('navIcSettings').innerHTML = icon('sliders', 'ic ic-lg');
@@ -790,7 +1036,11 @@ const tg = window.Telegram && window.Telegram.WebApp;
 let STATE = null;
 let ADD_MODE = 'link';
 let ACTIVE_FEED_Q = null;
+let FEED_ADS_LIST = [];
 let FEED_ADS_CACHE = {};
+let EDITING_QID = null;
+let LIGHTBOX_URLS = [];
+let LIGHTBOX_IDX = 0;
 
 function haptic(type = 'light') {
   try { tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(type); } catch(e) {}
@@ -877,7 +1127,8 @@ function renderAll() {
           <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id})">${icon('eye', 'ic ic-sm')} Лента</button>
           <button class="btn btn-sm btn-ghost" onclick="sendQueryToChat(${q.id})">${icon('send', 'ic ic-sm')} В чат</button>
           <button class="btn btn-sm btn-ghost" onclick="openFeed(${q.id}, true)">${icon('barChart', 'ic ic-sm')} Цены</button>
-          <button class="btn btn-sm btn-danger btn-icon" onclick="deleteQuery(${q.id}, '${esc(q.name)}')">${icon('trash', 'ic ic-sm')}</button>
+          <button class="btn btn-sm btn-ghost btn-icon" title="Редактировать" onclick="openEditModal(${q.id})">${icon('edit', 'ic ic-sm')}</button>
+          <button class="btn btn-sm btn-danger btn-icon" title="Удалить" onclick="deleteQuery(${q.id}, '${esc(q.name)}')">${icon('trash', 'ic ic-sm')}</button>
         </div>
       </div>
     `).join('');
@@ -986,12 +1237,39 @@ function renderAll() {
   if (!rgnSel.options.length) {
     STATE.regions.forEach(r => rgnSel.add(new Option(r.name, r.id)));
   }
+  const editCatSel = document.getElementById('editCatSelect');
+  if (!editCatSel.options.length) {
+    STATE.categories.forEach(c => editCatSel.add(new Option(c.name, c.id)));
+  }
+  const editRgnSel = document.getElementById('editRgnSelect');
+  if (!editRgnSel.options.length) {
+    STATE.regions.forEach(r => editRgnSel.add(new Option(r.name, r.id)));
+  }
 }
 
 async function loadState() {
   const data = await api('/api/state');
   STATE = data;
   renderAll();
+}
+
+async function refreshState() {
+  haptic('light');
+  const btn = document.getElementById('btnRefreshHeader');
+  const svg = btn && btn.querySelector('svg');
+  if (svg) svg.classList.add('spin');
+  try {
+    await loadState();
+    showToast('Данные обновлены');
+  } finally {
+    if (svg) svg.classList.remove('spin');
+  }
+}
+
+async function triggerCheckNow() {
+  haptic('medium');
+  await api('/api/check_now', 'POST', {});
+  showToast('Внеочередная проверка запущена');
 }
 
 async function toggleGlobalMonitoring() {
@@ -1084,12 +1362,218 @@ async function createNewQuery() {
   } catch(e) { showToast(e.message); }
 }
 
-async function openFeed(qid) {
+function parsePrcClient(prc) {
+  if (!prc || !String(prc).startsWith('r:')) return [null, null];
+  const parts = String(prc).slice(2).split(',');
+  if (parts.length !== 2) return [null, null];
+  const minP = (parts[0] && parts[0] !== '0') ? Math.round(Number(parts[0]) / 100) : null;
+  const maxP = (parts[1] && parts[1] !== '999999999' && parts[1] !== '0') ? Math.round(Number(parts[1]) / 100) : null;
+  return [Number.isFinite(minP) ? minP : null, Number.isFinite(maxP) ? maxP : null];
+}
+
+function openEditModal(qid) {
+  const q = STATE && STATE.queries.find(x => x.id === qid);
+  if (!q) return;
+  haptic('light');
+  EDITING_QID = qid;
+  const p = q.params || {};
+  document.getElementById('editNameInput').value = q.name || '';
+  document.getElementById('editQueryInput').value = p.query || '';
+  document.getElementById('editCatSelect').value = p.cat || 'all';
+  document.getElementById('editRgnSelect').value = p.rgn || 'all';
+  const [minP, maxP] = parsePrcClient(p.prc);
+  document.getElementById('editMinInput').value = minP !== null ? String(minP) : '';
+  document.getElementById('editMaxInput').value = maxP !== null ? String(maxP) : '';
+  document.getElementById('editCndSelect').value = p.cnd || '';
+  document.getElementById('editCmpSelect').value = p.cmp || '';
+  document.getElementById('editUrlInput').value = '';
+  document.getElementById('editPreviewBox').style.display = 'none';
+
+  const specials = [];
+  if (p.cbc === '31') specials.push('Sony');
+  else if (p.cbc) specials.push('Бренд #' + p.cbc);
+  if (p.brand) specials.push(p.brand);
+  if (p.cte === '1') specials.push('Приставки');
+  else if (p.cte === '2') specials.push('Игры');
+  else if (p.cte === '3') specials.push('Аксессуары');
+  if (p.pb) specials.push('Производитель #' + p.pb);
+  const infoEl = document.getElementById('editExtraInfo');
+  if (specials.length) {
+    infoEl.style.display = 'flex';
+    infoEl.innerHTML = `${icon('tag', 'ic ic-sm')} Сохранятся спецфильтры: ${esc(specials.join(', '))}`;
+  } else {
+    infoEl.style.display = 'none';
+  }
+  document.getElementById('editModal').classList.add('open');
+}
+
+function adjustEditPrice(delta) {
+  haptic('light');
+  const el = document.getElementById('editMaxInput');
+  const cur = Number(el.value || 0);
+  const next = Math.max(0, (Number.isFinite(cur) ? cur : 0) + delta);
+  el.value = next > 0 ? String(next) : '';
+}
+
+function resetEditPrice() {
+  haptic('light');
+  document.getElementById('editMinInput').value = '';
+  document.getElementById('editMaxInput').value = '';
+}
+
+function collectEditPayload() {
+  const url = document.getElementById('editUrlInput').value.trim();
+  const base = {
+    id: EDITING_QID,
+    name: document.getElementById('editNameInput').value.trim(),
+  };
+  if (url) {
+    base.url = url;
+    return base;
+  }
+  return {
+    ...base,
+    query: document.getElementById('editQueryInput').value.trim(),
+    cat: document.getElementById('editCatSelect').value,
+    rgn: document.getElementById('editRgnSelect').value,
+    min_price: document.getElementById('editMinInput').value.trim(),
+    max_price: document.getElementById('editMaxInput').value.trim(),
+    cnd: document.getElementById('editCndSelect').value,
+    cmp: document.getElementById('editCmpSelect').value,
+  };
+}
+
+async function previewEditedQuery() {
+  try {
+    haptic('light');
+    const payload = { ...collectEditPayload(), preview_only: true };
+    const res = await api('/api/queries/update', 'POST', payload);
+    const box = document.getElementById('editPreviewBox');
+    box.style.display = 'block';
+    box.innerHTML = `
+      <div style="font-weight:700">${esc(res.name)}</div>
+      <div class="chips" style="margin:8px 0">${res.chips.map(renderChip).join('')}</div>
+      <div class="query-meta">Найдено на Kufar: <b>${res.count}</b>${res.median ? ' · Медиана: ' + fmtMoney(res.median) : ''}</div>
+    `;
+  } catch(e) { showToast(e.message); }
+}
+
+async function saveEditedQuery(asCopy = false) {
+  try {
+    haptic('medium');
+    const payload = { ...collectEditPayload(), as_copy: !!asCopy };
+    await api('/api/queries/update', 'POST', payload);
+    closeModal('editModal');
+    await loadState();
+    showToast(asCopy ? 'Создана копия фильтра' : 'Фильтр обновлён');
+  } catch(e) { showToast(e.message); }
+}
+
+function buildKufarUrlFromParams(p) {
+  const sp = new URLSearchParams();
+  Object.entries(p || {}).forEach(([k, v]) => {
+    if (v !== null && v !== undefined && v !== '' && k !== 'size') {
+      sp.set(k, String(v));
+    }
+  });
+  return 'https://www.kufar.by/l?' + sp.toString();
+}
+
+function copyFeedKufarUrl() {
+  if (!ACTIVE_FEED_Q) return;
+  const url = buildKufarUrlFromParams(ACTIVE_FEED_Q.params);
+  navigator.clipboard && navigator.clipboard.writeText(url);
+  haptic('light');
+  showToast('Ссылка поиска Kufar скопирована');
+}
+
+function openLightbox(urls, idx = 0) {
+  if (!urls || !urls.length) return;
+  haptic('light');
+  LIGHTBOX_URLS = urls;
+  LIGHTBOX_IDX = Math.max(0, Math.min(idx, urls.length - 1));
+  renderLightbox();
+  document.getElementById('lightboxModal').classList.add('open');
+}
+
+function stepLightbox(delta) {
+  if (!LIGHTBOX_URLS.length) return;
+  haptic('light');
+  LIGHTBOX_IDX = (LIGHTBOX_IDX + delta + LIGHTBOX_URLS.length) % LIGHTBOX_URLS.length;
+  renderLightbox();
+}
+
+function renderLightbox() {
+  document.getElementById('lightboxImg').src = LIGHTBOX_URLS[LIGHTBOX_IDX];
+  document.getElementById('lightboxCounter').textContent = `${LIGHTBOX_IDX + 1} / ${LIGHTBOX_URLS.length}`;
+}
+
+function copyContactFromFeed(adId) {
+  const ad = FEED_ADS_CACHE[adId];
+  if (!ad) return;
+  copyContact(adId, ad.seller || 'продавец', ad.subject || 'товар', fmtMoney(ad.price_byn));
+}
+
+function filterAndRenderFeed() {
+  const searchVal = (document.getElementById('feedSearchInput').value || '').trim().toLowerCase();
+  const sortMode = document.getElementById('feedSortSelect').value || 'default';
+  let items = FEED_ADS_LIST.slice();
+  if (searchVal) {
+    items = items.filter(a => (a.subject || '').toLowerCase().includes(searchVal) || (a.area || '').toLowerCase().includes(searchVal));
+  }
+  if (sortMode === 'price_asc') {
+    items.sort((a, b) => (a.price_byn || 9e9) - (b.price_byn || 9e9));
+  } else if (sortMode === 'price_desc') {
+    items.sort((a, b) => (b.price_byn || 0) - (a.price_byn || 0));
+  } else if (sortMode === 'bargains') {
+    items = items.filter(a => a.bargain_pct !== null && a.bargain_pct <= -5)
+      .sort((a, b) => (a.bargain_pct || 0) - (b.bargain_pct || 0));
+  }
+  if (!items.length) {
+    document.getElementById('feedItems').innerHTML = `<div class="empty"><div class="empty-ic">${icon('inbox', 'ic ic-xl')}</div>По вашему фильтру ничего не найдено.</div>`;
+    return;
+  }
+  document.getElementById('feedItems').innerHTML = items.map(ad => {
+    let badge = '';
+    if (ad.bargain_pct !== null && ad.bargain_pct <= -8) badge = `<span class="badge badge-good">${ad.bargain_pct}%</span>`;
+    else if (ad.bargain_pct !== null && ad.bargain_pct >= 12) badge = `<span class="badge badge-high">+${ad.bargain_pct}%</span>`;
+    const urls = (ad.image_urls && ad.image_urls.length) ? ad.image_urls : (ad.image_url ? [ad.image_url] : []);
+    const imgCount = urls.length;
+    return `
+      <div class="ad-card" id="feed-ad-${ad.ad_id}">
+        <div class="thumb-wrap ${imgCount ? 'clickable' : ''}" ${imgCount ? `onclick="openLightbox(FEED_ADS_CACHE[${ad.ad_id}].image_urls && FEED_ADS_CACHE[${ad.ad_id}].image_urls.length ? FEED_ADS_CACHE[${ad.ad_id}].image_urls : [FEED_ADS_CACHE[${ad.ad_id}].image_url], 0)"` : ''}>
+          ${ad.image_url ? `<img class="ad-thumb" src="${esc(ad.image_url)}" />` : icon('images', 'ic ic-lg')}
+          ${imgCount > 1 ? `<span class="photo-pill">${icon('images', 'ic ic-sm')}${imgCount}</span>` : ''}
+        </div>
+        <div class="ad-body">
+          <div class="ad-title">${esc(ad.subject)}</div>
+          <div class="ad-price-row">
+            <span class="ad-price">${fmtMoney(ad.price_byn)}</span>
+            ${badge}
+          </div>
+          <div class="ad-sub">${icon('mapPin', 'ic ic-sm')} ${esc(ad.region || '')}${ad.area ? ', ' + esc(ad.area) : ''}</div>
+          <div class="ad-btns">
+            <a class="btn btn-sm" href="${esc(ad.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
+            <button class="btn btn-sm btn-ghost" onclick="pushAdToChat(${ad.ad_id})">${icon('send', 'ic ic-sm')} В чат</button>
+            <button class="btn btn-sm btn-ghost btn-icon" title="Текст продавцу" onclick="copyContactFromFeed(${ad.ad_id})">${icon('message', 'ic ic-sm')}</button>
+            <button class="btn btn-sm btn-icon ${ad.is_fav ? 'btn-success' : 'btn-ghost'}" onclick="toggleFavFromFeed(${ad.ad_id}, this)">${icon('star', ad.is_fav ? 'ic ic-sm ic-fill' : 'ic ic-sm')}</button>
+            <button class="btn btn-sm btn-danger btn-icon" onclick="hideAdFromFeed(${ad.ad_id})">${icon('eyeOff', 'ic ic-sm')}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function openFeed(qid, sortBargains = false) {
   haptic('light');
   const q = STATE.queries.find(x => x.id === qid);
   ACTIVE_FEED_Q = q;
   document.getElementById('feedTitle').innerHTML = `${icon('radar')} ${esc(q ? q.name : 'Лента')}`;
   document.getElementById('feedAnalytics').innerHTML = '';
+  document.getElementById('feedToolbar').style.display = 'none';
+  document.getElementById('feedSearchInput').value = '';
+  document.getElementById('feedSortSelect').value = sortBargains ? 'bargains' : 'default';
   document.getElementById('feedItems').innerHTML = `<div class="empty">Загружаю объявления...</div>`;
   document.getElementById('feedModal').classList.add('open');
 
@@ -1109,39 +1593,14 @@ async function openFeed(qid) {
       `;
     }
     FEED_ADS_CACHE = {};
-    if (!res.ads.length) {
+    FEED_ADS_LIST = res.ads || [];
+    if (!FEED_ADS_LIST.length) {
       document.getElementById('feedItems').innerHTML = `<div class="empty"><div class="empty-ic">${icon('inbox', 'ic ic-xl')}</div>Подходящих объявлений сейчас нет.</div>`;
       return;
     }
-    res.ads.forEach(ad => { FEED_ADS_CACHE[ad.ad_id] = ad; });
-    document.getElementById('feedItems').innerHTML = res.ads.map(ad => {
-      let badge = '';
-      if (ad.bargain_pct !== null && ad.bargain_pct <= -8) badge = `<span class="badge badge-good">${ad.bargain_pct}%</span>`;
-      else if (ad.bargain_pct !== null && ad.bargain_pct >= 12) badge = `<span class="badge badge-high">+${ad.bargain_pct}%</span>`;
-      const imgCount = (ad.image_urls || []).length;
-      return `
-        <div class="ad-card" id="feed-ad-${ad.ad_id}">
-          <div class="thumb-wrap">
-            ${ad.image_url ? `<img class="ad-thumb" src="${esc(ad.image_url)}" />` : icon('images', 'ic ic-lg')}
-            ${imgCount > 1 ? `<span class="photo-pill">${icon('images', 'ic ic-sm')}${imgCount}</span>` : ''}
-          </div>
-          <div class="ad-body">
-            <div class="ad-title">${esc(ad.subject)}</div>
-            <div class="ad-price-row">
-              <span class="ad-price">${fmtMoney(ad.price_byn)}</span>
-              ${badge}
-            </div>
-            <div class="ad-sub">${icon('mapPin', 'ic ic-sm')} ${esc(ad.region || '')}${ad.area ? ', ' + esc(ad.area) : ''}</div>
-            <div class="ad-btns">
-              <a class="btn btn-sm" href="${esc(ad.ad_link)}" target="_blank">${icon('external', 'ic ic-sm')} Kufar</a>
-              <button class="btn btn-sm btn-ghost" onclick="pushAdToChat(${ad.ad_id})">${icon('send', 'ic ic-sm')} В чат</button>
-              <button class="btn btn-sm btn-icon ${ad.is_fav ? 'btn-success' : 'btn-ghost'}" onclick="toggleFavFromFeed(${ad.ad_id}, this)">${icon('star', ad.is_fav ? 'ic ic-sm ic-fill' : 'ic ic-sm')}</button>
-              <button class="btn btn-sm btn-danger btn-icon" onclick="hideAdFromFeed(${ad.ad_id})">${icon('eyeOff', 'ic ic-sm')}</button>
-            </div>
-          </div>
-        </div>
-      `;
-    }).join('');
+    FEED_ADS_LIST.forEach(ad => { FEED_ADS_CACHE[ad.ad_id] = ad; });
+    document.getElementById('feedToolbar').style.display = 'grid';
+    filterAndRenderFeed();
   } catch(e) {
     document.getElementById('feedItems').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
@@ -1430,6 +1889,57 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                     app_ctx["sync_backup"]()
                     app_ctx["trigger_force_check"]()
                     self._send_json(200, {"ok": True, "id": qid, "name": name})
+                    return
+
+                if path == "/api/check_now":
+                    app_ctx["trigger_force_check"]()
+                    self._send_json(200, {"ok": True})
+                    return
+
+                if path == "/api/queries/update":
+                    qid = int(body.get("id", 0))
+                    user_queries = get_user_queries(chat_id)
+                    existing = next((q for q in user_queries if q["id"] == qid), None)
+                    if not existing:
+                        self._send_json(404, {"ok": False, "error": "Поиск не найден"})
+                        return
+                    params, new_name = _merge_edited_params(existing["params"], body, app_ctx)
+                    if not params.get("query") and (not params.get("cat") or params.get("cat") == "all"):
+                        self._send_json(400, {"ok": False, "error": "Укажите категорию или ключевые слова"})
+                        return
+                    final_name = new_name or existing["name"]
+                    if body.get("preview_only"):
+                        ads = fetch_ads(params)
+                        prices = [a["price_byn"] for a in ads if a.get("price_byn") and a["price_byn"] > 0]
+                        med = round(float(statistics.median(prices)), 2) if len(prices) >= 3 else None
+                        self._send_json(200, {
+                            "ok": True,
+                            "name": final_name,
+                            "params": params,
+                            "chips": _build_query_chips(params, app_ctx),
+                            "count": len(ads),
+                            "median": med,
+                        })
+                        return
+                    if body.get("as_copy"):
+                        ads = fetch_ads(params)
+                        new_qid = add_query(chat_id, final_name, params)
+                        if ads:
+                            mark_ads_seen(new_qid, [a["ad_id"] for a in ads])
+                        app_ctx["sync_backup"]()
+                        app_ctx["trigger_force_check"]()
+                        self._send_json(200, {"ok": True, "id": new_qid, "name": final_name, "copied": True})
+                        return
+                    update_query(qid, chat_id, name=final_name, params=params)
+                    app_ctx["sync_backup"]()
+                    app_ctx["trigger_force_check"]()
+                    self._send_json(200, {
+                        "ok": True,
+                        "id": qid,
+                        "name": final_name,
+                        "params": params,
+                        "chips": _build_query_chips(params, app_ctx),
+                    })
                     return
 
                 if path == "/api/queries/toggle":

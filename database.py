@@ -241,6 +241,35 @@ def toggle_query_active(query_id: int, is_active: bool, chat_id: Optional[int] =
         return cursor.rowcount > 0
 
 
+def update_query(
+    query_id: int,
+    chat_id: int,
+    name: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None
+) -> bool:
+    """Updates an existing search query's name and/or parameters in-place without losing seen history."""
+    with get_connection(db_path) as conn:
+        cursor = conn.cursor()
+        fields = []
+        values: List[Any] = []
+        if name is not None and name.strip():
+            fields.append("name = ?")
+            values.append(name.strip())
+        if params is not None:
+            fields.append("params_json = ?")
+            values.append(json.dumps(params))
+        if not fields:
+            return False
+        values.extend([query_id, chat_id])
+        cursor.execute(
+            f"UPDATE queries SET {', '.join(fields)} WHERE id = ? AND chat_id = ?",
+            tuple(values)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def delete_query(query_id: int, chat_id: Optional[int] = None, db_path: Optional[str] = None) -> bool:
     """Deletes a query by ID and marks it in deleted_queries to prevent resurrection on restart."""
     with get_connection(db_path) as conn:

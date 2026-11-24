@@ -3060,7 +3060,7 @@ def main():
 
     webapp_url = get_webapp_url()
     if webapp_url:
-        tg.set_chat_menu_button(webapp_url, text="Приложение")
+        tg.set_chat_menu_button(webapp_url, text="Mini App")
         print(f"Telegram Mini App включен: {webapp_url}")
     else:
         tg.set_chat_menu_button(None)
