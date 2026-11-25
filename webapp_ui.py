@@ -35,7 +35,9 @@ from database import (
     get_stop_words,
     get_user_blacklist,
     get_user_count,
+    get_user_fast_alert,
     get_user_favorites,
+    get_user_priority_mode,
     get_user_queries,
     get_user_template,
     is_favorite,
@@ -50,7 +52,9 @@ from database import (
     remove_stop_word,
     set_setting,
     set_silent_mode,
+    set_user_fast_alert,
     set_user_monitoring_paused,
+    set_user_priority_mode,
     set_user_template,
     toggle_query_active,
     update_favorite_crm,
@@ -344,6 +348,8 @@ def _build_user_state_payload(chat_id: int, app_ctx: Dict[str, Any]) -> Dict[str
         "chat_id": chat_id,
         "monitoring_paused": paused,
         "interval_seconds": int(config.get("check_interval_seconds", 60)) if is_admin else None,
+        "fast_alert": get_user_fast_alert(chat_id),
+        "priority_mode": get_user_priority_mode(chat_id),
         "silent_mode": silent_mode,
         "in_silent_now": is_in_silent_hours(chat_id),
         "template": template,
@@ -998,11 +1004,33 @@ WEBAPP_HTML = r"""<!DOCTYPE html>
 
     <div class="card" id="intervalCard" style="display:none">
       <div class="section-title"><span class="title-ic" id="icIntTitle"></span>Интервал проверки (Админ)</div>
-      <div class="seg" id="intervalSeg">
+      <div class="seg" id="intervalSeg" style="grid-template-columns:repeat(3,1fr)">
+        <button class="seg-btn" data-sec="5" onclick="setIntervalSec(5)">5 сек</button>
+        <button class="seg-btn" data-sec="10" onclick="setIntervalSec(10)">10 сек</button>
         <button class="seg-btn" data-sec="15" onclick="setIntervalSec(15)">15 сек</button>
         <button class="seg-btn" data-sec="30" onclick="setIntervalSec(30)">30 сек</button>
         <button class="seg-btn" data-sec="60" onclick="setIntervalSec(60)">60 сек</button>
         <button class="seg-btn" data-sec="120" onclick="setIntervalSec(120)">120 сек</button>
+      </div>
+    </div>
+
+    <div class="card" id="speedCard">
+      <div class="section-title">Скорость и приоритет</div>
+      <div class="query-top" style="margin-top:8px">
+        <div>
+          <div style="font-size:13px;font-weight:700">Молния: сначала кнопка</div>
+          <div class="query-meta">Карточка со ссылкой и копированием приходит мгновенно, фото — следом.</div>
+        </div>
+        <div id="fastAlertSwitch" class="switch" onclick="toggleFastAlert()"></div>
+      </div>
+      <div style="margin-top:12px">
+        <div style="font-size:13px;font-weight:700">Громкий приоритет</div>
+        <div class="query-meta">Для +слов или выгодных лотов от -18% от рынка</div>
+        <div class="seg" id="prioritySeg" style="grid-template-columns:repeat(3,1fr)">
+          <button class="seg-btn" data-pm="off" onclick="setPriorityMode('off')">Обычно</button>
+          <button class="seg-btn" data-pm="hot" onclick="setPriorityMode('hot')">Пробой</button>
+          <button class="seg-btn" data-pm="only_hot" onclick="setPriorityMode('only_hot')">Только топ</button>
+        </div>
       </div>
     </div>
 
@@ -1598,6 +1626,14 @@ function renderAll() {
   // Interval
   document.querySelectorAll('#intervalSeg .seg-btn').forEach(b => {
     b.classList.toggle('active', Number(b.dataset.sec) === STATE.interval_seconds);
+  });
+
+  // Speed & Priority
+  const fastSw = document.getElementById('fastAlertSwitch');
+  if (fastSw) fastSw.className = 'switch' + (STATE.fast_alert !== false ? ' on' : '');
+  const curPm = STATE.priority_mode || 'hot';
+  document.querySelectorAll('#prioritySeg .seg-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.pm === curPm);
   });
 
   // Silent mode
@@ -2694,6 +2730,26 @@ async function setIntervalSec(sec) {
   showToast(`Интервал: ${sec} сек`);
 }
 
+async function toggleFastAlert() {
+  haptic('light');
+  const next = !(STATE && STATE.fast_alert !== false);
+  await api('/api/settings', 'POST', { fast_alert: next });
+  await loadState();
+  showToast(next ? 'Молния включена (кнопка сразу)' : 'Молния выключена (сначала альбом)');
+}
+
+async function setPriorityMode(mode) {
+  haptic('light');
+  await api('/api/settings', 'POST', { priority_mode: mode });
+  await loadState();
+  const labels = {
+    off: 'Обычный звук по расписанию',
+    hot: 'Горячие лоты пробивают тишину',
+    only_hot: 'Громко только для топ-лотов',
+  };
+  showToast(labels[mode] || 'Режим обновлён');
+}
+
 async function toggleSilentPreset() {
   const isOn = STATE.silent_mode && STATE.silent_mode !== 'off';
   const val = isOn ? 'off' : `${document.getElementById('silentFrom').value || '23:00'}-${document.getElementById('silentTo').value || '08:00'}`;
@@ -3258,10 +3314,14 @@ def create_http_handler(app_ctx: Dict[str, Any]):
                         if not (admin_chat_id and chat_id == admin_chat_id):
                             self._send_json(403, {"ok": False, "error": "Интервал сервера меняет только администратор"})
                             return
-                        sec = max(10, min(600, int(body["interval_seconds"])))
+                        sec = max(5, min(600, int(body["interval_seconds"])))
                         config["check_interval_seconds"] = sec
                         set_setting("check_interval_seconds", str(sec))
                         app_ctx["trigger_force_check"]()
+                    if "fast_alert" in body:
+                        set_user_fast_alert(chat_id, bool(body["fast_alert"]))
+                    if "priority_mode" in body:
+                        set_user_priority_mode(chat_id, str(body["priority_mode"]))
                     if "silent_mode" in body:
                         set_silent_mode(chat_id, str(body["silent_mode"]).strip() or "off")
                     if body.get("reset_template"):

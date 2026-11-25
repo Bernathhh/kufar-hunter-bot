@@ -14,7 +14,8 @@ DB_FILE = os.path.join(os.path.dirname(__file__), "kufar_hunter.db")
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     if not db_path:
         db_path = DB_FILE
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=15.0)
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -955,6 +956,31 @@ def is_in_silent_hours(chat_id: int, current_dt: Optional[datetime] = None, db_p
             return cur_min >= start_min or cur_min < end_min
     except Exception:
         return False
+
+
+def get_user_fast_alert(chat_id: int, db_path: Optional[str] = None) -> bool:
+    """Returns True if Fast-Alert mode (button card first, photos asynchronously) is enabled."""
+    val = get_setting(f"fast_alert_{chat_id}", "1", db_path=db_path)
+    return str(val).strip().lower() not in ("0", "false", "off", "no")
+
+
+def set_user_fast_alert(chat_id: int, enabled: bool, db_path: Optional[str] = None):
+    """Sets Fast-Alert mode for a user."""
+    set_setting(f"fast_alert_{chat_id}", "1" if enabled else "0", db_path=db_path)
+
+
+def get_user_priority_mode(chat_id: int, db_path: Optional[str] = None) -> str:
+    """Returns notification priority mode: 'hot' (bypass silence on hot deals), 'only_hot', or 'off'."""
+    val = (get_setting(f"priority_mode_{chat_id}", "hot", db_path=db_path) or "hot").strip().lower()
+    return val if val in ("hot", "only_hot", "off") else "hot"
+
+
+def set_user_priority_mode(chat_id: int, mode: str, db_path: Optional[str] = None):
+    """Persists notification priority mode ('hot', 'only_hot', or 'off')."""
+    clean = mode.strip().lower() if mode else "hot"
+    if clean not in ("hot", "only_hot", "off"):
+        clean = "hot"
+    set_setting(f"priority_mode_{chat_id}", clean, db_path=db_path)
 
 
 # ==================== CLOUD STATE BACKUP & RESTORE ====================

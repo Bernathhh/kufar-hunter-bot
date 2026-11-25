@@ -9,6 +9,7 @@ import os
 import time
 import logging
 import threading
+import concurrent.futures
 import html
 import json
 import http.server
@@ -71,6 +72,10 @@ from database import (
     get_silent_mode,
     set_silent_mode,
     is_in_silent_hours,
+    get_user_fast_alert,
+    set_user_fast_alert,
+    get_user_priority_mode,
+    set_user_priority_mode,
     set_user_monitoring_paused,
     is_user_monitoring_paused,
     toggle_query_active,
@@ -110,6 +115,7 @@ LAST_BACKUP_TIME: Optional[datetime] = None
 BACKUP_FILE = os.path.join(os.path.dirname(__file__), "backup_state.json")
 BACKUP_DIRTY: bool = False
 BACKUP_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
 BACKUP_SCHEDULES: Dict[str, List[str]] = {
     "1": ["09:00"],
     "2": ["09:00", "21:00"],
@@ -147,9 +153,23 @@ def record_api_event(level: str, message: str):
     """Records a compact timestamped runtime/API event for admin monitoring."""
     minsk_tz = timezone(timedelta(hours=3))
     ts = datetime.now(minsk_tz).strftime("%H:%M:%S")
-    API_HEALTH_EVENTS.append({"time": ts, "level": level, "message": message[:160]})
-    if len(API_HEALTH_EVENTS) > 25:
-        del API_HEALTH_EVENTS[:-25]
+    with STATE_LOCK:
+        API_HEALTH_EVENTS.append({"time": ts, "level": level, "message": message[:160]})
+        if len(API_HEALTH_EVENTS) > 25:
+            del API_HEALTH_EVENTS[:-25]
+
+
+def _delete_ad_messages(tg: TelegramClient, chat_id: int, ad_id: int, fallback_msg_id: Optional[int] = None):
+    """Thread-safely pops tracked Telegram message IDs for an ad and deletes them."""
+    with STATE_LOCK:
+        mids = list(AD_MESSAGES_MAP.pop((chat_id, ad_id), []))
+    if fallback_msg_id and fallback_msg_id not in mids:
+        mids.append(fallback_msg_id)
+    for m in mids:
+        try:
+            tg.delete_message(chat_id, m)
+        except Exception as e:
+            logger.debug(f"Could not delete message {m}: {e}")
 
 
 def evaluate_query_meta_for_ad(
@@ -789,6 +809,181 @@ def _build_safe_photo_caption(
     return html.escape(plain[:1000] + "...")
 
 
+def _evaluate_priority(
+    ad: Dict[str, Any],
+    effective_price: Optional[float],
+    market_median: Optional[float],
+    update_type: str = "new",
+    old_price_byn: Optional[float] = None,
+    new_price_byn: Optional[float] = None
+) -> bool:
+    """Returns True if ad matches plus-words or offers strong discount vs market / previous price."""
+    if ad.get("_matched_plus"):
+        return True
+    if market_median and market_median > 0 and effective_price and effective_price > 0:
+        if ((effective_price - market_median) / market_median) <= -0.18:
+            return True
+    if update_type == "price_change" and old_price_byn and new_price_byn and old_price_byn > new_price_byn:
+        if old_price_byn > 0 and ((old_price_byn - new_price_byn) / old_price_byn) >= 0.10:
+            return True
+    return False
+
+
+def _should_disable_notification(
+    chat_id: int,
+    is_hot: bool,
+    query_meta: Optional[Dict[str, Any]],
+    priority_mode: str
+) -> bool:
+    """Computes Telegram disable_notification flag respecting quiet hours and priority override."""
+    if is_hot and priority_mode in ("hot", "only_hot"):
+        return False
+    if priority_mode == "only_hot":
+        return True
+    return is_in_silent_hours(chat_id) or bool((query_meta or {}).get("silent_query"))
+
+
+def _build_single_screen_action_text(
+    ad: Dict[str, Any],
+    photo_count: int,
+    seller_name: str,
+    phone_e164: Optional[str],
+    personalized_msg: str,
+    is_hot: bool = False,
+    market_median: Optional[float] = None,
+    update_type: str = "new",
+    old_price_byn: Optional[float] = None,
+    new_price_byn: Optional[float] = None
+) -> str:
+    """Builds compact single-screen action card with priority badge, price, seller, phone, and quick reply quote."""
+    subj_short = (ad.get("subject") or "Объявление").strip()
+    if len(subj_short) > 48:
+        subj_short = subj_short[:45].rstrip() + "..."
+    p_byn = new_price_byn if (update_type == "price_change" and new_price_byn is not None) else ad.get("price_byn")
+    price_short = f" · <b>{p_byn:,.0f} BYN</b>".replace(",", " ") if p_byn is not None else ""
+    if update_type == "price_change" and old_price_byn is not None and new_price_byn is not None:
+        diff = old_price_byn - new_price_byn
+        if diff > 0:
+            price_short += f" <i>(-{diff:,.0f} BYN)</i>".replace(",", " ")
+
+    bargain_str = ""
+    if market_median and market_median > 0 and p_byn and p_byn > 0:
+        pct = round(((p_byn - market_median) / market_median) * 100)
+        if pct <= -18:
+            bargain_str = f" · <b>{pct}% от рынка</b>"
+
+    seller_disp = html.escape(seller_name or "Автор")
+    ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad['ad_id']}")
+    if phone_e164:
+        contact_line = f"<b>Продавец:</b> {seller_disp} · <b>Тел:</b> {html.escape(phone_e164)}"
+    elif ad.get("phone_hidden") is False:
+        contact_line = f"<b>Продавец:</b> {seller_disp} · <a href=\"{html.escape(ad_link, quote=True)}\">телефон на Kufar</a>"
+    else:
+        contact_line = f"<b>Продавец:</b> {seller_disp} · только чат Kufar"
+
+    prefix = "🔥 <b>ПРИОРИТЕТ</b> · " if is_hot else ""
+    photo_badge = f" · <i>{photo_count} фото</i>" if photo_count else ""
+    quote_msg = html.escape(personalized_msg[:180])
+    return (
+        f"{prefix}<b>{html.escape(subj_short)}</b>{price_short}{bargain_str}{photo_badge}\n"
+        f"{contact_line}\n"
+        f"<blockquote>{quote_msg}</blockquote>"
+    )
+
+
+def _deliver_fast_media(
+    tg: TelegramClient,
+    chat_id: int,
+    ad: Dict[str, Any],
+    query_name: str,
+    image_urls: List[str],
+    description: Optional[str],
+    update_type: str,
+    old_price_byn: Optional[float],
+    new_price_byn: Optional[float],
+    market_median: Optional[float],
+    card_msg_id: Optional[int],
+    had_phone: bool,
+    personalized_msg: str,
+    is_fav: bool
+):
+    """Enriches details/phone if missing and silently appends photo album after fast action card."""
+    ad_id = ad["ad_id"]
+    urls = list(image_urls)
+    desc = description
+    try:
+        if desc is None:
+            fetched_desc, fetched_photos = fetch_ad_details(ad_id, timeout=5)
+            desc = fetched_desc
+            ad["description"] = desc
+            if fetched_photos:
+                seen_u = set(urls)
+                for u in fetched_photos:
+                    if u not in seen_u:
+                        seen_u.add(u)
+                        urls.append(u)
+                ad["image_urls"] = urls
+            with STATE_LOCK:
+                AD_DATA_CACHE[ad_id] = ad
+                if urls:
+                    AD_PHOTOS_CACHE[ad_id] = urls
+
+            # If a phone was found in the delayed description, patch the fast card buttons in-place
+            if not had_phone and card_msg_id:
+                new_phone_e164, _ = resolve_phone_info(ad, desc or "")
+                if new_phone_e164:
+                    ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+                    updated_markup = make_ad_keyboard(
+                        ad_link,
+                        ad_id,
+                        photo_count=len(urls),
+                        seller_name=ad.get("seller", ""),
+                        is_blacklisted=False,
+                        is_fav=is_fav,
+                        copy_msg=personalized_msg,
+                        phone_number=new_phone_e164
+                    )
+                    try:
+                        tg.edit_message_reply_markup(chat_id, card_msg_id, reply_markup=updated_markup)
+                    except Exception:
+                        pass
+
+        if not urls:
+            return
+
+        photo_caption = _build_safe_photo_caption(
+            ad, query_name, desc or "", update_type,
+            old_price_byn, new_price_byn, market_median
+        )
+        added_mids: List[int] = []
+        if len(urls) > 1:
+            for chunk_idx, chunk in enumerate(_split_album_chunks(urls[:20])):
+                media = []
+                for item_idx, u in enumerate(chunk):
+                    entry: Dict[str, Any] = {"type": "photo", "media": u}
+                    if chunk_idx == 0 and item_idx == 0:
+                        entry["caption"] = photo_caption
+                        entry["parse_mode"] = "HTML"
+                    media.append(entry)
+                res_album = tg.send_media_group(chat_id, media, disable_notification=True)
+                if res_album and isinstance(res_album, list):
+                    added_mids.extend(m["message_id"] for m in res_album if isinstance(m, dict) and "message_id" in m)
+                else:
+                    break
+        else:
+            res_photo = tg.send_photo(chat_id, urls[0], caption=photo_caption, disable_notification=True)
+            if res_photo and isinstance(res_photo, dict) and "message_id" in res_photo:
+                added_mids.append(res_photo["message_id"])
+
+        if added_mids:
+            with STATE_LOCK:
+                existing = AD_MESSAGES_MAP.get((chat_id, ad_id), [])
+                existing.extend(added_mids)
+                AD_MESSAGES_MAP[(chat_id, ad_id)] = existing
+    except Exception as e:
+        logger.debug(f"Fast media delivery error for ad {ad_id}: {e}")
+
+
 def send_ad_notification(
     tg: TelegramClient,
     chat_id: int,
@@ -798,11 +993,13 @@ def send_ad_notification(
     old_price_byn: Optional[float] = None,
     new_price_byn: Optional[float] = None,
     market_median: Optional[float] = None,
-    query_meta: Optional[Dict[str, Any]] = None
+    query_meta: Optional[Dict[str, Any]] = None,
+    fast_mode: Optional[bool] = None,
+    async_media: bool = True
 ) -> bool:
     """
-    Sends notification with ALL photos immediately (native media group album + compact control card),
-    or single photo / text fallback when 0-1 photos are present.
+    Sends notification using either Fast-Alert mode (instant card + buttons first, silent photos after)
+    or standard mode (native media group album + compact control card).
     """
     ad_id = ad["ad_id"]
     if is_ad_blacklisted(chat_id, ad_id):
@@ -815,10 +1012,15 @@ def send_ad_notification(
         logger.info(f"Seller '{seller_name}' is blacklisted by chat {chat_id}, skipping ad {ad_id}")
         return False
 
+    fast_alert = get_user_fast_alert(chat_id) if fast_mode is None else bool(fast_mode)
+    stop_words = get_stop_words(chat_id)
+    meta_dict = query_meta or {}
+    need_desc_filter = bool(stop_words or meta_dict.get("stop_words") or meta_dict.get("plus_words"))
+
     image_urls = list(ad.get("image_urls") or ([ad["image_url"]] if ad.get("image_url") else []))
     description = ad.get("description")
-    if description is None or len(image_urls) <= 1:
-        fetched_desc, fetched_photos = fetch_ad_details(ad_id)
+    if (description is None and (not fast_alert or need_desc_filter)) or (not image_urls and description is None) or (not fast_alert and len(image_urls) <= 1):
+        fetched_desc, fetched_photos = fetch_ad_details(ad_id, timeout=4 if fast_alert else 6)
         if description is None:
             description = fetched_desc
             ad["description"] = description
@@ -831,7 +1033,6 @@ def send_ad_notification(
             ad["image_urls"] = image_urls
 
     # Check global and per-query stop-words + plus-words
-    stop_words = get_stop_words(chat_id)
     if stop_words:
         check_text = f"{ad.get('subject', '')} {description or ''}".lower()
         for sw in stop_words:
@@ -848,18 +1049,33 @@ def send_ad_notification(
     if matched_plus:
         ad["_matched_plus"] = matched_plus
 
-    AD_DATA_CACHE[ad_id] = ad
-    if len(AD_DATA_CACHE) > 1000:
-        for old_k in list(AD_DATA_CACHE.keys())[:200]:
-            AD_DATA_CACHE.pop(old_k, None)
+    with STATE_LOCK:
+        AD_DATA_CACHE[ad_id] = ad
+        if len(AD_DATA_CACHE) > 1000:
+            for old_k in list(AD_DATA_CACHE.keys())[:200]:
+                AD_DATA_CACHE.pop(old_k, None)
 
-    ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
-    if image_urls:
-        AD_PHOTOS_CACHE[ad_id] = image_urls
+        ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+        if image_urls:
+            AD_PHOTOS_CACHE[ad_id] = image_urls
+
+        if len(AD_MESSAGES_MAP) > 1000:
+            for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
+                AD_MESSAGES_MAP.pop(old_k, None)
 
     is_fav = is_favorite(chat_id, ad_id)
     phone_e164, _ = resolve_phone_info(ad, description or "")
     personalized_msg = build_personalized_message(chat_id, ad)
+
+    effective_price = new_price_byn if (update_type == "price_change" and new_price_byn is not None) else ad.get("price_byn")
+    is_hot = _evaluate_priority(
+        ad, effective_price, market_median,
+        update_type=update_type,
+        old_price_byn=old_price_byn,
+        new_price_byn=new_price_byn
+    )
+    priority_mode = get_user_priority_mode(chat_id)
+    disable_notif = _should_disable_notification(chat_id, is_hot, query_meta, priority_mode)
 
     markup = make_ad_keyboard(
         ad_link,
@@ -872,11 +1088,37 @@ def send_ad_notification(
         phone_number=phone_e164
     )
 
-    if len(AD_MESSAGES_MAP) > 1000:
-        for old_k in list(AD_MESSAGES_MAP.keys())[:200]:
-            AD_MESSAGES_MAP.pop(old_k, None)
-
-    disable_notif = is_in_silent_hours(chat_id) or (bool((query_meta or {}).get("silent_query")) and not ad.get("_matched_plus"))
+    # 0. Fast-Alert mode ("Молния"): deliver action card + buttons IMMEDIATELY, stream photos silently after
+    if fast_alert and image_urls:
+        action_text = _build_single_screen_action_text(
+            ad, len(image_urls), seller_name, phone_e164, personalized_msg,
+            is_hot=(is_hot and priority_mode != "off"),
+            market_median=market_median,
+            update_type=update_type,
+            old_price_byn=old_price_byn,
+            new_price_byn=new_price_byn
+        )
+        res_fast = tg.send_message(
+            chat_id,
+            action_text,
+            reply_markup=markup,
+            disable_notification=disable_notif
+        )
+        if res_fast and isinstance(res_fast, dict) and "message_id" in res_fast:
+            card_mid = res_fast["message_id"]
+            with STATE_LOCK:
+                AD_MESSAGES_MAP[(chat_id, ad_id)] = [card_mid]
+            delivery_args = (
+                tg, chat_id, ad, query_name, image_urls, description,
+                update_type, old_price_byn, new_price_byn, market_median,
+                card_mid, bool(phone_e164), personalized_msg, is_fav
+            )
+            if async_media:
+                threading.Thread(target=_deliver_fast_media, args=delivery_args, daemon=True).start()
+            else:
+                _deliver_fast_media(*delivery_args)
+            return True
+        return False
 
     # 1. Multiple photos: send ALL photos immediately as native Telegram album(s)
     if len(image_urls) > 1:
@@ -904,23 +1146,13 @@ def send_ad_notification(
                 break
 
         if album_ok and mids:
-            subj_short = (ad.get("subject") or "Объявление").strip()
-            if len(subj_short) > 48:
-                subj_short = subj_short[:45].rstrip() + "..."
-            p_byn = ad.get("price_byn")
-            price_short = f" · <b>{p_byn:,.0f} BYN</b>".replace(",", " ") if p_byn is not None else ""
-            seller_disp = html.escape(seller_name or "Автор")
-            if phone_e164:
-                contact_line = f"<b>Продавец:</b> {seller_disp} · <b>Тел:</b> {html.escape(phone_e164)}"
-            elif ad.get("phone_hidden") is False:
-                contact_line = f"<b>Продавец:</b> {seller_disp} · телефон на Kufar"
-            else:
-                contact_line = f"<b>Продавец:</b> {seller_disp} · только чат Kufar"
-            quote_msg = html.escape(personalized_msg[:180])
-            action_text = (
-                f"<b>{html.escape(subj_short)}</b>{price_short} · <i>{len(image_urls)} фото</i>\n"
-                f"{contact_line}\n"
-                f"<blockquote>{quote_msg}</blockquote>"
+            action_text = _build_single_screen_action_text(
+                ad, len(image_urls), seller_name, phone_e164, personalized_msg,
+                is_hot=(is_hot and priority_mode != "off"),
+                market_median=market_median,
+                update_type=update_type,
+                old_price_byn=old_price_byn,
+                new_price_byn=new_price_byn
             )
             res_btn = tg.send_message(
                 chat_id,
@@ -930,7 +1162,8 @@ def send_ad_notification(
             )
             if res_btn and isinstance(res_btn, dict) and "message_id" in res_btn:
                 mids.append(res_btn["message_id"])
-            AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
+            with STATE_LOCK:
+                AD_MESSAGES_MAP[(chat_id, ad_id)] = mids
             return True
 
     # 2. Single photo (or fallback if album upload was rejected)
@@ -947,7 +1180,8 @@ def send_ad_notification(
             disable_notification=disable_notif
         )
         if res_photo and isinstance(res_photo, dict) and "message_id" in res_photo:
-            AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
+            with STATE_LOCK:
+                AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_photo["message_id"]]
             return True
 
     # 3. Text-only fallback
@@ -959,6 +1193,8 @@ def send_ad_notification(
         new_price_byn=new_price_byn,
         market_median=market_median
     )
+    if is_hot and priority_mode != "off":
+        caption = f"🔥 <b>ПРИОРИТЕТ</b>\n{caption}"
     res_msg = tg.send_message(
         chat_id,
         caption,
@@ -967,7 +1203,8 @@ def send_ad_notification(
         disable_notification=disable_notif
     )
     if res_msg and isinstance(res_msg, dict) and "message_id" in res_msg:
-        AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_msg["message_id"]]
+        with STATE_LOCK:
+            AD_MESSAGES_MAP[(chat_id, ad_id)] = [res_msg["message_id"]]
         return True
 
     return False
@@ -1084,9 +1321,10 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
                         query_meta=meta
                     ):
                         sent_count += 1
-                        NEW_ADS_FOUND += 1
+                        with STATE_LOCK:
+                            NEW_ADS_FOUND += 1
                         record_api_event("ok", f"Отправлено [{name}]: {ad.get('subject', '')[:40]}")
-                        time.sleep(1.0)
+                        time.sleep(0.25)
                 except Exception as e:
                     logger.error(f"Error sending ad notification: {e}")
 
@@ -1122,8 +1360,9 @@ def check_single_query(tg: TelegramClient, query: Dict[str, Any], chat_id_fallba
                                 query_meta=meta
                             ):
                                 sent_count += 1
-                                NEW_ADS_FOUND += 1
-                                time.sleep(1.0)
+                                with STATE_LOCK:
+                                    NEW_ADS_FOUND += 1
+                                time.sleep(0.25)
                         except Exception as e:
                             logger.error(f"Error sending price update notification: {e}")
 
@@ -1181,36 +1420,49 @@ def check_favorites_tracker(tg: TelegramClient):
         time.sleep(1.0)
 
 
+def favorites_tracker_loop(tg: TelegramClient, config: dict):
+    """Dedicated background thread checking favorites so main search loop stays non-blocking."""
+    while not STOP_EVENT.is_set():
+        try:
+            check_favorites_tracker(tg)
+        except Exception as e:
+            logger.error(f"Error in favorites tracker loop: {e}")
+        if STOP_EVENT.wait(timeout=900):
+            break
+
+
 def hunter_loop(tg: TelegramClient, config: dict):
-    """Background monitoring loop."""
-    global TOTAL_CHECKS, LAST_FAVS_TRACK_TS
+    """Background monitoring loop with parallel query execution and minimal inter-cycle latency."""
+    global TOTAL_CHECKS
     logger.info("Kufar Hunter loop started.")
     record_api_event("info", "Фоновый мониторинг запущен")
 
     while not STOP_EVENT.is_set():
-        interval = config.get("check_interval_seconds", 60)
+        interval = max(5, int(config.get("check_interval_seconds", 60)))
         try:
             queries = get_active_queries()
             if queries:
                 logger.debug(f"Running check for {len(queries)} active queries...")
-                for q in queries:
-                    if STOP_EVENT.is_set():
-                        break
+                if len(queries) == 1:
                     try:
-                        check_single_query(tg, q)
+                        check_single_query(tg, queries[0])
                     except Exception as e:
-                        logger.error(f"Error checking query '{q['name']}': {e}")
-                        record_api_event("error", f"Исключение '{q['name']}': {e}")
-                    time.sleep(2.0)
+                        logger.error(f"Error checking query '{queries[0]['name']}': {e}")
+                        record_api_event("error", f"Исключение '{queries[0]['name']}': {e}")
+                else:
+                    workers = min(4, len(queries))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                        fut_map = {pool.submit(check_single_query, tg, q): q for q in queries}
+                        for fut in concurrent.futures.as_completed(fut_map):
+                            if STOP_EVENT.is_set():
+                                break
+                            q = fut_map[fut]
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                logger.error(f"Error checking query '{q['name']}': {e}")
+                                record_api_event("error", f"Исключение '{q['name']}': {e}")
                 TOTAL_CHECKS += 1
-
-            now_ts = time.time()
-            if now_ts - LAST_FAVS_TRACK_TS >= 900:
-                LAST_FAVS_TRACK_TS = now_ts
-                try:
-                    check_favorites_tracker(tg)
-                except Exception as e:
-                    logger.error(f"Error in favorites tracker: {e}")
 
             try:
                 maybe_run_scheduled_backup(tg, config)
@@ -1652,7 +1904,7 @@ def _run_batch_ad_output(
                 seen_in_run.add(ad_id)
                 mark_ad_seen(qid, ad_id, price_byn=ad.get("price_byn"), price_usd=ad.get("price_usd"))
                 try:
-                    if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median, query_meta=q_meta):
+                    if send_ad_notification(tg, chat_id, ad, q_name, market_median=q_median, query_meta=q_meta, fast_mode=False):
                         total_shown += 1
                         shown_for_query += 1
                         for _ in range(4):
@@ -1826,11 +2078,21 @@ def show_main_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] 
     _send_or_edit(tg, chat_id, text, reply_markup={"inline_keyboard": buttons}, edit_msg_id=edit_msg_id)
 
 
+PRIORITY_MODE_LABELS = {
+    "hot": "Пробой тишины (топ-лоты)",
+    "only_hot": "Громко только топ-лоты",
+    "off": "Обычный по расписанию",
+}
+
+
 def show_settings_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
     """Unified settings & filters submenu rendered cleanly in-place."""
     interval = int(GLOBAL_CONFIG.get("check_interval_seconds", 60))
     silent_mode = get_silent_mode(chat_id)
     silent_badge = "Выкл" if silent_mode in ("off", "") else silent_mode
+    fast_on = get_user_fast_alert(chat_id)
+    pmode = get_user_priority_mode(chat_id)
+    pm_label = PRIORITY_MODE_LABELS.get(pmode, pmode)
     sw_cnt = len(get_stop_words(chat_id))
     bl_ads = get_blacklist_count(chat_id)
     bl_sellers = len(get_blacklisted_sellers(chat_id))
@@ -1839,6 +2101,8 @@ def show_settings_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[i
         f"<b>НАСТРОЙКИ И ФИЛЬТРЫ</b>\n"
         f"────────────────────\n"
         f"<b>Интервал:</b> {interval} сек.\n"
+        f"<b>Молния:</b> {'Вкл (кнопка сразу)' if fast_on else 'Выкл (сначала фото)'}\n"
+        f"<b>Громкий приоритет:</b> {html.escape(pm_label)}\n"
         f"<b>Тихий режим:</b> {html.escape(silent_badge)}\n"
         f"<b>Стоп-слова:</b> {sw_cnt} шт.\n"
         f"<b>Чёрный список:</b> {bl_ads} объявл. · {bl_sellers} авт.\n"
@@ -1846,6 +2110,10 @@ def show_settings_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[i
     buttons = [
         [
             {"text": f"Интервал · {interval}с", "callback_data": "cb:interval_menu"},
+            {"text": f"Молния: {'Вкл' if fast_on else 'Выкл'}", "callback_data": "cb:fast_toggle"}
+        ],
+        [
+            {"text": "Громкий приоритет", "callback_data": "cb:priority_menu"},
             {"text": "Тихий режим", "callback_data": "cb:silent_menu"}
         ],
         [
@@ -2126,7 +2394,8 @@ def show_interval_options(tg: TelegramClient, chat_id: int, current: int, edit_m
     text = (
         f"<b>ИНТЕРВАЛ ПРОВЕРКИ</b>\n"
         f"────────────────────\n"
-        f"Текущий интервал: <b>{current} сек.</b>"
+        f"Текущий интервал: <b>{current} сек.</b>\n"
+        f"<i>Режимы 5–10 сек. подходят для быстрой «снайперской» охоты.</i>"
     )
     def _lbl(sec: int) -> str:
         return f"● {sec} сек" if int(current) == sec else f"{sec} сек"
@@ -2134,13 +2403,38 @@ def show_interval_options(tg: TelegramClient, chat_id: int, current: int, edit_m
     markup = {
         "inline_keyboard": [
             [
-                {"text": _lbl(15), "callback_data": "cb:interval:15"},
-                {"text": _lbl(30), "callback_data": "cb:interval:30"}
+                {"text": _lbl(5), "callback_data": "cb:interval:5"},
+                {"text": _lbl(10), "callback_data": "cb:interval:10"},
+                {"text": _lbl(15), "callback_data": "cb:interval:15"}
             ],
             [
+                {"text": _lbl(30), "callback_data": "cb:interval:30"},
                 {"text": _lbl(60), "callback_data": "cb:interval:60"},
                 {"text": _lbl(120), "callback_data": "cb:interval:120"}
             ],
+            [{"text": "‹ Назад в настройки", "callback_data": "cb:settings"}]
+        ]
+    }
+    _send_or_edit(tg, chat_id, text, reply_markup=markup, edit_msg_id=edit_msg_id)
+
+
+def show_priority_mode_menu(tg: TelegramClient, chat_id: int, edit_msg_id: Optional[int] = None):
+    """Shows notification priority mode options in-place."""
+    cur = get_user_priority_mode(chat_id)
+    def _pl(mode: str, title: str) -> str:
+        return f"● {title}" if cur == mode else title
+
+    text = (
+        f"<b>ГРОМКИЙ ПРИОРИТЕТ</b>\n"
+        f"────────────────────\n"
+        f"Приоритетными считаются объявления по <b>+словам</b>, со скидкой от <b>-18% от рынка</b> или со снижением цены на 10%+.\n\n"
+        f"Текущий режим: <b>{html.escape(PRIORITY_MODE_LABELS.get(cur, cur))}</b>"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": _pl("hot", "Пробой тишины (горячие громко)"), "callback_data": "cb:priority_set:hot"}],
+            [{"text": _pl("only_hot", "Только топ-лоты громко, остальные тихо"), "callback_data": "cb:priority_set:only_hot"}],
+            [{"text": _pl("off", "Обычный режим (строго по часам тишины)"), "callback_data": "cb:priority_set:off"}],
             [{"text": "‹ Назад в настройки", "callback_data": "cb:settings"}]
         ]
     }
@@ -2847,16 +3141,7 @@ def _dispatch_callback_query(
         add_to_blacklist(chat_id, ad_id)
         save_local_backup()
         ack(text="🚫 Объявление добавлено в ЧС и удалено!", show_alert=False)
-
-        # Delete all messages related to this ad (album photos + description card)
-        mids = AD_MESSAGES_MAP.pop((chat_id, ad_id), [])
-        if msg_id and msg_id not in mids:
-            mids.append(msg_id)
-        for m in mids:
-            try:
-                tg.delete_message(chat_id, m)
-            except Exception as e:
-                logger.debug(f"Could not delete message {m}: {e}")
+        _delete_ad_messages(tg, chat_id, ad_id, msg_id)
 
     elif data.startswith("cb:bl_seller:"):
         ad_id = int(data.split(":")[-1])
@@ -2872,16 +3157,7 @@ def _dispatch_callback_query(
             text=f"👤 Продавец {disp_name} добавлен в ЧС! Все его объявления скрыты.",
             show_alert=True
         )
-
-        # Delete all messages related to this ad (album photos + description card)
-        mids = AD_MESSAGES_MAP.pop((chat_id, ad_id), [])
-        if msg_id and msg_id not in mids:
-            mids.append(msg_id)
-        for m in mids:
-            try:
-                tg.delete_message(chat_id, m)
-            except Exception as e:
-                logger.debug(f"Could not delete message {m}: {e}")
+        _delete_ad_messages(tg, chat_id, ad_id, msg_id)
 
     elif data.startswith("cb:unbl:"):
         ad_id = int(data.split(":")[-1])
@@ -2973,8 +3249,27 @@ def _dispatch_callback_query(
         ack(text="🔄 Шаблон сброшен к исходному!", show_alert=True)
         show_template_menu(tg, chat_id, edit_msg_id=msg_id)
 
+    elif data == "cb:fast_toggle":
+        next_fast = not get_user_fast_alert(chat_id)
+        set_user_fast_alert(chat_id, next_fast)
+        save_local_backup()
+        ack(text="⚡ Молния включена!" if next_fast else "📸 Режим: сначала альбом фото")
+        show_settings_menu(tg, chat_id, edit_msg_id=msg_id)
+
+    elif data == "cb:priority_menu":
+        ack()
+        USER_STATES.pop(chat_id, None)
+        show_priority_mode_menu(tg, chat_id, edit_msg_id=msg_id)
+
+    elif data.startswith("cb:priority_set:"):
+        mode = data.split(":")[-1]
+        set_user_priority_mode(chat_id, mode)
+        save_local_backup()
+        ack(text=f"🔊 {PRIORITY_MODE_LABELS.get(get_user_priority_mode(chat_id), mode)}")
+        show_priority_mode_menu(tg, chat_id, edit_msg_id=msg_id)
+
     elif data.startswith("cb:interval:"):
-        sec = int(data.split(":")[-1])
+        sec = max(5, min(600, int(data.split(":")[-1])))
         config["check_interval_seconds"] = sec
         set_setting("check_interval_seconds", str(sec))
         save_local_backup()
@@ -3420,6 +3715,10 @@ def main():
     hunter_thread = threading.Thread(target=hunter_loop, args=(tg, config), daemon=True)
     hunter_thread.start()
 
+    # Start independent Favorites tracker thread (never blocks ad sniping)
+    favs_thread = threading.Thread(target=favorites_tracker_loop, args=(tg, config), daemon=True)
+    favs_thread.start()
+
     # Start Telegram listener
     listener_thread = threading.Thread(target=telegram_listener, args=(tg, config), daemon=True)
     listener_thread.start()
@@ -3454,6 +3753,10 @@ def main():
                 logger.warning("Hunter thread died! Auto-restarting hunter_loop...")
                 hunter_thread = threading.Thread(target=hunter_loop, args=(tg, config), daemon=True)
                 hunter_thread.start()
+            if not favs_thread.is_alive():
+                logger.warning("Favorites tracker thread died! Auto-restarting...")
+                favs_thread = threading.Thread(target=favorites_tracker_loop, args=(tg, config), daemon=True)
+                favs_thread.start()
             time.sleep(2)
     except KeyboardInterrupt:
         print("\n🛑 Остановка бота...")
