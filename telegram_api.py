@@ -60,6 +60,18 @@ class TelegramClient:
                 if "message is not modified" in err_body:
                     logger.debug(f"Telegram {method}: message not modified")
                     return None
+                if e.code == 400 and "copy_text" in err_body and payload and "reply_markup" in payload and attempt < retries:
+                    # Fallback for legacy Bot API clients: drop copy_text field cleanly and retry
+                    kb = payload.get("reply_markup", {}).get("inline_keyboard")
+                    if isinstance(kb, list):
+                        new_kb = []
+                        for row in kb:
+                            new_row = [btn for btn in row if "copy_text" not in btn]
+                            if new_row:
+                                new_kb.append(new_row)
+                        payload["reply_markup"] = {"inline_keyboard": new_kb}
+                        data = json.dumps(payload).encode("utf-8")
+                        continue
                 logger.error(f"HTTPError on {method}: {e.code} - {err_body}")
                 return None
             except Exception as e:

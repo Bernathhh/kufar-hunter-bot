@@ -232,33 +232,60 @@ def get_main_keyboard(chat_id: int = 0) -> Optional[Dict[str, Any]]:
 MAIN_KEYBOARD = None
 
 
+def build_personalized_message(chat_id: int, ad: Dict[str, Any]) -> str:
+    """Renders user's contact template with seller name, item subject, and price."""
+    tpl = get_user_template(chat_id)
+    seller_raw = (ad.get("seller") or "").strip()
+    subject_raw = (ad.get("subject") or "").strip()
+    price_byn = ad.get("price_byn")
+    price_str = f"{price_byn:,.0f} BYN".replace(",", " ") if price_byn else ""
+
+    msg = tpl
+    if "{name}" in msg:
+        msg = msg.replace("{name}", seller_raw if seller_raw else "продавец")
+    if "{item}" in msg:
+        msg = msg.replace("{item}", subject_raw if subject_raw else "товар")
+    if "{price}" in msg:
+        msg = msg.replace("{price}", price_str)
+    return msg.strip()
+
+
 def make_ad_keyboard(
     ad_link: str,
     ad_id: int,
     photo_count: int = 0,
     seller_name: Optional[str] = None,
     is_blacklisted: bool = False,
-    is_fav: bool = False
+    is_fav: bool = False,
+    copy_msg: Optional[str] = None,
+    phone_number: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Builds compact 2-row minimal inline action keyboard attached to ad cards."""
+    """Builds compact single-screen action keyboard with 1-tap text/phone copy and Kufar link."""
     fav_text = "★ Убрать" if is_fav else "☆ В избр."
     fav_cb = f"cb:unfav:{ad_id}" if is_fav else f"cb:fav:{ad_id}"
     bl_text = "↩ Вернуть" if is_blacklisted else "× Скрыть"
     bl_cb = f"cb:unbl:{ad_id}" if is_blacklisted else f"cb:bl:{ad_id}"
 
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "Открыть на Kufar ↗", "url": ad_link},
+    rows: List[List[Dict[str, Any]]] = [
+        [
+            {"text": "Открыть / Написать ↗", "url": ad_link},
+            (
+                {"text": "Скопировать текст", "copy_text": {"text": copy_msg[:256]}}
+                if copy_msg else
                 {"text": "Написать", "callback_data": f"cb:contact:{ad_id}"}
-            ],
-            [
-                {"text": fav_text, "callback_data": fav_cb},
-                {"text": bl_text, "callback_data": bl_cb},
-                {"text": "Бан автора", "callback_data": f"cb:bl_seller:{ad_id}"}
-            ]
+            ),
         ]
-    }
+    ]
+    if phone_number:
+        rows.append([
+            {"text": f"Скопировать тел: {phone_number}", "copy_text": {"text": phone_number[:256]}}
+        ])
+    rows.append([
+        {"text": fav_text, "callback_data": fav_cb},
+        {"text": bl_text, "callback_data": bl_cb},
+        {"text": "Бан автора", "callback_data": f"cb:bl_seller:{ad_id}"},
+    ])
+    return {"inline_keyboard": rows}
 
 
 def calculate_market_stats(ads: List[Dict[str, Any]]) -> Optional[float]:
@@ -549,26 +576,62 @@ def parse_ad_timing(iso_str: str) -> Dict[str, Any]:
         return {"header": "<b>НОВОЕ ОБЪЯВЛЕНИЕ</b>", "time_str": iso_str, "is_repost": False, "note": ""}
 
 
-def resolve_phone_string(ad: Dict[str, Any], description: str) -> str:
-    """Detects phone number from description or checks authorization/visibility."""
-    # 1. Search in description text
+def normalize_by_phone(raw_phone: Optional[str]) -> Optional[str]:
+    """Normalizes a Belarusian (or international) phone number to E.164 for 1-tap dialing."""
+    if not raw_phone:
+        return None
+    raw_str = str(raw_phone).strip()
+    digits = re.sub(r"\D", "", raw_str)
+    if digits.startswith("375") and len(digits) == 12:
+        return f"+{digits}"
+    if digits.startswith("80") and len(digits) == 11:
+        return f"+375{digits[2:]}"
+    if len(digits) == 9 and digits[:2] in ("25", "29", "33", "44", "17"):
+        return f"+375{digits}"
+    if raw_str.startswith("+") and 10 <= len(digits) <= 15:
+        return f"+{digits}"
+    return None
+
+
+def resolve_phone_info(ad: Dict[str, Any], description: str) -> Tuple[Optional[str], str]:
+    """Extracts normalized clickable phone (if present) and returns (e164_phone, html_label)."""
+    cached = ad.get("_resolved_phone")
+    if cached:
+        return cached, f"{html.escape(cached)} (нажмите для звонка)"
+
+    direct_raw = ad.get("phone") or ad.get("phone_number")
+    if direct_raw:
+        norm = normalize_by_phone(direct_raw)
+        if norm:
+            ad["_resolved_phone"] = norm
+            return norm, f"{html.escape(norm)} (нажмите для звонка)"
+
     phone_in_text = extract_phone_from_text(description)
     if phone_in_text:
-        return f"<code>{html.escape(phone_in_text)}</code> (из описания)"
+        norm = normalize_by_phone(phone_in_text)
+        if norm:
+            ad["_resolved_phone"] = norm
+            return norm, f"{html.escape(norm)} (нажмите для звонка)"
 
-    # 2. Check if optional Kufar Bearer token is provided
     kufar_token = os.getenv("KUFAR_BEARER_TOKEN")
     if kufar_token:
         direct_phone = fetch_ad_phone_with_token(ad["ad_id"], kufar_token)
         if direct_phone:
-            return f"<code>{html.escape(direct_phone)}</code>"
+            norm = normalize_by_phone(direct_phone)
+            if norm:
+                ad["_resolved_phone"] = norm
+                return norm, f"{html.escape(norm)} (нажмите для звонка)"
 
-    # 3. Fallback based on Kufar's phone_hidden flag
     link = ad.get("ad_link", "")
     if ad.get("phone_hidden") is False:
-        return f"<a href=\"{link}\">Есть в объявлении (кнопка «Позвонить»)</a>"
-    else:
-        return "<i>Скрыт продавцом (только сообщения)</i>"
+        return None, f"<a href=\"{link}\">Есть на Kufar (кнопка «Позвонить»)</a>"
+    return None, "<i>Скрыт продавцом (только чат)</i>"
+
+
+def resolve_phone_string(ad: Dict[str, Any], description: str) -> str:
+    """Returns formatted HTML phone label for ad captions."""
+    _, label = resolve_phone_info(ad, description)
+    return label
 
 
 def format_ad_caption(
@@ -795,13 +858,18 @@ def send_ad_notification(
         AD_PHOTOS_CACHE[ad_id] = image_urls
 
     is_fav = is_favorite(chat_id, ad_id)
+    phone_e164, _ = resolve_phone_info(ad, description or "")
+    personalized_msg = build_personalized_message(chat_id, ad)
+
     markup = make_ad_keyboard(
         ad_link,
         ad_id,
         photo_count=len(image_urls),
         seller_name=seller_name,
         is_blacklisted=False,
-        is_fav=is_fav
+        is_fav=is_fav,
+        copy_msg=personalized_msg,
+        phone_number=phone_e164
     )
 
     if len(AD_MESSAGES_MAP) > 1000:
@@ -841,7 +909,19 @@ def send_ad_notification(
                 subj_short = subj_short[:45].rstrip() + "..."
             p_byn = ad.get("price_byn")
             price_short = f" · <b>{p_byn:,.0f} BYN</b>".replace(",", " ") if p_byn is not None else ""
-            action_text = f"<b>{html.escape(subj_short)}</b>{price_short} · <i>{len(image_urls)} фото</i>"
+            seller_disp = html.escape(seller_name or "Автор")
+            if phone_e164:
+                contact_line = f"<b>Продавец:</b> {seller_disp} · <b>Тел:</b> {html.escape(phone_e164)}"
+            elif ad.get("phone_hidden") is False:
+                contact_line = f"<b>Продавец:</b> {seller_disp} · телефон на Kufar"
+            else:
+                contact_line = f"<b>Продавец:</b> {seller_disp} · только чат Kufar"
+            quote_msg = html.escape(personalized_msg[:180])
+            action_text = (
+                f"<b>{html.escape(subj_short)}</b>{price_short} · <i>{len(image_urls)} фото</i>\n"
+                f"{contact_line}\n"
+                f"<blockquote>{quote_msg}</blockquote>"
+            )
             res_btn = tg.send_message(
                 chat_id,
                 action_text,
@@ -2561,33 +2641,23 @@ def _dispatch_callback_query(
         ad_id = int(data.split(":")[-1])
         ad = AD_DATA_CACHE.get(ad_id, {})
         ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
-        tpl = get_user_template(chat_id)
-
-        # Smart variables replacement
         seller_raw = (ad.get("seller") or "").strip()
         subject_raw = (ad.get("subject") or "").strip()
-        price_byn = ad.get("price_byn")
-        price_str = f"{price_byn:,.0f} BYN".replace(",", " ") if price_byn else ""
-
-        personalized_msg = tpl
-        if "{name}" in personalized_msg:
-            personalized_msg = personalized_msg.replace("{name}", seller_raw if seller_raw else "продавец")
-        if "{item}" in personalized_msg:
-            personalized_msg = personalized_msg.replace("{item}", subject_raw if subject_raw else "товар")
-        if "{price}" in personalized_msg:
-            personalized_msg = personalized_msg.replace("{price}", price_str)
+        personalized_msg = build_personalized_message(chat_id, ad)
 
         ack()
         text = (
             f"💬 <b>Готовое сообщение продавцу:</b>\n"
             f"👤 Продавец: <b>{html.escape(seller_raw or 'Не указан')}</b>\n"
             f"📌 Товар: <b>{html.escape(subject_raw or 'Товар')}</b>\n\n"
-            f"<i>Нажмите на текст в рамке ниже, чтобы скопировать его в один клик:</i>\n\n"
             f"<code>{html.escape(personalized_msg)}</code>"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "Открыть диалог на Kufar ↗", "url": ad_link}],
+                [
+                    {"text": "Открыть диалог на Kufar ↗", "url": ad_link},
+                    {"text": "Скопировать текст", "copy_text": {"text": personalized_msg[:256]}},
+                ],
                 [{"text": "× Закрыть", "callback_data": "cb:close_msg"}]
             ]
         }
@@ -2614,7 +2684,9 @@ def _dispatch_callback_query(
             photo_count=len(photos),
             seller_name=sname,
             is_blacklisted=is_bl,
-            is_fav=True
+            is_fav=True,
+            copy_msg=build_personalized_message(chat_id, ad) if ad else None,
+            phone_number=ad.get("_resolved_phone")
         )
         try:
             tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
@@ -2637,7 +2709,9 @@ def _dispatch_callback_query(
             photo_count=len(photos),
             seller_name=sname,
             is_blacklisted=is_bl,
-            is_fav=False
+            is_fav=False,
+            copy_msg=build_personalized_message(chat_id, ad) if ad else None,
+            phone_number=ad.get("_resolved_phone")
         )
         try:
             tg.edit_message_reply_markup(chat_id, msg_id, reply_markup=new_markup)
@@ -2814,13 +2888,17 @@ def _dispatch_callback_query(
         remove_from_blacklist(chat_id, ad_id)
         save_local_backup()
         ack(text="✅ Объявление убрано из ЧС", show_alert=False)
-        ad_link = f"https://www.kufar.by/item/{ad_id}"
         ad = AD_DATA_CACHE.get(ad_id, {})
+        ad_link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+        photos = AD_PHOTOS_CACHE.get(ad_id, [])
         new_markup = make_ad_keyboard(
             ad_link, ad_id,
+            photo_count=len(photos),
             seller_name=ad.get("seller"),
             is_blacklisted=False,
-            is_fav=is_favorite(chat_id, ad_id)
+            is_fav=is_favorite(chat_id, ad_id),
+            copy_msg=build_personalized_message(chat_id, ad),
+            phone_number=ad.get("_resolved_phone")
         )
         if msg.get("text"):
             tg.edit_message_text(
